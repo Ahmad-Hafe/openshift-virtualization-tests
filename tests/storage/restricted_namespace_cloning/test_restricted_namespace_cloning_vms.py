@@ -27,7 +27,7 @@ from tests.storage.restricted_namespace_cloning.constants import (
     VERBS_SRC_SA,
     VM_FOR_TEST,
 )
-from tests.storage.restricted_namespace_cloning.utils import verify_snapshot_used_namespace_transfer
+from tests.storage.restricted_namespace_cloning.utils import verify_snapshot_transfer_for_dv
 from utilities.constants import QUARANTINED, Images
 from utilities.storage import ErrorMsg
 from utilities.virt import VirtualMachineForTests
@@ -97,7 +97,7 @@ def test_create_vm_with_cloned_data_volume_positive(
     permissions_datavolume_destination,
     vm_for_restricted_namespace_cloning_test,
 ):
-    verify_snapshot_used_namespace_transfer(
+    verify_snapshot_transfer_for_dv(
         cdv=data_volume_clone_settings,
         unprivileged_client=unprivileged_client,
     )
@@ -194,7 +194,7 @@ def test_create_vm_with_cloned_data_volume_permissions_for_pods_positive(
     permissions_datavolume_destination,
     vm_for_restricted_namespace_cloning_test,
 ):
-    verify_snapshot_used_namespace_transfer(
+    verify_snapshot_transfer_for_dv(
         cdv=data_volume_clone_settings,
         unprivileged_client=unprivileged_client,
     )

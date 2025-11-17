@@ -18,7 +18,7 @@ from utilities.storage import (
 LOGGER = logging.getLogger(__name__)
 
 
-def verify_snapshot_used_namespace_transfer(cdv: DataVolume, unprivileged_client: DynamicClient) -> None:
+def verify_snapshot_transfer_for_dv(cdv: DataVolume, unprivileged_client: DynamicClient) -> None:
     storage_class = cdv.storage_class
     # Namespace transfer is not possible with WFFC
     if is_snapshot_supported_by_sc(
