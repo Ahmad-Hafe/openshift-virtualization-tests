@@ -100,7 +100,6 @@ def test_user_permissions_positive(
             ):
                 verify_vm_disk_image_permission(vm=vm)
 
-
 @pytest.mark.sno
 @pytest.mark.parametrize(
     "namespace, data_volume_multi_storage_scope_module, "
