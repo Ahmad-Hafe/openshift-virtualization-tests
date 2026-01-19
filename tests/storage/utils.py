@@ -25,6 +25,7 @@ from pyhelper_utils.shell import run_ssh_commands
 from pytest_testconfig import config as py_config
 from timeout_sampler import TimeoutExpiredError, TimeoutSampler
 
+from tests.storage.cdi_upload.utils import get_storage_profile_minimum_supported_pvc_size
 from utilities.artifactory import (
     cleanup_artifactory_secret_and_config_map,
     get_artifactory_config_map,
@@ -402,11 +403,15 @@ def create_cirros_dv(
     volume_mode=None,
     dv_size=Images.Cirros.DEFAULT_DV_SIZE,
 ):
+    storage_profile_minimum_supported_pvc_size = get_storage_profile_minimum_supported_pvc_size(
+        storage_class_name=storage_class,
+        client=client,
+    )
     with create_dv(
         dv_name=f"dv-{name}",
         namespace=namespace,
         url=get_http_image_url(image_directory=Images.Cirros.DIR, image_name=Images.Cirros.QCOW2_IMG),
-        size=dv_size,
+        size=storage_profile_minimum_supported_pvc_size or dv_size,
         storage_class=storage_class,
         access_modes=access_modes,
         volume_mode=volume_mode,
