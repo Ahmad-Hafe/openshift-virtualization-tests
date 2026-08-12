@@ -1,0 +1,11 @@
+"""Constants for concurrent VM boot tests."""
+
+NUM_CONCURRENT_VMS = 20
+# Each VM has 5 VMI disk devices: 1 golden image boot (PVC clone) + 1 cloud-init + 3 blank data volumes
+NUM_BLANK_DISKS_PER_VM = 3
+# Fixed disks present on every VM regardless of configuration: boot volume + cloud-init
+NUM_FIXED_DISKS_PER_VM = 2
+BLANK_DV_SIZE = "1Gi"
+# u1.micro (1Gi RAM) without preference to reduce aggregate memory from 40Gi to 20Gi;
+# fedora preference enforces a 2Gi minimum, doubling the requirement.
+VM_INSTANCE_TYPE = "u1.micro"
