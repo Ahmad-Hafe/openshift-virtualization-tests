@@ -1,9 +1,8 @@
 """Utilities for concurrent VM boot tests."""
 
 import logging
-from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING
 
 from kubernetes.dynamic import DynamicClient
 from kubernetes.utils.quantity import parse_quantity
@@ -17,6 +16,9 @@ from utilities.storage import add_dv_to_vm, construct_datavolume_source_dict, da
 from utilities.virt import VirtualMachineForTests
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
+    from typing import Any
+
     from ocp_resources.node import Node
 
 LOGGER = logging.getLogger(__name__)
@@ -120,7 +122,7 @@ def blank_dv_template(name: str, namespace: str, storage_class_name: str) -> dic
         storage_class=storage_class_name,
         api_name="storage",
     )
-    dv.to_dict()
+    dv.to_dict()  # populates dv.res with the full resource dict
     dv.res["metadata"].pop("namespace", None)
     return dv.res
 

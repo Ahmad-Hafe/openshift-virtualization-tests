@@ -10,6 +10,7 @@ Jira: https://redhat.atlassian.net/browse/CNV-88906  # <skip-jira-utils-check>
 Markers:
     - tier3
     - conformance
+    - min_cluster_resources
 
 Preconditions:
     - Fedora golden image DataSource available in the openshift-virtualization-os-images namespace
@@ -26,7 +27,7 @@ from tests.storage.concurrent_vm_boot.constants import (
     NUM_FIXED_DISKS_PER_VM,
 )
 
-pytestmark = [pytest.mark.tier3, pytest.mark.conformance, pytest.mark.special_infra, pytest.mark.min_cluster_resources]
+pytestmark = [pytest.mark.tier3, pytest.mark.conformance, pytest.mark.min_cluster_resources]
 
 EXPECTED_DISK_COUNT = NUM_FIXED_DISKS_PER_VM + NUM_BLANK_DISKS_PER_VM
 
