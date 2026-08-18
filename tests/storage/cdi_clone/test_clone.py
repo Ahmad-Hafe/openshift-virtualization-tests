@@ -4,8 +4,10 @@ Clone tests
 
 import pytest
 from ocp_resources.datavolume import DataVolume
+from ocp_resources.virtual_machine_clone import VirtualMachineClone
 
 from tests.os_params import FEDORA_LATEST
+from tests.storage.cdi_clone.utils import create_vm_from_clone_dv_template
 from tests.storage.stop_status_utils import dv_stop_status_restart_threshold
 from tests.storage.utils import (
     assert_pvc_snapshot_clone_annotation,
@@ -21,44 +23,12 @@ from utilities.storage import (
     check_disk_count_in_vm,
     create_dv,
     create_vm_from_dv,
-    data_volume_template_dict_with_pvc_source,
+    data_source_ref,
     get_dv_size_from_datasource,
     overhead_size_for_dv,
     sc_volume_binding_mode_is_wffc,
 )
-from utilities.virt import (
-    VirtualMachineForTests,
-    restart_vm_wait_for_running_vm,
-    running_vm,
-)
-
-
-def create_vm_from_clone_dv_template(
-    vm_name,
-    dv_name,
-    namespace_name,
-    source_dv,
-    client,
-    volume_mode,
-    storage_class,
-    size=None,
-):
-    with VirtualMachineForTests(
-        name=vm_name,
-        namespace=namespace_name,
-        os_flavor=OS_FLAVOR_FEDORA,
-        client=client,
-        memory_guest=Images.Fedora.DEFAULT_MEMORY_SIZE,
-        data_volume_template=data_volume_template_dict_with_pvc_source(
-            target_dv_name=dv_name,
-            target_dv_namespace=namespace_name,
-            source_dv=source_dv,
-            volume_mode=volume_mode,
-            size=size,
-            storage_class=storage_class,
-        ),
-    ) as vm:
-        running_vm(vm=vm)
+from utilities.virt import restart_vm_wait_for_running_vm, target_vm_from_cloning_job
 
 
 @pytest.mark.sno
@@ -80,11 +50,7 @@ def test_successful_vm_restart_with_cloned_dv(
         size=size,
         storage_class=storage_class_name_scope_module,
         consume_wffc=False,
-        source_ref={
-            "kind": fedora_data_source_scope_module.kind,
-            "name": fedora_data_source_scope_module.name,
-            "namespace": fedora_data_source_scope_module.namespace,
-        },
+        source_ref=data_source_ref(data_source=fedora_data_source_scope_module),
     ) as cdv:
         if sc_volume_binding_mode_is_wffc(sc=storage_class_name_scope_module, client=unprivileged_client):
             cdv.wait_for_status(status=DataVolume.Status.PENDING_POPULATION, timeout=TIMEOUT_1MIN)
@@ -314,9 +280,15 @@ def test_clone_from_block_to_fs_using_dv_template(
 
 @pytest.mark.conformance
 @pytest.mark.polarion("CNV-16335")
-def test_clone_vm_with_4_disks_host_assisted():
+def test_clone_vm_with_4_disks_host_assisted(
+    source_vm_with_4_disks,
+    unprivileged_client,
+    namespace,
+):
     """
     Test that cloning a VM with 4 disks succeeds and all disks are preserved.
+
+    Jira: https://issues.redhat.com/browse/CNV-88909  # <skip-jira-utils-check>
 
     Preconditions:
         - Source Fedora VM with 1 boot disk (cloned from golden image DataSource) and 3 blank data disks
@@ -329,6 +301,13 @@ def test_clone_vm_with_4_disks_host_assisted():
     Expected:
         - All 4 disks are visible inside the running target VM
     """
-
-
-__test__ = False
+    with VirtualMachineClone(
+        name="clone-job-4-disks",
+        client=unprivileged_client,
+        namespace=namespace.name,
+        source_name=source_vm_with_4_disks.name,
+        target_name="fedora-4-disks-target",
+    ) as vmc:
+        vmc.wait_for_status(status=VirtualMachineClone.Status.SUCCEEDED)
+        with target_vm_from_cloning_job(client=unprivileged_client, cloning_job=vmc) as target_vm:
+            check_disk_count_in_vm(vm=target_vm)

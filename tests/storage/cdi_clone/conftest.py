@@ -4,10 +4,19 @@ from ocp_resources.datavolume import DataVolume
 from tests.storage.constants import QUAY_FEDORA_CONTAINER_IMAGE
 from tests.storage.stop_status_utils import dv_stop_status_restart_threshold
 from utilities.constants import Images
+from utilities.constants.images import OS_FLAVOR_FEDORA
 from utilities.constants.storage import REGISTRY_STR
 from utilities.constants.timeouts import TIMEOUT_40MIN
 from utilities.constants.virt import WIN_2K22
-from utilities.storage import create_dv, data_volume, get_dv_size_from_datasource
+from utilities.storage import (
+    add_dv_to_vm,
+    construct_datavolume_source_dict,
+    create_dv,
+    data_volume,
+    data_volume_template_with_source_ref_dict,
+    get_dv_size_from_datasource,
+)
+from utilities.virt import VirtualMachineForCloning, running_vm
 
 
 @pytest.fixture()
@@ -63,6 +72,41 @@ def fedora_dv_with_block_volume_mode(
     ) as dv:
         dv.wait_for_dv_success(stop_status_func=dv_stop_status_restart_threshold, dv=dv)
         yield dv
+
+
+@pytest.fixture()
+def source_vm_with_4_disks(
+    fedora_data_source_scope_module,
+    unprivileged_client,
+    namespace,
+    storage_class_name_scope_module,
+):
+    with VirtualMachineForCloning(
+        name="fedora-4-disks-clone-source",
+        namespace=namespace.name,
+        client=unprivileged_client,
+        os_flavor=OS_FLAVOR_FEDORA,
+        data_volume_template=data_volume_template_with_source_ref_dict(
+            data_source=fedora_data_source_scope_module,
+            storage_class=storage_class_name_scope_module,
+        ),
+        vm_instance_type_infer=True,
+        vm_preference_infer=True,
+    ) as vm:
+        for idx in range(1, 4):
+            blank_dv = DataVolume(
+                name=f"blank-data-disk-{idx}",
+                namespace=namespace.name,
+                client=unprivileged_client,
+                source_dict=construct_datavolume_source_dict(source="blank"),
+                size="10Gi",
+                storage_class=storage_class_name_scope_module,
+                api_name="storage",
+            )
+            blank_dv.to_dict()
+            add_dv_to_vm(vm=vm, template_dv=blank_dv.res)
+        running_vm(vm=vm)
+        yield vm
 
 
 @pytest.fixture(scope="class")

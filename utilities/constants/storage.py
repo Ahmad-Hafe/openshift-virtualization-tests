@@ -81,6 +81,9 @@ HOTPLUG_DISK_SCSI_BUS = "scsi"
 # DataVolume source type strings
 REGISTRY_STR = "registry"
 
+# CDI clone strategy values
+HOST_ASSISTED_CLONE_STRATEGY = "copy"
+
 # DataImportCron / golden image constants
 WILDCARD_CRON_EXPRESSION = "* * * * *"
 OUTDATED = "Outdated"
