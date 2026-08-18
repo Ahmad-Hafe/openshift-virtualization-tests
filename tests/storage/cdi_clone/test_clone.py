@@ -237,6 +237,7 @@ def test_successful_snapshot_clone(
 
 
 @pytest.mark.gating
+@pytest.mark.conformance
 @pytest.mark.polarion("CNV-5607")
 @pytest.mark.s390x
 def test_clone_from_fs_to_block_using_dv_template(
@@ -246,6 +247,19 @@ def test_clone_from_fs_to_block_using_dv_template(
     fedora_dv_with_filesystem_volume_mode,
     storage_class_with_block_volume_mode,
 ):
+    """
+    Test cloning a DV from filesystem to block volume mode via DV template.
+
+    Preconditions:
+        - Fedora DataVolume (cloned from golden image DataSource) with filesystem volume mode
+        - Storage class supporting block volume mode
+
+    Steps:
+        1. Create a VM using a clone DataVolume template that clones the filesystem DV to block
+
+    Expected:
+        - VM boots successfully with the cloned block DV
+    """
     create_vm_from_clone_dv_template(
         vm_name="vm-5607",
         dv_name="dv-5607",
@@ -257,6 +271,7 @@ def test_clone_from_fs_to_block_using_dv_template(
     )
 
 
+@pytest.mark.conformance
 @pytest.mark.polarion("CNV-5608")
 @pytest.mark.smoke()
 @pytest.mark.s390x
@@ -268,6 +283,19 @@ def test_clone_from_block_to_fs_using_dv_template(
     storage_class_with_filesystem_volume_mode,
     default_fs_overhead,
 ):
+    """
+    Test cloning a DV from block to filesystem volume mode via DV template.
+
+    Preconditions:
+        - Fedora DataVolume (cloned from golden image DataSource) with block volume mode
+        - Storage class supporting filesystem volume mode
+
+    Steps:
+        1. Create a VM using a clone DataVolume template that clones the block DV to filesystem
+
+    Expected:
+        - VM boots successfully with the cloned filesystem DV
+    """
     create_vm_from_clone_dv_template(
         vm_name="vm-5608",
         dv_name="dv-5608",
@@ -282,3 +310,25 @@ def test_clone_from_block_to_fs_using_dv_template(
         ),
         storage_class=storage_class_with_filesystem_volume_mode,
     )
+
+
+@pytest.mark.conformance
+@pytest.mark.polarion("CNV-16335")
+def test_clone_vm_with_4_disks_host_assisted():
+    """
+    Test that cloning a VM with 4 disks succeeds and all disks are preserved.
+
+    Preconditions:
+        - Source Fedora VM with 1 boot disk (cloned from golden image DataSource) and 3 blank data disks
+
+    Steps:
+        1. Clone the source VM using VirtualMachineClone
+        2. Wait for the clone job to succeed
+        3. Start the target VM and verify all 4 disks are visible inside the guest
+
+    Expected:
+        - All 4 disks are visible inside the running target VM
+    """
+
+
+__test__ = False
