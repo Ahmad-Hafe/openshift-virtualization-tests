@@ -508,7 +508,7 @@ class TestRestoreMultiDiskPerformance:
     """
     Snapshot restore performance tests for VMs with multiple disks.
 
-    Jira: https://redhat.atlassian.net/browse/CNV-88906  # <skip-jira-utils-check>
+    Jira: https://redhat.atlassian.net/browse/CNV-88908  # <skip-jira-utils-check>
 
     Markers:
         - tier3
@@ -519,10 +519,8 @@ class TestRestoreMultiDiskPerformance:
         - Fedora golden image DataSource available
     """
 
-    __test__ = False
-
-    @pytest.mark.polarion("CNV-16400")
-    def test_restore_vm_with_4_disks_completes_within_five_minutes(self):
+    @pytest.mark.polarion("CNV-16805")
+    def test_restore_vm_with_4_disks_completes_within_five_minutes(self, restored_vm_with_4_disks):
         """
         Test that restoring a snapshot of a VM with 4 disks completes within 5 minutes.
 
@@ -530,17 +528,20 @@ class TestRestoreMultiDiskPerformance:
             - Running Fedora VM with 4 disk devices (1 boot from golden image DataSource + 3 blank DVs)
             - VM snapshot taken and ready to use
             - VM stopped before restore
+            - Snapshot restore initiated with a 5-minute timeout
 
         Steps:
-            1. Restore the VM snapshot
-            2. Wait for the restore to complete with a 5-minute timeout
+            1. Verify the restore reports completion status
 
         Expected:
-            - Restore completes successfully within 5 minutes
+            - Restore completed successfully within 5 minutes
         """
+        assert restored_vm_with_4_disks.instance.status.complete, (
+            "Restore did not complete successfully within 5 minutes"
+        )
 
-    @pytest.mark.polarion("CNV-16401")
-    def test_restore_four_vms_with_4_disks_completes_within_five_minutes(self):
+    @pytest.mark.polarion("CNV-16806")
+    def test_restore_four_vms_with_4_disks_completes_within_five_minutes(self, restored_four_vms):
         """
         Test that restoring snapshots of 4 VMs (each with 4 disks) in parallel completes within 5 minutes.
 
@@ -548,11 +549,15 @@ class TestRestoreMultiDiskPerformance:
             - 4 running Fedora VMs, each with 4 disk devices (1 boot from golden image DataSource + 3 blank DVs)
             - VM snapshots taken and ready to use for all 4 VMs
             - All 4 VMs stopped before restore
+            - All 4 snapshot restores initiated concurrently with a shared 5-minute deadline
 
         Steps:
-            1. Restore all 4 VM snapshots concurrently
-            2. Wait for all restores to complete with a 5-minute timeout
+            1. For each restore, verify it reports completion status
 
         Expected:
-            - All 4 restores complete successfully within 5 minutes total
+            - All 4 restores completed successfully within 5 minutes total
         """
+        failed_restores = [restore.name for restore in restored_four_vms if not restore.instance.status.complete]
+        assert not failed_restores, (
+            f"Restores did not complete successfully within 5 minutes: {', '.join(failed_restores)}"
+        )
