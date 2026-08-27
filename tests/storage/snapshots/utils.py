@@ -1,4 +1,5 @@
 import logging
+import sys
 
 import pytest
 from kubernetes.client.rest import ApiException
@@ -60,6 +61,26 @@ def fail_to_create_snapshot_no_permissions(snapshot_name, namespace, vm_name, cl
 def start_windows_vm_after_restore(vm_restore, windows_vm):
     vm_restore.wait_restore_done(timeout=TIMEOUT_10MIN)
     running_vm(vm=windows_vm)
+
+
+def raise_cleanup_failures(message: str, cleanup_errors: list[Exception]) -> None:
+    """Raise cleanup errors without replacing an in-flight setup or test failure.
+
+    Args:
+        message: ExceptionGroup message when cleanup errors are raised.
+        cleanup_errors: Exceptions collected while cleaning resources.
+
+    Raises:
+        ExceptionGroup: Cleanup failures, including any exception already being handled.
+    """
+    if not cleanup_errors:
+        return
+    primary = sys.exception()
+    grouped_errors = [primary, *cleanup_errors] if isinstance(primary, Exception) else cleanup_errors
+    cleanup_group = ExceptionGroup(message, grouped_errors)
+    if primary is None:
+        raise cleanup_group
+    raise cleanup_group from primary
 
 
 def create_vm_with_4_disks(vm_name, namespace_name, client, storage_class_name, data_source):

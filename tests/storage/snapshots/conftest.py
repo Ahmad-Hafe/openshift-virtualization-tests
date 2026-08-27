@@ -15,7 +15,7 @@ from ocp_resources.virtual_machine_snapshot import VirtualMachineSnapshot
 from pyhelper_utils.shell import run_ssh_commands
 
 from tests.storage.snapshots.constants import NUM_MULTI_DISK_VMS, WINDOWS_DIRECTORY_PATH
-from tests.storage.snapshots.utils import create_vm_with_4_disks
+from tests.storage.snapshots.utils import create_vm_with_4_disks, raise_cleanup_failures
 from tests.storage.utils import (
     assert_windows_directory_existence,
     create_windows_directory,
@@ -209,7 +209,8 @@ def four_vms_with_4_disks_for_snapshot(
         list: Running VirtualMachineForTests objects, each with four disk devices.
 
     Raises:
-        ExceptionGroup: If cleanup of one or more VMs fails.
+        ExceptionGroup: If cleanup of one or more VMs fails. Includes the original
+            setup or test failure when both occur.
     """
     vms = []
     try:
@@ -231,8 +232,7 @@ def four_vms_with_4_disks_for_snapshot(
             except Exception as exp:
                 LOGGER.warning(f"Failed to clean up VM {vm.name}: {exp}")
                 cleanup_errors.append(exp)
-        if cleanup_errors:
-            raise ExceptionGroup("VM cleanup failures", cleanup_errors)
+        raise_cleanup_failures(message="VM cleanup failures", cleanup_errors=cleanup_errors)
 
 
 @pytest.fixture()
@@ -243,7 +243,8 @@ def snapshots_of_four_vms(admin_client, four_vms_with_4_disks_for_snapshot):
         dict: Mapping of each VM to its completed VirtualMachineSnapshot.
 
     Raises:
-        ExceptionGroup: If cleanup of one or more snapshots fails.
+        ExceptionGroup: If cleanup of one or more snapshots fails. Includes the original
+            setup or test failure when both occur.
     """
     for vm in four_vms_with_4_disks_for_snapshot:
         vm.stop(wait=True)
@@ -272,8 +273,7 @@ def snapshots_of_four_vms(admin_client, four_vms_with_4_disks_for_snapshot):
             except Exception as exp:
                 LOGGER.warning(f"Failed to clean up snapshot {snapshot.name}: {exp}")
                 cleanup_errors.append(exp)
-        if cleanup_errors:
-            raise ExceptionGroup("Snapshot cleanup failures", cleanup_errors)
+        raise_cleanup_failures(message="Snapshot cleanup failures", cleanup_errors=cleanup_errors)
 
 
 @pytest.fixture()
@@ -303,6 +303,7 @@ def restored_four_vms(admin_client, snapshots_of_four_vms):
 
     Raises:
         ExceptionGroup: If one or more restores fail, or if restore cleanup fails.
+            Cleanup failures include the original restore or test failure when both occur.
     """
     restores_by_vm = {
         vm: VirtualMachineRestore(
@@ -347,5 +348,4 @@ def restored_four_vms(admin_client, snapshots_of_four_vms):
             except Exception as exp:
                 LOGGER.warning(f"Failed to clean up restore {restore.name}: {exp}")
                 cleanup_errors.append(exp)
-        if cleanup_errors:
-            raise ExceptionGroup("Restore cleanup failures", cleanup_errors)
+        raise_cleanup_failures(message="Restore cleanup failures", cleanup_errors=cleanup_errors)
