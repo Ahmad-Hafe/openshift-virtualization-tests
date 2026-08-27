@@ -65,7 +65,8 @@ def start_windows_vm_after_restore(vm_restore, windows_vm):
 def create_vm_with_4_disks(vm_name, namespace_name, client, storage_class_name, data_source):
     """Create a Fedora VM with 1 boot disk from DataSource and 3 blank DVs.
 
-    If disk attachment or boot fails after deploy, the VM is cleaned up before re-raising.
+    If deploy, disk attachment, or boot fails, the VM is cleaned up before re-raising.
+    Cleanup failures are chained onto the original setup exception.
 
     Args:
         vm_name: Name for the VM.
@@ -91,8 +92,8 @@ def create_vm_with_4_disks(vm_name, namespace_name, client, storage_class_name, 
             storage_class=storage_class_name,
         ),
     )
-    vm.deploy(wait=True)
     try:
+        vm.deploy(wait=True)
         for disk_index in range(NUM_BLANK_DISKS):
             blank_dv = DataVolume(
                 name=f"{vm_name}-blank-{disk_index}",
@@ -113,5 +114,6 @@ def create_vm_with_4_disks(vm_name, namespace_name, client, storage_class_name, 
             vm.clean_up()
         except Exception as cleanup_error:
             LOGGER.error(f"Failed to clean up VM {vm_name}: {cleanup_error}")
+            raise error from cleanup_error
         raise
     return vm

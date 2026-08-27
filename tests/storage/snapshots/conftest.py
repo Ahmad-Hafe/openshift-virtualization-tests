@@ -162,7 +162,11 @@ def vm_with_4_disks_for_snapshot(
     snapshot_storage_class_name_scope_module,
     fedora_data_source_scope_module,
 ):
-    """Running Fedora VM with 4 disk devices for snapshot restore testing."""
+    """Create a Fedora VM with four disk devices for snapshot restore testing.
+
+    Yields:
+        VirtualMachineForTests: Running VM with four disk devices.
+    """
     vm = create_vm_with_4_disks(
         vm_name="vm-restore-4-disks",
         namespace_name=namespace.name,
@@ -176,7 +180,11 @@ def vm_with_4_disks_for_snapshot(
 
 @pytest.fixture()
 def snapshot_of_vm_with_4_disks(admin_client, vm_with_4_disks_for_snapshot):
-    """Offline snapshot of the 4-disk VM, ready to use."""
+    """Create an offline snapshot of the 4-disk VM.
+
+    Yields:
+        VirtualMachineSnapshot: Completed snapshot of the 4-disk VM.
+    """
     vm_with_4_disks_for_snapshot.stop(wait=True)
     with VirtualMachineSnapshot(
         name=f"snapshot-{vm_with_4_disks_for_snapshot.name}",
@@ -195,7 +203,14 @@ def four_vms_with_4_disks_for_snapshot(
     snapshot_storage_class_name_scope_module,
     fedora_data_source_scope_module,
 ):
-    """4 running Fedora VMs, each with 4 disk devices, for concurrent snapshot restore testing."""
+    """Create four Fedora VMs for concurrent snapshot restore testing.
+
+    Yields:
+        list: Running VirtualMachineForTests objects, each with four disk devices.
+
+    Raises:
+        ExceptionGroup: If cleanup of one or more VMs fails.
+    """
     vms = []
     try:
         for vm_index in range(NUM_MULTI_DISK_VMS):
@@ -214,7 +229,7 @@ def four_vms_with_4_disks_for_snapshot(
             try:
                 vm.clean_up()
             except Exception as exp:
-                LOGGER.warning(f"Failed to clean up VM {vm.name}")
+                LOGGER.warning(f"Failed to clean up VM {vm.name}: {exp}")
                 cleanup_errors.append(exp)
         if cleanup_errors:
             raise ExceptionGroup("VM cleanup failures", cleanup_errors)
@@ -222,7 +237,14 @@ def four_vms_with_4_disks_for_snapshot(
 
 @pytest.fixture()
 def snapshots_of_four_vms(admin_client, four_vms_with_4_disks_for_snapshot):
-    """Offline snapshots of all 4 VMs, ready to use."""
+    """Create offline snapshots of all four VMs.
+
+    Yields:
+        dict: Mapping of each VM to its completed VirtualMachineSnapshot.
+
+    Raises:
+        ExceptionGroup: If cleanup of one or more snapshots fails.
+    """
     for vm in four_vms_with_4_disks_for_snapshot:
         vm.stop(wait=True)
 
@@ -235,8 +257,8 @@ def snapshots_of_four_vms(admin_client, four_vms_with_4_disks_for_snapshot):
                 vm_name=vm.name,
                 client=admin_client,
             )
-            snapshot.deploy()
             snapshots.append(snapshot)
+            snapshot.deploy()
 
         for snapshot in snapshots:
             snapshot.wait_snapshot_done(timeout=TIMEOUT_10MIN)
@@ -248,7 +270,7 @@ def snapshots_of_four_vms(admin_client, four_vms_with_4_disks_for_snapshot):
             try:
                 snapshot.clean_up()
             except Exception as exp:
-                LOGGER.warning(f"Failed to clean up snapshot {snapshot.name}")
+                LOGGER.warning(f"Failed to clean up snapshot {snapshot.name}: {exp}")
                 cleanup_errors.append(exp)
         if cleanup_errors:
             raise ExceptionGroup("Snapshot cleanup failures", cleanup_errors)
@@ -256,7 +278,11 @@ def snapshots_of_four_vms(admin_client, four_vms_with_4_disks_for_snapshot):
 
 @pytest.fixture()
 def restored_vm_with_4_disks(admin_client, vm_with_4_disks_for_snapshot, snapshot_of_vm_with_4_disks):
-    """Restore the 4-disk VM snapshot within the 5-minute performance budget."""
+    """Restore the 4-disk VM snapshot within the 5-minute performance budget.
+
+    Yields:
+        VirtualMachineRestore: Completed restore of the 4-disk VM.
+    """
     with VirtualMachineRestore(
         name=f"restore-{vm_with_4_disks_for_snapshot.name}",
         namespace=vm_with_4_disks_for_snapshot.namespace,
@@ -270,7 +296,14 @@ def restored_vm_with_4_disks(admin_client, vm_with_4_disks_for_snapshot, snapsho
 
 @pytest.fixture()
 def restored_four_vms(admin_client, snapshots_of_four_vms):
-    """Restore all 4 VM snapshots concurrently within the 5-minute performance budget."""
+    """Restore all four VM snapshots concurrently within the 5-minute performance budget.
+
+    Yields:
+        list: VirtualMachineRestore objects for the concurrent restores.
+
+    Raises:
+        ExceptionGroup: If one or more restores fail, or if restore cleanup fails.
+    """
     restores_by_vm = {
         vm: VirtualMachineRestore(
             name=f"restore-{vm.name}",
@@ -312,7 +345,7 @@ def restored_four_vms(admin_client, snapshots_of_four_vms):
             try:
                 restore.clean_up()
             except Exception as exp:
-                LOGGER.warning(f"Failed to clean up restore {restore.name}")
+                LOGGER.warning(f"Failed to clean up restore {restore.name}: {exp}")
                 cleanup_errors.append(exp)
         if cleanup_errors:
             raise ExceptionGroup("Restore cleanup failures", cleanup_errors)
