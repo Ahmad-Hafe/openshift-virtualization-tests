@@ -28,7 +28,12 @@ from tests.storage.snapshots.utils import (
     start_windows_vm_after_restore,
 )
 from tests.storage.utils import assert_windows_directory_existence
-from utilities.constants.cluster import LS_COMMAND, RHCOS9_AFFINITY, RHCOS9_WORKER_LABEL, RHCOS10_AFFINITY
+from utilities.constants.cluster import (
+    LS_COMMAND,
+    RHCOS9_AFFINITY,
+    RHCOS9_WORKER_LABEL,
+    RHCOS10_AFFINITY,
+)
 from utilities.constants.timeouts import TIMEOUT_1MIN, TIMEOUT_5MIN, TIMEOUT_10MIN, TIMEOUT_10SEC
 from utilities.storage import assert_guest_disk_count, run_command_on_vm_and_check_output
 from utilities.virt import restart_vm_wait_for_running_vm, running_vm, set_vm_affinity
@@ -36,7 +41,7 @@ from utilities.virt import restart_vm_wait_for_running_vm, running_vm, set_vm_af
 if TYPE_CHECKING:
     from kubernetes.dynamic import DynamicClient
 
-    from utilities.virt import VirtualMachineForTests
+    from utilities.virt import VirtualMachineForTestsFromTemplate
 
 LOGGER = logging.getLogger(__name__)
 
@@ -675,7 +680,7 @@ class TestSnapshotRestoreMixedRhcos:
     def test_snapshot_rhcos9_restore_rhcos10(
         self,
         admin_client: DynamicClient,
-        snapshot_source_vm: VirtualMachineForTests,
+        snapshot_source_vm: VirtualMachineForTestsFromTemplate,
     ) -> None:
         """
         Test that snapshot created on RHCOS 9 can be restored on RHCOS 10 with data integrity.
@@ -744,7 +749,7 @@ class TestSnapshotRestoreMixedRhcos:
     def test_snapshot_rhcos10_restore_rhcos9(
         self,
         admin_client: DynamicClient,
-        snapshot_source_vm: VirtualMachineForTests,
+        snapshot_source_vm: VirtualMachineForTestsFromTemplate,
     ) -> None:
         """
         Test that snapshot created on RHCOS 10 can be restored on RHCOS 9 with data integrity.
