@@ -5,7 +5,7 @@ Snapshots tests
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import pytest
 from kubernetes.client.rest import ApiException
@@ -661,117 +661,68 @@ class TestSnapshotRestoreMixedRhcos:
     """
 
     @pytest.mark.parametrize(
-        "golden_image_data_source_for_test_scope_function, snapshot_source_vm",
+        "golden_image_data_source_for_test_scope_function, snapshot_source_vm, "
+        "expect_label_before, target_affinity, expect_label_after",
         [
             pytest.param(
                 {"os_dict": RHEL_LATEST},
                 {
-                    "vm_name": "snapshot-rhcos9-restore-rhcos10-rhel",
+                    "vm_name": "snap-rhcos9-restore-rhcos10-rhel",
                     "template_labels": RHEL_LATEST_LABELS,
                     "vm_affinity": RHCOS9_AFFINITY,
                 },
+                True,
+                RHCOS10_AFFINITY,
+                False,
                 marks=pytest.mark.polarion("CNV-96772-1"),
-                id="RHEL-VM",
+                id="rhcos9-to-rhcos10",
             ),
-        ],
-        indirect=True,
-    )
-    def test_snapshot_rhcos9_restore_rhcos10(
-        self,
-        admin_client: DynamicClient,
-        snapshot_source_vm: VirtualMachineForTestsFromTemplate,
-    ) -> None:
-        """
-        Test that snapshot created on RHCOS 9 can be restored on RHCOS 10 with data integrity.
-
-        Preconditions:
-            - RHEL VM running on an RHCOS 9 worker node with known test data
-
-        Steps:
-            1. Verify VM is on RHCOS 9 worker node
-            2. Create snapshot of the VM on RHCOS 9
-            3. Change VM affinity to RHCOS 10 worker node
-            4. Restore VM from snapshot on RHCOS 10
-            5. Verify VM is running on RHCOS 10 node
-
-        Expected:
-            - VM is on RHCOS 9 before snapshot
-            - Snapshot created successfully
-            - VM restores without errors
-            - VM is running on RHCOS 10 node after restore
-        """
-        vm = snapshot_source_vm
-        assert RHCOS9_WORKER_LABEL in vm.vmi.get_node(privileged_client=admin_client).labels.keys(), (
-            f"VM {vm.name} is not running on an RHCOS 9 node before snapshot"
-        )
-
-        if vm.ready:
-            vm.stop(wait=True)
-
-        with VirtualMachineSnapshot(
-            name=f"snapshot-{vm.name}",
-            namespace=vm.namespace,
-            vm_name=vm.name,
-            client=admin_client,
-        ) as snapshot:
-            snapshot.wait_snapshot_done(timeout=TIMEOUT_10MIN)
-            set_vm_affinity(vm=vm, affinity=RHCOS10_AFFINITY)
-            with VirtualMachineRestore(
-                name=f"restore-{vm.name}",
-                namespace=vm.namespace,
-                vm_name=vm.name,
-                snapshot_name=snapshot.name,
-                client=admin_client,
-            ) as restore:
-                restore.wait_restore_done(timeout=TIMEOUT_10MIN)
-                running_vm(vm=vm)
-                assert RHCOS9_WORKER_LABEL not in vm.vmi.get_node(privileged_client=admin_client).labels.keys(), (
-                    f"VM {vm.name} is not running on an RHCOS 10 node after restore"
-                )
-
-    @pytest.mark.parametrize(
-        "golden_image_data_source_for_test_scope_function, snapshot_source_vm",
-        [
             pytest.param(
                 {"os_dict": RHEL_LATEST},
                 {
-                    "vm_name": "snapshot-rhcos10-restore-rhcos9-rhel",
+                    "vm_name": "snap-rhcos10-restore-rhcos9-rhel",
                     "template_labels": RHEL_LATEST_LABELS,
                     "vm_affinity": RHCOS10_AFFINITY,
                 },
+                False,
+                RHCOS9_AFFINITY,
+                True,
                 marks=pytest.mark.polarion("CNV-96772-2"),
-                id="RHEL-VM",
+                id="rhcos10-to-rhcos9",
             ),
         ],
-        indirect=True,
+        indirect=["golden_image_data_source_for_test_scope_function", "snapshot_source_vm"],
     )
-    def test_snapshot_rhcos10_restore_rhcos9(
+    def test_snapshot_restore_across_rhcos_versions(
         self,
         admin_client: DynamicClient,
         snapshot_source_vm: VirtualMachineForTestsFromTemplate,
+        expect_label_before: bool,
+        target_affinity: dict[str, Any],
+        expect_label_after: bool,
     ) -> None:
         """
-        Test that snapshot created on RHCOS 10 can be restored on RHCOS 9 with data integrity.
+        Test that snapshot created on one RHCOS version can be restored on another.
 
         Preconditions:
-            - RHEL VM running on an RHCOS 10 worker node with known test data
+            - VM running on source RHCOS worker node
 
         Steps:
-            1. Verify VM is on RHCOS 10 worker node
-            2. Create snapshot of the VM on RHCOS 10
-            3. Change VM affinity to RHCOS 9 worker node
-            4. Restore VM from snapshot on RHCOS 9
-            5. Verify VM is running on RHCOS 9 node
+            1. Verify VM is on expected source RHCOS node
+            2. Create snapshot of the VM
+            3. Change VM affinity to target RHCOS version
+            4. Restore VM from snapshot on target RHCOS node
+            5. Verify VM is running on target RHCOS node
 
         Expected:
-            - VM is on RHCOS 10 before snapshot
             - Snapshot created successfully
             - VM restores without errors
-            - VM is running on RHCOS 9 node after restore
+            - VM is running on target RHCOS node after restore
         """
         vm = snapshot_source_vm
-        assert RHCOS9_WORKER_LABEL not in vm.vmi.get_node(privileged_client=admin_client).labels.keys(), (
-            f"VM {vm.name} is not running on an RHCOS 10 node before snapshot"
+        node_labels = vm.vmi.get_node(privileged_client=admin_client).labels
+        assert (RHCOS9_WORKER_LABEL in node_labels) == expect_label_before, (
+            f"VM {vm.name} pre-snapshot node label mismatch"
         )
 
         if vm.ready:
@@ -784,7 +735,7 @@ class TestSnapshotRestoreMixedRhcos:
             client=admin_client,
         ) as snapshot:
             snapshot.wait_snapshot_done(timeout=TIMEOUT_10MIN)
-            set_vm_affinity(vm=vm, affinity=RHCOS9_AFFINITY)
+            set_vm_affinity(vm=vm, affinity=target_affinity)
             with VirtualMachineRestore(
                 name=f"restore-{vm.name}",
                 namespace=vm.namespace,
@@ -794,6 +745,7 @@ class TestSnapshotRestoreMixedRhcos:
             ) as restore:
                 restore.wait_restore_done(timeout=TIMEOUT_10MIN)
                 running_vm(vm=vm)
-                assert RHCOS9_WORKER_LABEL in vm.vmi.get_node(privileged_client=admin_client).labels.keys(), (
-                    f"VM {vm.name} is not running on an RHCOS 9 node after restore"
+                node_labels = vm.vmi.get_node(privileged_client=admin_client).labels
+                assert (RHCOS9_WORKER_LABEL in node_labels) == expect_label_after, (
+                    f"VM {vm.name} post-restore node label mismatch"
                 )

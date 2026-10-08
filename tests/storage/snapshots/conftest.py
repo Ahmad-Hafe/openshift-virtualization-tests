@@ -35,6 +35,8 @@ from utilities.constants.timeouts import (
 from utilities.storage import data_volume_template_with_source_ref_dict
 from utilities.virt import (
     VirtualMachineForTestsFromTemplate,
+    get_data_volume_template_dict_with_default_storage_class,
+    get_or_create_golden_image_data_source,
     running_vm,
     vm_instance_from_template,
 )
@@ -243,6 +245,32 @@ def vms_with_4_disks_created(
 
         if cleanup_errors:
             raise ExceptionGroup("VM cleanup errors", cleanup_errors)
+
+
+@pytest.fixture()
+def golden_image_data_source_for_test_scope_function(
+    request: pytest.FixtureRequest,
+    admin_client: DynamicClient,
+    golden_images_namespace: str,
+) -> Generator[dict[str, Any]]:
+    """Provide golden image data source for parametrized snapshot tests."""
+    yield from get_or_create_golden_image_data_source(
+        admin_client=admin_client,
+        golden_images_namespace=golden_images_namespace,
+        os_dict=request.param["os_dict"],
+    )
+
+
+@pytest.fixture()
+def golden_image_data_volume_template_for_test_scope_function(
+    request: pytest.FixtureRequest,
+    golden_image_data_source_for_test_scope_function: dict[str, Any],
+) -> dict[str, Any]:
+    """Create golden image data volume template from parametrized data source."""
+    return get_data_volume_template_dict_with_default_storage_class(
+        data_source=golden_image_data_source_for_test_scope_function,
+        storage_class=getattr(request, "param", {}).get("storage_class"),
+    )
 
 
 @pytest.fixture()
