@@ -50,12 +50,11 @@ class TestUpgrade:
         self,
         admin_client,
         hco_namespace,
-        migratable_vms,
         cnv_target_version,
         cnv_upgrade_stream,
         fired_alerts_before_upgrade,
         disabled_default_sources_in_operatorhub,
-        updated_image_content_source_policy,
+        updated_konflux_idms,
         updated_custom_hco_catalog_source_image,
         updated_cnv_subscription_source,
         approved_cnv_upgrade_install_plan,
@@ -79,7 +78,7 @@ class TestUpgrade:
             6.4. Wait until HCO is stable and its version is updated.
         """
         verify_upgrade_cnv(
-            dyn_client=admin_client,
+            client=admin_client,
             hco_namespace=hco_namespace,
             expected_images=related_images_from_target_csv.values(),
         )
@@ -92,7 +91,6 @@ class TestUpgrade:
         self,
         admin_client,
         hco_namespace,
-        migratable_vms,
         cnv_target_version,
         cnv_upgrade_stream,
         fired_alerts_before_upgrade,
@@ -109,7 +107,7 @@ class TestUpgrade:
         but it is not needed to disable the default sources, create a new ICSP or update the HCO CatalogSource.
         """
         verify_upgrade_cnv(
-            dyn_client=admin_client,
+            client=admin_client,
             hco_namespace=hco_namespace,
             expected_images=related_images_from_target_csv.values(),
         )

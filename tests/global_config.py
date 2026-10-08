@@ -7,49 +7,58 @@ from ocp_resources.virtual_machine import VirtualMachine
 
 from utilities.architecture import get_cluster_architecture
 from utilities.artifactory import BASE_ARTIFACTORY_LOCATION
-from utilities.constants import (
+from utilities.constants import Images
+from utilities.constants.aaq import (
     AAQ_VIRTUAL_RESOURCES,
     AAQ_VMI_POD_USAGE,
-    ALL_CNV_CRDS,
+)
+from utilities.constants.architecture import MULTIARCH
+from utilities.constants.components import (
     ALL_CNV_DAEMONSETS,
     ALL_CNV_DEPLOYMENTS,
     ALL_CNV_PODS,
     ALL_HCO_RELATED_OBJECTS,
-    BREW_REGISTERY_SOURCE,
+    CNV_OPERATORS,
+    HCO_CATALOG_SOURCE,
+    VM_CONSOLE_PROXY_CLUSTER_RESOURCES,
+    VM_CONSOLE_PROXY_NAMESPACE_RESOURCES,
+)
+from utilities.constants.hco import (
+    ALL_CNV_CRDS,
+    PRODUCTION_CATALOG_SOURCE,
+    TLS_CUSTOM_POLICY,
+    TLS_OLD_POLICY,
+)
+from utilities.constants.images import OS_FLAVOR_FEDORA
+from utilities.constants.instance_types import (
     CENTOS_STREAM9_PREFERENCE,
     CENTOS_STREAM10_PREFERENCE,
-    CNV_OPERATORS,
-    CNV_PROMETHEUS_RULES,
-    HCO_CATALOG_SOURCE,
-    HPP_CAPABILITIES,
-    IPV4_STR,
-    IPV6_STR,
-    LINUX_BRIDGE,
-    MONITORING_METRICS,
-    OS_FLAVOR_FEDORA,
-    OVS_BRIDGE,
-    PRODUCTION_CATALOG_SOURCE,
     RHEL8_PREFERENCE,
     RHEL9_PREFERENCE,
     RHEL10_PREFERENCE,
+    U1_MEDIUM_STR,
+)
+from utilities.constants.monitoring import MONITORING_METRICS
+from utilities.constants.namespaces import NamespacesNames
+from utilities.constants.storage import (
+    BREW_REGISTRY_SOURCE,
+    HPP_CAPABILITIES,
+    StorageClassNames,
+)
+from utilities.constants.tekton import (
     TEKTON_AVAILABLE_PIPELINEREF,
     TEKTON_AVAILABLE_TASKS,
+)
+from utilities.constants.timeouts import (
     TIMEOUT_5MIN,
     TIMEOUT_5SEC,
-    TLS_CUSTOM_POLICY,
-    TLS_OLD_POLICY,
-    U1_MEDIUM_STR,
-    VM_CONSOLE_PROXY_CLUSTER_RESOURCES,
-    VM_CONSOLE_PROXY_NAMESPACE_RESOURCES,
-    Images,
-    NamespacesNames,
-    StorageClassNames,
 )
 from utilities.storage import HppCsiStorageClass
 
-arch = get_cluster_architecture()
 global config
-global_config = pytest_testconfig.load_python(py_file=f"tests/global_config_{arch}.py", encoding="utf-8")
+cluster_arch = get_cluster_architecture()
+cluster_type = MULTIARCH if len(cluster_arch) > 1 else next(iter(cluster_arch))
+global_config = pytest_testconfig.load_python(py_file=f"tests/global_config_{cluster_type}.py", encoding="utf-8")
 
 
 def _get_default_storage_class(sc_list):
@@ -69,11 +78,11 @@ def _get_default_storage_class(sc_list):
 
 no_unprivileged_client = False
 hco_cr_name = "kubevirt-hyperconverged"
-hco_namespace = "openshift-cnv"
-openshift_apiserver_namespace = "openshift-apiserver"
-sriov_namespace = "openshift-sriov-network-operator"
-marketplace_namespace = "openshift-marketplace"
-machine_api_namespace = "openshift-machine-api"
+hco_namespace = NamespacesNames.OPENSHIFT_CNV
+openshift_apiserver_namespace = NamespacesNames.OPENSHIFT_APISERVER
+sriov_namespace = NamespacesNames.OPENSHIFT_SRIOV_NETWORK_OPERATOR
+marketplace_namespace = NamespacesNames.OPENSHIFT_MARKETPLACE
+machine_api_namespace = NamespacesNames.MACHINE_API_NAMESPACE
 golden_images_namespace = NamespacesNames.OPENSHIFT_VIRTUALIZATION_OS_IMAGES
 hco_subscription = ""  # TODO: remove constants/HCO_SUBSCRIPTION and use this instead.
 disconnected_cluster = False
@@ -90,7 +99,7 @@ servers = {
 cnv_registry_sources = {
     "osbs": {
         "cnv_subscription_source": HCO_CATALOG_SOURCE,
-        "source_map": BREW_REGISTERY_SOURCE,
+        "source_map": BREW_REGISTRY_SOURCE,
     },
     "hotfix": {
         "cnv_subscription_source": HCO_CATALOG_SOURCE,
@@ -100,7 +109,7 @@ cnv_registry_sources = {
     },
     "fbc": {
         "cnv_subscription_source": HCO_CATALOG_SOURCE,
-        "source_map": BREW_REGISTERY_SOURCE,
+        "source_map": BREW_REGISTRY_SOURCE,
     },
 }
 
@@ -127,8 +136,6 @@ cnv_vm_resource_requests_units_matrix = [
 
 cnv_vmi_monitoring_metrics_matrix = MONITORING_METRICS
 
-bridge_device_matrix = [LINUX_BRIDGE, OVS_BRIDGE]
-
 storage_class_matrix = [
     {
         StorageClassNames.CEPH_RBD_VIRTUALIZATION: {
@@ -138,6 +145,7 @@ storage_class_matrix = [
             "online_resize": True,
             "wffc": False,
             "default": True,
+            "data_import_cron_source_format": "snapshot",
         }
     },
     {HppCsiStorageClass.Name.HOSTPATH_CSI_BASIC: HPP_CAPABILITIES},
@@ -191,17 +199,11 @@ data_import_cron_matrix = [
     {"rhel10": {"instance_type": U1_MEDIUM_STR, "preference": RHEL10_PREFERENCE}},
 ]
 
-ip_stack_version_matrix = [
-    IPV4_STR,
-    IPV6_STR,
-]
 cnv_pod_matrix = ALL_CNV_PODS
 cnv_crd_matrix = ALL_CNV_CRDS
 cnv_crypto_policy_matrix = [TLS_OLD_POLICY, TLS_CUSTOM_POLICY]
 
 cnv_related_object_matrix = ALL_HCO_RELATED_OBJECTS
-cnv_prometheus_rules_matrix = CNV_PROMETHEUS_RULES
-
 cnv_deployment_matrix = ALL_CNV_DEPLOYMENTS
 cnv_daemonset_matrix = ALL_CNV_DAEMONSETS
 pod_resource_validation_matrix = [{"cpu": 5}, {"memory": None}]
@@ -253,10 +255,10 @@ os_login_param: dict[str, Any] = {}
 vlans = [f"{_id}" for _id in range(1000, 1020)]
 
 for _dir in dir():
-    if not config:  # noqa: F821
+    if not config:
         config: dict[str, Any] = {}
     val = locals()[_dir]
-    if type(val) not in [bool, list, dict, str, int]:
+    if type(val) not in [bool, list, dict, str, int, set]:
         continue
 
     if _dir in ["encoding", "py_file"]:

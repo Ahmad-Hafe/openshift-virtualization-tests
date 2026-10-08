@@ -5,14 +5,11 @@ from tests.observability.metrics.constants import (
     KUBEVIRT_VMI_INFO,
 )
 from tests.observability.metrics.utils import (
-    assert_vm_metric,
-    assert_vm_metric_virt_handler_pod,
+    assert_vm_metric_labels,
     compare_kubevirt_vmi_info_metric_with_vm_info,
 )
-from tests.observability.utils import validate_metrics_value
-from utilities.constants import (
-    KUBEVIRT_HCO_HYPERCONVERGED_CR_EXISTS,
-)
+from utilities.constants.monitoring import KUBEVIRT_HCO_HYPERCONVERGED_CR_EXISTS
+from utilities.monitoring import validate_metrics_value
 
 pytestmark = [pytest.mark.post_upgrade, pytest.mark.sno]
 
@@ -21,35 +18,37 @@ class TestMetricsLinux:
     @pytest.mark.polarion("CNV-11906")
     @pytest.mark.s390x
     def test_cnv_vmi_monitoring_metrics_linux_vm(
-        self, prometheus, single_metric_vm, cnv_vmi_monitoring_metrics_matrix__function__
+        self, admin_client, prometheus, single_metric_vm, cnv_vmi_monitoring_metrics_matrix__function__
     ):
         """
-        Tests validating ability to perform various prometheus api queries on various metrics against a given vm.
-        This test also validates ability to pull metric information from a given vm's virt-handler pod and validates
-        appropriate information exists for that metrics.
+        Tests validating ability to perform various prometheus api queries on various metrics against a given vm
+        and validates appropriate label information (node, namespace) exists for those metrics.
         """
-        assert_vm_metric(
-            prometheus=prometheus, query=cnv_vmi_monitoring_metrics_matrix__function__, vm_name=single_metric_vm.name
+        assert_vm_metric_labels(
+            prometheus=prometheus,
+            query=cnv_vmi_monitoring_metrics_matrix__function__,
+            vm=single_metric_vm,
+            admin_client=admin_client,
         )
-        assert_vm_metric_virt_handler_pod(query=cnv_vmi_monitoring_metrics_matrix__function__, vm=single_metric_vm)
 
 
 @pytest.mark.tier3
+@pytest.mark.windows
 class TestMetricsWindows:
     @pytest.mark.polarion("CNV-11880")
     def test_cnv_vmi_monitoring_metrics_windows_vm(
         self,
+        admin_client,
         prometheus,
-        xfail_if_memory_metric_has_bug,
         windows_vm_for_test,
         cnv_vmi_monitoring_metrics_matrix__function__,
     ):
-        assert_vm_metric(
+        assert_vm_metric_labels(
             prometheus=prometheus,
             query=cnv_vmi_monitoring_metrics_matrix__function__,
-            vm_name=windows_vm_for_test.name,
+            vm=windows_vm_for_test,
+            admin_client=admin_client,
         )
-        assert_vm_metric_virt_handler_pod(query=cnv_vmi_monitoring_metrics_matrix__function__, vm=windows_vm_for_test)
 
 
 @pytest.mark.polarion("CNV-10438")
@@ -66,16 +65,6 @@ def test_cnv_installation_with_hco_cr_metrics(
 
 
 class TestVMIMetricsLinuxVms:
-    @pytest.mark.polarion("CNV-11400")
-    @pytest.mark.s390x
-    def test_kubevirt_vmi_info(self, prometheus, single_metric_vm, vmi_guest_os_kernel_release_info_linux):
-        compare_kubevirt_vmi_info_metric_with_vm_info(
-            prometheus=prometheus,
-            query=KUBEVIRT_VMI_INFO.format(vm_name=single_metric_vm.name),
-            expected_value="1",
-            values_to_compare=vmi_guest_os_kernel_release_info_linux,
-        )
-
     @pytest.mark.polarion("CNV-11862")
     @pytest.mark.s390x
     def test_metric_kubevirt_vm_info(self, prometheus, single_metric_vm, linux_vm_info_to_compare):
@@ -88,6 +77,7 @@ class TestVMIMetricsLinuxVms:
 
 
 @pytest.mark.tier3
+@pytest.mark.windows
 class TestVMIMetricsWindowsVms:
     @pytest.mark.polarion("CNV-11861")
     def test_kubevirt_vmi_info_windows(self, prometheus, windows_vm_for_test, vmi_guest_os_kernel_release_info_windows):

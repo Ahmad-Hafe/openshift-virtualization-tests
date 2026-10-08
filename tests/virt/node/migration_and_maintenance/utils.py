@@ -1,123 +1,90 @@
-import json
+from __future__ import annotations
+
 import logging
-import re
-from contextlib import contextmanager
+from time import sleep
+from typing import TYPE_CHECKING
 
-from kubernetes.dynamic.exceptions import InternalServerError
-from ocp_resources.network_attachment_definition import NetworkAttachmentDefinition
-from timeout_sampler import TimeoutExpiredError, TimeoutSampler
+from pyhelper_utils.shell import run_ssh_commands
 
-from utilities.constants import TIMEOUT_3MIN, TIMEOUT_10SEC
-from utilities.hco import ResourceEditorValidateHCOReconcile
-from utilities.infra import ExecCommandOnPod, get_hyperconverged_resource
-from utilities.virt import check_migration_process_after_node_drain, node_mgmt_console
+from utilities.constants.images import OS_FLAVOR_WINDOWS
+from utilities.constants.timeouts import TCP_TIMEOUT_30SEC
+from utilities.constants.virt import REGEDIT_PROC_NAME
+from utilities.virt import fetch_pid_from_linux_vm, fetch_pid_from_windows_vm
+
+if TYPE_CHECKING:
+    from utilities.virt import VirtualMachineForTests
 
 LOGGER = logging.getLogger(__name__)
-WHEREABOUTS_NETWORK = "10.200.5.0/24"
-TCPDUMP_LOG_FILE = "/tmp/mig_tcpdump.log"
+
+STRESS_RAMP_UP_SEC = 5
+
+# Allocate and continuously re-dirty memory pages without stress-ng (uses built-in PowerShell/Python).
+WIN_MEM_LOAD_CMD = (
+    "powershell.exe -NoProfile -WindowStyle Hidden -Command"
+    ' "$a0=New-Object byte[] (1GB);$a1=New-Object byte[] (1GB);'
+    ' while($true){ for($i=0;$i -lt $a0.Length;$i+=4096){$a0[$i]++;$a1[$i]++} }"'
+)
+RHEL_MEM_LOAD_CMD = (
+    "import time; a = bytearray(2 * 1024**3); "
+    'exec("while True: [a.__setitem__(i, (a[i]+1)%256) for i in range(0, len(a), 4096)]; time.sleep(0.5)")'
+)
 
 
-class MACVLANNetworkAttachmentDefinition(NetworkAttachmentDefinition):
-    def __init__(
-        self,
-        name,
-        namespace,
-        master,
-        client,
-        teardown=True,
-    ):
-        super().__init__(name=name, namespace=namespace, client=client, teardown=teardown)
-        self.master = master
-
-    def to_dict(self):
-        super().to_dict()
-        spec_config = {
-            "cniVersion": "0.3.1",
-            "type": "macvlan",
-            "master": self.master,
-            "mode": "bridge",
-            "ipam": {
-                "type": "whereabouts",
-                "range": WHEREABOUTS_NETWORK,
-            },
-        }
-
-        self.res["spec"]["config"] = json.dumps(spec_config)
-
-
-def assert_vm_migrated_through_dedicated_network_with_logs(source_node, vm, virt_handler_pods):
-    def _get_source_migration_logs():
-        for pod in virt_handler_pods:
-            if pod.node.name == source_node.name:
-                return pod.log()
-
-    LOGGER.info(f"Checking virt-handler logs of VM {vm.name} migrated via dedicated network")
-    # get first 3 octets of network address
-    parsed_ip = re.search(r"(\d{1,3}\.\d{1,3}\.\d{1,3})\.\d{1,3}\/\d{1,2}", WHEREABOUTS_NETWORK).group(1)
-    parsed_ip = parsed_ip.replace(".", "\\.")
-    search_pattern = rf"\"proxy \w+? listening\".+?{parsed_ip}.+?\"uid\":\"{vm.vmi.instance.metadata.uid}\""
-
-    # matches list should contain 3 matches for start of migration and 3 for end of it
-    # start log - ... "msg": "proxy started listening", "ourbound": ...
-    # end log - ... "msg": "proxy stopped listening", "outbound": ...
-    # 3 started/stoped logs should exist since 3 different proxies are created during migration process
-    matches = re.findall(search_pattern, _get_source_migration_logs())
-    assert len(matches) == 6, f"Not all migration logs found. Found {len(matches)} of 6"
-
-
-def assert_node_drain_and_vm_migration(dyn_client, vm, virt_handler_pods):
-    source_node = vm.privileged_vmi.node
-    with node_mgmt_console(node=source_node, node_mgmt="drain"):
-        check_migration_process_after_node_drain(dyn_client=dyn_client, vm=vm)
-        assert_vm_migrated_through_dedicated_network_with_logs(
-            source_node=source_node, vm=vm, virt_handler_pods=virt_handler_pods
-        )
-
-
-def assert_vm_migrated_through_dedicated_network_with_tcpdump(utility_pods, node, vm):
-    LOGGER.info(f"Checking tcpdump logs of VM {vm.name} migration")
-    tcpdump_out = ExecCommandOnPod(utility_pods=utility_pods, node=node).exec(
-        command=f"cat {TCPDUMP_LOG_FILE}", chroot_host=False
-    )
-    assert tcpdump_out, "Migration didn't go through dedicated network!"
-
-
-@contextmanager
-def run_tcpdump_on_source_node(utility_pods, node, iface_name):
-    pod_exec = ExecCommandOnPod(utility_pods=utility_pods, node=node)
-    pod_exec.exec(
-        command=f"tcpdump -i {iface_name} net {WHEREABOUTS_NETWORK} -nnn > {TCPDUMP_LOG_FILE} 2> /dev/null &",
-        chroot_host=False,
+def assert_expected_migration_mode(vm: VirtualMachineForTests, expected_mode: str) -> None:
+    migration_state = vm.vmi.instance.status.migrationState
+    assert migration_state.mode == expected_mode, (
+        f"Migration mode is not {expected_mode}! VMI MigrationState {migration_state}"
     )
 
-    yield
 
-    pod_exec.exec(command=f"pkill tcpdump; rm -f {TCPDUMP_LOG_FILE}")
+def assert_same_pid_after_migration(orig_pid: str, vm: VirtualMachineForTests) -> None:
+    if vm.os_flavor == OS_FLAVOR_WINDOWS:
+        new_pid = fetch_pid_from_windows_vm(vm=vm, process_name=REGEDIT_PROC_NAME)
+    else:
+        new_pid = fetch_pid_from_linux_vm(vm=vm, process_name="ping")
+    assert new_pid == orig_pid, f"PID mismatch after migration! orig_pid: {orig_pid}; new_pid: {new_pid}"
 
 
-@contextmanager
-def update_hco_migration_config(client, hco_ns_name, param, value):
-    def _wait_restore(_resource_editor):
-        # Sometime in tests that do node draining in process, the virt-operator
-        # pods are not yet running again after the test if finished therefore the
-        # attempt to update HCO recource will fail with InternalServerError
-        samples = TimeoutSampler(
-            wait_timeout=TIMEOUT_3MIN,
-            sleep=TIMEOUT_10SEC,
-            func=_resource_editor.restore,
-            exceptions_dict={InternalServerError: []},
-        )
-        try:
-            for sample in samples:
-                if not sample:
-                    break
-        except TimeoutExpiredError:
-            raise
+def start_memory_pressure_on_vm(vm: VirtualMachineForTests) -> None:
+    """Continuously dirty memory pages to prevent pre-copy migration convergence.
 
-    hco_cr = get_hyperconverged_resource(client=client, hco_ns_name=hco_ns_name)
-    editor = ResourceEditorValidateHCOReconcile(
-        patches={hco_cr: {"spec": {"liveMigrationConfig": {param: value}}}},
-    )
-    editor.update(backup_resources=True)
-    yield
-    _wait_restore(_resource_editor=editor)
+    Kills any leftover stress processes before spawning new ones, since
+    previous processes may be degraded after migration. Sleeps
+    STRESS_RAMP_UP_SEC after starting so the allocation and dirty loop
+    reach steady-state before migration begins.
+
+    This function requires no external tools — uses built-in PowerShell on Windows
+    and Python on Linux.
+
+    Args:
+        vm: Target VM to stress.
+    """
+    is_windows = vm.os_flavor == OS_FLAVOR_WINDOWS
+
+    LOGGER.info(f"Killing leftover memory pressure processes on VM {vm.name}")
+    if is_windows:
+        kill_cmd = ["powershell", "Stop-Process", "-Name", "powershell", "-Force"]
+    else:
+        kill_cmd = ["pkill", "-f", "python3 -c.*bytearray"]
+    run_ssh_commands(host=vm.ssh_exec, commands=kill_cmd, tcp_timeout=TCP_TIMEOUT_30SEC, check_rc=False)
+
+    if is_windows:
+        cmd = [
+            "powershell",
+            "Invoke-WmiMethod",
+            "-Class",
+            "Win32_Process",
+            "-Name",
+            "Create",
+            "-ArgumentList",
+            f"'{WIN_MEM_LOAD_CMD}'",
+        ]
+    else:
+        cmd = [
+            "/bin/bash",
+            "-c",
+            f"nohup python3 -c '{RHEL_MEM_LOAD_CMD}' >/dev/null 2>&1 &",
+        ]
+    run_ssh_commands(host=vm.ssh_exec, commands=cmd, tcp_timeout=TCP_TIMEOUT_30SEC)
+    LOGGER.info(f"Started 2GB memory pressure on VM {vm.name}, sleeping {STRESS_RAMP_UP_SEC}s for ramp-up")
+    sleep(STRESS_RAMP_UP_SEC)

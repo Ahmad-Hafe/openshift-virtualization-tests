@@ -8,7 +8,8 @@ from contextlib import contextmanager
 
 import pytest
 
-from utilities.constants import TIMEOUT_9MIN
+from utilities.constants.networking import LINUX_BRIDGE
+from utilities.constants.timeouts import TIMEOUT_9MIN
 from utilities.infra import ExecCommandOnPod, get_node_selector_dict, get_node_selector_name
 from utilities.network import (
     BondNodeNetworkConfigurationPolicy,
@@ -19,10 +20,7 @@ from utilities.virt import VirtualMachineForTests, fedora_vm_body
 
 pytestmark = [
     pytest.mark.sno,
-    pytest.mark.usefixtures(
-        "hyperconverged_ovs_annotations_enabled_scope_session",
-        "workers_type",
-    ),
+    pytest.mark.usefixtures("workers_type"),
 ]
 
 
@@ -63,10 +61,11 @@ def create_vm(namespace, nad, node_selector, unprivileged_client):
 
 @pytest.fixture()
 def matrix_bond_modes_bond(
+    nmstate_dependent_placeholder,
     admin_client,
     index_number,
     link_aggregation_mode_no_connectivity_matrix__function__,
-    nodes_available_nics,
+    hosts_common_available_ports,
     worker_node1,
 ):
     """
@@ -77,7 +76,7 @@ def matrix_bond_modes_bond(
         name=f"matrix-bond{bond_index}-nncp",
         bond_name=f"mtx-bond{bond_index}",
         client=admin_client,
-        bond_ports=nodes_available_nics[worker_node1.name][-2:],
+        bond_ports=hosts_common_available_ports[-2:],
         mode=link_aggregation_mode_no_connectivity_matrix__function__,
         node_selector=get_node_selector_dict(node_selector=worker_node1.hostname),
     ) as bond:
@@ -85,10 +84,10 @@ def matrix_bond_modes_bond(
 
 
 @pytest.fixture()
-def bond_modes_nad(admin_client, bridge_device_matrix__function__, namespace, matrix_bond_modes_bond):
+def bond_modes_nad(admin_client, namespace, matrix_bond_modes_bond):
     with network_nad(
         namespace=namespace,
-        nad_type=bridge_device_matrix__function__,
+        nad_type=LINUX_BRIDGE,
         nad_name=f"bond-nad-{matrix_bond_modes_bond.bond_name}",
         interface_name=f"br{matrix_bond_modes_bond.bond_name}",
         client=admin_client,
@@ -98,8 +97,8 @@ def bond_modes_nad(admin_client, bridge_device_matrix__function__, namespace, ma
 
 @pytest.fixture()
 def matrix_bond_modes_bridge(
+    nmstate_dependent_placeholder,
     admin_client,
-    bridge_device_matrix__function__,
     worker_node1,
     bond_modes_nad,
     matrix_bond_modes_bond,
@@ -108,7 +107,7 @@ def matrix_bond_modes_bridge(
     Create bridge and attach the BOND to it
     """
     with network_device(
-        interface_type=bridge_device_matrix__function__,
+        interface_type=LINUX_BRIDGE,
         nncp_name=f"bridge-on-bond-{matrix_bond_modes_bond.bond_name}",
         node_selector=get_node_selector_dict(node_selector=worker_node1.hostname),
         interface_name=bond_modes_nad.bridge_name,
@@ -137,8 +136,8 @@ def bond_modes_vm(
 
 @pytest.fixture()
 def bridge_on_bond_fail_over_mac(
+    nmstate_dependent_placeholder,
     admin_client,
-    bridge_device_matrix__function__,
     worker_node1,
     bond_modes_nad,
     active_backup_bond_with_fail_over_mac,
@@ -147,7 +146,7 @@ def bridge_on_bond_fail_over_mac(
     Create bridge and attach the BOND to it
     """
     with network_device(
-        interface_type=bridge_device_matrix__function__,
+        interface_type=LINUX_BRIDGE,
         nncp_name="bridge-on-bond-fail-over-mac",
         node_selector=get_node_selector_dict(node_selector=worker_node1.hostname),
         interface_name=bond_modes_nad.bridge_name,
@@ -158,13 +157,15 @@ def bridge_on_bond_fail_over_mac(
 
 
 @pytest.fixture()
-def active_backup_bond_with_fail_over_mac(admin_client, index_number, worker_node1, nodes_available_nics):
+def active_backup_bond_with_fail_over_mac(
+    nmstate_dependent_placeholder, admin_client, index_number, worker_node1, hosts_common_available_ports
+):
     bond_index = next(index_number)
     with BondNodeNetworkConfigurationPolicy(
         client=admin_client,
         name=f"active-bond{bond_index}-nncp",
         bond_name=f"act-bond{bond_index}",
-        bond_ports=nodes_available_nics[worker_node1.name][-2:],
+        bond_ports=hosts_common_available_ports[-2:],
         node_selector=get_node_selector_dict(node_selector=worker_node1.hostname),
         options={"fail_over_mac": "active"},
         success_timeout=TIMEOUT_9MIN,
@@ -191,13 +192,15 @@ def vm_with_fail_over_mac_bond(
 
 
 @pytest.fixture()
-def bond_resource(admin_client, index_number, nodes_available_nics, worker_node1):
+def bond_resource(
+    nmstate_dependent_placeholder, admin_client, index_number, hosts_common_available_ports, worker_node1
+):
     bond_idx = next(index_number)
     with BondNodeNetworkConfigurationPolicy(
         client=admin_client,
         name=f"bond-with-port{bond_idx}nncp",
         bond_name=f"bond-w-port{bond_idx}",
-        bond_ports=nodes_available_nics[worker_node1.name][-2:],
+        bond_ports=hosts_common_available_ports[-2:],
         node_selector=get_node_selector_dict(node_selector=worker_node1.hostname),
     ) as bond:
         yield bond
@@ -222,7 +225,7 @@ def test_active_backup_bond_with_fail_over_mac(
     admin_client,
     index_number,
     worker_node1,
-    nodes_available_nics,
+    hosts_common_available_ports,
     workers_utility_pods,
 ):
     bond_index = next(index_number)
@@ -230,7 +233,7 @@ def test_active_backup_bond_with_fail_over_mac(
         name=f"test-active-bond{bond_index}-nncp",
         bond_name=f"test-act-bond{bond_index}",
         client=admin_client,
-        bond_ports=nodes_available_nics[worker_node1.name][-2:],
+        bond_ports=hosts_common_available_ports[-2:],
         node_selector=get_node_selector_dict(node_selector=worker_node1.hostname),
         options={"fail_over_mac": "active"},
     ) as bond:

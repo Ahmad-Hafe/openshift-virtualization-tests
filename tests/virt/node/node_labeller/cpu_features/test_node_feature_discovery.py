@@ -4,7 +4,7 @@ Test node feature discovery.
 
 import pytest
 
-from utilities.constants import CPU_MODEL_LABEL_PREFIX
+from utilities.constants.cluster import CPU_MODEL_LABEL_PREFIX
 from utilities.hco import update_hco_annotations
 from utilities.virt import wait_for_kv_stabilize, wait_for_updated_kv_value
 
@@ -47,6 +47,7 @@ def updated_kubevirt_cpus(
     hco_namespace,
 ):
     with update_hco_annotations(
+        admin_client=admin_client,
         resource=hyperconverged_resource_scope_function,
         path=OBSOLETE_CPU,
         value={cluster_common_node_cpu: True},
@@ -64,17 +65,26 @@ def updated_kubevirt_cpus(
 
 def node_label_checker(node_label_dict, label_list, dict_key):
     """
-    Check node labels for cpu models/features/kvm-info.
-    Return dict:
-    {'<node_name>': [<cpu_models/features/kvm-info>]}
+    Checks node labels for either cpu_models, cpu_features, or kvm-info.
+
+    The specific check depends on the dict_key value.
+
+    Args:
+        node_label_dict: Dictionary mapping node names to their labels.
+        label_list: List of label values to search for.
+        dict_key: Key indicating which label category to check (cpu_models, cpu_features, or kvm-info).
+
+    Returns:
+        dict: A dictionary mapping node names to the list of retrieved values.
+                Format: {'<node_name>': [<cpu_models | cpu_features | kvm-info>]}
     """
     return {
         node: [value for value in label_list if value in node_label_dict[node][dict_key]] for node in node_label_dict
     }
 
 
-@pytest.mark.polarion("CNV-2797")
 @pytest.mark.s390x
+@pytest.mark.polarion("CNV-2797")
 def test_obsolete_cpus_in_node_labels(nodes_labels_dict, kubevirt_config):
     """
     Test obsolete CPUs. Obsolete CPUs don't appear in node labels.
@@ -113,9 +123,9 @@ def test_hardware_required_node_labels(nodes_labels_dict):
     assert any(test_dict.values()), f"KVM info not found in labels\n{test_dict}"
 
 
-@pytest.mark.s390x
 @pytest.mark.gating
 @pytest.mark.conformance
+@pytest.mark.s390x
 @pytest.mark.polarion("CNV-6088")
 def test_hardware_non_required_node_labels(nodes_labels_dict):
     hw_supported_hyperv_features = [
@@ -134,8 +144,8 @@ def test_hardware_non_required_node_labels(nodes_labels_dict):
     assert not any(test_dict.values()), f"Some nodes have non required KVM labels: {test_dict}"
 
 
-@pytest.mark.s390x
 @pytest.mark.gating
+@pytest.mark.s390x
 @pytest.mark.polarion("CNV-6103")
 def test_updated_obsolete_cpus_in_node_labels(updated_kubevirt_cpus, nodes_labels_dict, kubevirt_config):
     """

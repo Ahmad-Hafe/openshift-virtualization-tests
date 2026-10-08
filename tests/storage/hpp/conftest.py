@@ -3,7 +3,6 @@ from ocp_resources.persistent_volume import PersistentVolume
 from ocp_resources.persistent_volume_claim import PersistentVolumeClaim
 from ocp_resources.resource import ResourceEditor
 
-from tests.storage.constants import HPP_STORAGE_CLASSES
 from tests.storage.hpp.utils import (
     DV_NAME,
     HPP_KEY,
@@ -14,7 +13,7 @@ from tests.storage.hpp.utils import (
     wait_for_desired_hpp_pods_running,
 )
 from tests.utils import create_cirros_vm
-from utilities.constants import TIMEOUT_5MIN
+from utilities.constants.timeouts import TIMEOUT_5MIN
 from utilities.hco import add_labels_to_nodes
 from utilities.infra import (
     get_node_selector_dict,
@@ -27,6 +26,7 @@ from utilities.infra import (
 def utility_daemonset_for_hpp_test(
     generated_pulled_secret,
     cnv_tests_utilities_service_account,
+    admin_client,
 ):
     """
     Deploy utility daemonset into the cnv_tests_utilities_namespace namespace.
@@ -38,6 +38,7 @@ def utility_daemonset_for_hpp_test(
         generated_pulled_secret=generated_pulled_secret,
         cnv_tests_utilities_service_account=cnv_tests_utilities_service_account,
         label=utility_pods_for_hpp_test,
+        client=admin_client,
     )
 
 
@@ -121,18 +122,13 @@ def cirros_pvc_on_hpp(cirros_vm_for_node_placement_tests):
     return PersistentVolumeClaim(
         namespace=cirros_vm_for_node_placement_tests.namespace,
         name=cirros_vm_for_node_placement_tests.data_volume_template["metadata"]["name"],
+        client=cirros_vm_for_node_placement_tests.client,
     )
 
 
 @pytest.fixture()
-def cirros_pv_on_hpp(cirros_pvc_on_hpp):
+def cirros_pv_on_hpp(admin_client, cirros_pvc_on_hpp):
     return PersistentVolume(
         name=cirros_pvc_on_hpp.instance.spec.volumeName,
+        client=admin_client,
     )
-
-
-@pytest.fixture(scope="session")
-def skip_test_if_no_hpp_requested(available_storage_classes_names):
-    # Skip test if HPP is not passed with --storage-class-matrix
-    if not any(storage_class in HPP_STORAGE_CLASSES for storage_class in available_storage_classes_names):
-        pytest.skip(f"HPP is not passed with --storage-class-matrix: {available_storage_classes_names}")

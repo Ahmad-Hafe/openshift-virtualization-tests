@@ -2,7 +2,10 @@
 Common templates test Windows OS support
 """
 
+from __future__ import annotations
+
 import logging
+from typing import TYPE_CHECKING
 
 import pytest
 
@@ -12,12 +15,16 @@ from tests.virt.cluster.common_templates.utils import (
     validate_os_info_virtctl_vs_windows_os,
     validate_user_info_virtctl_vs_windows_os,
 )
-from tests.virt.utils import validate_pause_unpause_windows_vm
-from utilities.constants import OS_FLAVOR_WINDOWS
-from utilities.guest_support import assert_windows_efi, check_vm_xml_hyperv, check_windows_vm_hvinfo
+from utilities.constants.images import OS_FLAVOR_WINDOWS
+from utilities.constants.pytest import QUARANTINED
+from utilities.guest_support import (
+    assert_windows_efi,
+    check_vm_xml_hyperv,
+    check_windows_vm_hvinfo,
+    validate_pause_unpause_windows_vm,
+)
 from utilities.ssp import validate_os_info_vmi_vs_windows_os
 from utilities.virt import (
-    assert_vm_xml_efi,
     check_vm_xml_smbios,
     migrate_vm_and_verify,
     running_vm,
@@ -26,13 +33,23 @@ from utilities.virt import (
     validate_virtctl_guest_agent_data_over_time,
 )
 
-pytestmark = [pytest.mark.post_upgrade, pytest.mark.special_infra, pytest.mark.high_resource_vm]
+if TYPE_CHECKING:
+    from kubernetes.dynamic import DynamicClient
+
+    from utilities.virt import VirtualMachineForTests
+
+pytestmark = [
+    pytest.mark.post_upgrade,
+    pytest.mark.special_infra,
+    pytest.mark.high_resource_vm,
+    pytest.mark.data_collector_scope(scope="module"),
+]
 
 LOGGER = logging.getLogger(__name__)
 TESTS_CLASS_NAME = "TestCommonTemplatesWindows"
 
 
-@pytest.mark.usefixtures("cluster_cpu_model_scope_class")
+@pytest.mark.windows
 class TestCommonTemplatesWindows:
     @pytest.mark.sno
     @pytest.mark.dependency(name=f"{TESTS_CLASS_NAME}::create_vm")
@@ -54,10 +71,9 @@ class TestCommonTemplatesWindows:
     @pytest.mark.sno
     @pytest.mark.dependency(depends=[f"{TESTS_CLASS_NAME}::start_vm"])
     @pytest.mark.polarion("CNV-8854")
-    def test_efi_secureboot_enabled_by_default(self, matrix_windows_os_vm_from_template):
+    def test_efi_secureboot_enabled_by_default(self, admin_client, matrix_windows_os_vm_from_template):
         """Test CNV common templates EFI secureboot status"""
 
-        assert_vm_xml_efi(vm=matrix_windows_os_vm_from_template)
         assert_windows_efi(vm=matrix_windows_os_vm_from_template)
 
     @pytest.mark.sno
@@ -70,20 +86,20 @@ class TestCommonTemplatesWindows:
     @pytest.mark.sno
     @pytest.mark.dependency(depends=[f"{TESTS_CLASS_NAME}::start_vm"])
     @pytest.mark.polarion("CNV-4196")
-    def test_virtctl_guest_agent_os_info(self, matrix_windows_os_vm_from_template):
-        validate_os_info_virtctl_vs_windows_os(vm=matrix_windows_os_vm_from_template)
+    def test_virtctl_guest_agent_os_info(self, admin_client, matrix_windows_os_vm_from_template):
+        validate_os_info_virtctl_vs_windows_os(vm=matrix_windows_os_vm_from_template, admin_client=admin_client)
 
     @pytest.mark.sno
     @pytest.mark.dependency(depends=[f"{TESTS_CLASS_NAME}::start_vm"])
     @pytest.mark.polarion("CNV-4197")
-    def test_virtctl_guest_agent_fs_info(self, matrix_windows_os_vm_from_template):
-        validate_fs_info_virtctl_vs_windows_os(vm=matrix_windows_os_vm_from_template)
+    def test_virtctl_guest_agent_fs_info(self, admin_client, matrix_windows_os_vm_from_template):
+        validate_fs_info_virtctl_vs_windows_os(vm=matrix_windows_os_vm_from_template, admin_client=admin_client)
 
     @pytest.mark.sno
     @pytest.mark.dependency(depends=[f"{TESTS_CLASS_NAME}::start_vm"])
     @pytest.mark.polarion("CNV-4552")
-    def test_virtctl_guest_agent_user_info(self, matrix_windows_os_vm_from_template):
-        validate_user_info_virtctl_vs_windows_os(vm=matrix_windows_os_vm_from_template)
+    def test_virtctl_guest_agent_user_info(self, admin_client, matrix_windows_os_vm_from_template):
+        validate_user_info_virtctl_vs_windows_os(vm=matrix_windows_os_vm_from_template, admin_client=admin_client)
 
     @pytest.mark.sno
     @pytest.mark.dependency(depends=[f"{TESTS_CLASS_NAME}::create_vm"])
@@ -97,9 +113,13 @@ class TestCommonTemplatesWindows:
     @pytest.mark.sno
     @pytest.mark.dependency(depends=[f"{TESTS_CLASS_NAME}::start_vm"])
     @pytest.mark.polarion("CNV-2776")
-    def test_hyperv(self, matrix_windows_os_vm_from_template):
+    def test_hyperv(self, admin_client, matrix_windows_os_vm_from_template):
         LOGGER.info("Verify VM HyperV values.")
-        check_vm_xml_hyperv(vm=matrix_windows_os_vm_from_template)
+        check_vm_xml_hyperv(
+            vm=matrix_windows_os_vm_from_template,
+            admin_client=admin_client,
+            expected_hyperv_features=matrix_windows_os_vm_from_template.instance.spec.template.spec.domain.features.hyperv.to_dict(),
+        )
         check_windows_vm_hvinfo(vm=matrix_windows_os_vm_from_template)
 
     @pytest.mark.sno
@@ -118,18 +138,20 @@ class TestCommonTemplatesWindows:
     @pytest.mark.sno
     @pytest.mark.dependency(depends=[f"{TESTS_CLASS_NAME}::start_vm"])
     @pytest.mark.polarion("CNV-4203")
-    def test_vm_smbios_default(self, smbios_from_kubevirt_config, matrix_windows_os_vm_from_template):
-        check_vm_xml_smbios(vm=matrix_windows_os_vm_from_template, cm_values=smbios_from_kubevirt_config)
+    def test_vm_smbios_default(self, admin_client, smbios_from_kubevirt_config, matrix_windows_os_vm_from_template):
+        check_vm_xml_smbios(
+            vm=matrix_windows_os_vm_from_template, cm_values=smbios_from_kubevirt_config, admin_client=admin_client
+        )
 
     @pytest.mark.rwx_default_storage
     @pytest.mark.dependency(
         name=f"{TESTS_CLASS_NAME}::migrate_vm_and_verify", depends=[f"{TESTS_CLASS_NAME}::start_vm"]
     )
     @pytest.mark.polarion("CNV-3335")
-    def test_migrate_vm(self, matrix_windows_os_vm_from_template):
+    def test_migrate_vm(self, admin_client: DynamicClient, matrix_windows_os_vm_from_template: VirtualMachineForTests):
         """Test SSH connectivity after migration"""
-        migrate_vm_and_verify(vm=matrix_windows_os_vm_from_template, check_ssh_connectivity=True)
-        validate_libvirt_persistent_domain(vm=matrix_windows_os_vm_from_template)
+        migrate_vm_and_verify(vm=matrix_windows_os_vm_from_template, client=admin_client, check_ssh_connectivity=True)
+        validate_libvirt_persistent_domain(vm=matrix_windows_os_vm_from_template, admin_client=admin_client)
 
     @pytest.mark.polarion("CNV-5903")
     @pytest.mark.dependency(depends=[f"{TESTS_CLASS_NAME}::migrate_vm_and_verify"])
@@ -147,6 +169,10 @@ class TestCommonTemplatesWindows:
 
     @pytest.mark.polarion("CNV-12220")
     @pytest.mark.dependency(depends=[f"{TESTS_CLASS_NAME}::vmi_guest_agent_info"])
+    @pytest.mark.xfail(
+        reason=f"{QUARANTINED}: Intermittent failures due to timeout exceeded; tracked in CNV-79605",
+        run=False,
+    )
     def test_vmi_guest_agent_info_after_guest_reboot(self, matrix_windows_os_vm_from_template):
         validate_virtctl_guest_agent_after_guest_reboot(
             vm=matrix_windows_os_vm_from_template, os_type=OS_FLAVOR_WINDOWS

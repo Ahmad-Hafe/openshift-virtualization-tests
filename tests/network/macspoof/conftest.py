@@ -8,14 +8,15 @@ from ocp_resources.resource import ResourceEditor
 from pyhelper_utils.shell import run_ssh_commands
 from timeout_sampler import TimeoutSampler
 
-from tests.network.libs.ip import random_ipv4_address
-from utilities.constants import LINUX_BRIDGE, TIMEOUT_30SEC
+from libs.net.ip import random_ipv4_address
+from libs.net.vmspec import lookup_iface_status_ip
+from utilities.constants.networking import LINUX_BRIDGE
+from utilities.constants.timeouts import TIMEOUT_30SEC
 from utilities.data_utils import name_prefix
 from utilities.infra import get_node_selector_dict
 from utilities.network import (
     assert_ping_successful,
     compose_cloud_init_data_dict,
-    get_vmi_ip_v4_by_name,
     network_device,
     network_nad,
 )
@@ -58,26 +59,30 @@ def set_vm_interface_network_mac(vm, mac):
 
 
 @pytest.fixture(scope="class")
-def linux_bridge_device_worker_1(admin_client, nodes_available_nics, worker_node1):
+def linux_bridge_device_worker_1(
+    nmstate_dependent_placeholder, admin_client, hosts_common_available_ports, worker_node1
+):
     with network_device(
         interface_type=LINUX_BRIDGE,
         nncp_name=f"bridge-{name_prefix(worker_node1.hostname)}",
         interface_name=BRIDGE_NAME,
         node_selector=get_node_selector_dict(node_selector=worker_node1.hostname),
-        ports=[nodes_available_nics[worker_node1.hostname][-1]],
+        ports=[hosts_common_available_ports[-1]],
         client=admin_client,
     ) as br_dev:
         yield br_dev
 
 
 @pytest.fixture(scope="class")
-def linux_bridge_device_worker_2(admin_client, nodes_available_nics, worker_node2):
+def linux_bridge_device_worker_2(
+    nmstate_dependent_placeholder, admin_client, hosts_common_available_ports, worker_node2
+):
     with network_device(
         interface_type=LINUX_BRIDGE,
         nncp_name=f"bridge-{name_prefix(worker_node2.hostname)}",
         interface_name=BRIDGE_NAME,
         node_selector=get_node_selector_dict(node_selector=worker_node2.hostname),
-        ports=[nodes_available_nics[worker_node2.hostname][-1]],
+        ports=[hosts_common_available_ports[-1]],
         client=admin_client,
     ) as br_dev:
         yield br_dev
@@ -109,7 +114,7 @@ def linux_bridge_attached_vma(
 ):
     name = "vma"
     networks, network_data_data = _networks_data(
-        nad=linux_macspoof_nad, ip=f"{random_ipv4_address(net_seed=0, host_address=1)}/24"
+        nad=linux_macspoof_nad, ip=str(random_ipv4_address(net_seed=0, host_address=1))
     )
     cloud_init_data = compose_cloud_init_data_dict(
         network_data=network_data_data,
@@ -137,7 +142,7 @@ def linux_bridge_attached_vmb(
 ):
     name = "vmb"
     networks, network_data_data = _networks_data(
-        nad=linux_macspoof_nad, ip=f"{random_ipv4_address(net_seed=0, host_address=2)}/24"
+        nad=linux_macspoof_nad, ip=str(random_ipv4_address(net_seed=0, host_address=2))
     )
     cloud_init_data = compose_cloud_init_data_dict(
         network_data=network_data_data,
@@ -171,9 +176,8 @@ def linux_bridge_attached_running_vmb(linux_bridge_attached_vmb):
 
 @pytest.fixture(scope="class")
 def vmb_ip_address(linux_bridge_device_worker_1, linux_bridge_attached_running_vmb):
-    return get_vmi_ip_v4_by_name(
-        vm=linux_bridge_attached_running_vmb,
-        name=linux_bridge_device_worker_1.bridge_name,
+    return lookup_iface_status_ip(
+        vm=linux_bridge_attached_running_vmb, iface_name=linux_bridge_device_worker_1.bridge_name, ip_family=4
     )
 
 

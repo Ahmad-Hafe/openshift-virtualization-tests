@@ -1,5 +1,3 @@
-# -*- coding: utf-8 -*-
-
 """
 Hostpath Provisioner test suite
 """
@@ -22,12 +20,8 @@ from ocp_resources.service import Service
 from ocp_resources.service_account import ServiceAccount
 from ocp_resources.service_monitor import ServiceMonitor
 
-from utilities.constants import (
-    HOSTPATH_PROVISIONER_OPERATOR,
-    HPP_POOL,
-    TIMEOUT_1MIN,
-    TIMEOUT_5MIN,
-)
+from utilities.constants.components import HOSTPATH_PROVISIONER_OPERATOR, HPP_POOL
+from utilities.constants.timeouts import TIMEOUT_1MIN, TIMEOUT_5MIN
 from utilities.infra import get_pod_by_name_prefix
 
 LOGGER = logging.getLogger(__name__)
@@ -35,7 +29,7 @@ LOGGER = logging.getLogger(__name__)
 HOSTPATH_PROVISIONER_ADMIN = "hostpath-provisioner-admin"
 VOLUME_BINDING_MODE = "volumeBindingMode"
 
-pytestmark = pytest.mark.usefixtures("skip_test_if_no_hpp_sc")
+pytestmark = pytest.mark.hpp
 
 
 def skipped_hco_resources():
@@ -83,21 +77,23 @@ def verify_hpp_app_label(hpp_resources, cnv_version):
 
 
 @pytest.fixture(scope="module")
-def hpp_operator_deployment(hco_namespace):
-    hpp_operator_deployment = Deployment(name=HOSTPATH_PROVISIONER_OPERATOR, namespace=hco_namespace.name)
+def hpp_operator_deployment(admin_client, hco_namespace):
+    hpp_operator_deployment = Deployment(
+        name=HOSTPATH_PROVISIONER_OPERATOR, namespace=hco_namespace.name, client=admin_client
+    )
     assert hpp_operator_deployment.exists
     return hpp_operator_deployment
 
 
 @pytest.fixture(scope="module")
-def hpp_prometheus_resources(hco_namespace):
+def hpp_prometheus_resources(admin_client, hco_namespace):
     rbac_name = "hostpath-provisioner-monitoring"
     yield [
-        PrometheusRule(name="prometheus-hpp-rules", namespace=hco_namespace.name),
-        ServiceMonitor(name="service-monitor-hpp", namespace=hco_namespace.name),
-        Service(name="hpp-prometheus-metrics", namespace=hco_namespace.name),
-        Role(name=rbac_name, namespace=hco_namespace.name),
-        RoleBinding(name=rbac_name, namespace=hco_namespace.name),
+        PrometheusRule(name="prometheus-hpp-rules", namespace=hco_namespace.name, client=admin_client),
+        ServiceMonitor(name="service-monitor-hpp", namespace=hco_namespace.name, client=admin_client),
+        Service(name="hpp-prometheus-metrics", namespace=hco_namespace.name, client=admin_client),
+        Role(name=rbac_name, namespace=hco_namespace.name, client=admin_client),
+        RoleBinding(name=rbac_name, namespace=hco_namespace.name, client=admin_client),
     ]
 
 
@@ -107,34 +103,40 @@ def hpp_clusterrole_version_suffix(is_hpp_cr_legacy_scope_module):
 
 
 @pytest.fixture(scope="module")
-def hpp_serviceaccount(hco_namespace, hpp_cr_suffix_scope_module):
+def hpp_serviceaccount(admin_client, hco_namespace, hpp_cr_suffix_scope_module):
     yield ServiceAccount(
         name=f"{HOSTPATH_PROVISIONER_ADMIN}{hpp_cr_suffix_scope_module}",
         namespace=hco_namespace.name,
+        client=admin_client,
     )
 
 
 @pytest.fixture(scope="module")
-def hpp_scc(hpp_cr_suffix_scope_module):
+def hpp_scc(admin_client, hpp_cr_suffix_scope_module):
     yield SecurityContextConstraints(
-        name=f"{HostPathProvisioner.Name.HOSTPATH_PROVISIONER}{hpp_cr_suffix_scope_module}"
+        name=f"{HostPathProvisioner.Name.HOSTPATH_PROVISIONER}{hpp_cr_suffix_scope_module}",
+        client=admin_client,
     )
 
 
 @pytest.fixture(scope="module")
-def hpp_clusterrole(hpp_clusterrole_version_suffix):
-    yield ClusterRole(name=f"{HostPathProvisioner.Name.HOSTPATH_PROVISIONER}{hpp_clusterrole_version_suffix}")
+def hpp_clusterrole(admin_client, hpp_clusterrole_version_suffix):
+    yield ClusterRole(
+        name=f"{HostPathProvisioner.Name.HOSTPATH_PROVISIONER}{hpp_clusterrole_version_suffix}", client=admin_client
+    )
 
 
 @pytest.fixture(scope="module")
-def hpp_clusterrolebinding(hpp_clusterrole_version_suffix):
-    yield ClusterRoleBinding(name=f"{HostPathProvisioner.Name.HOSTPATH_PROVISIONER}{hpp_clusterrole_version_suffix}")
+def hpp_clusterrolebinding(admin_client, hpp_clusterrole_version_suffix):
+    yield ClusterRoleBinding(
+        name=f"{HostPathProvisioner.Name.HOSTPATH_PROVISIONER}{hpp_clusterrole_version_suffix}", client=admin_client
+    )
 
 
 @pytest.fixture(scope="module")
 def hpp_operator_pod(admin_client, hco_namespace):
     yield get_pod_by_name_prefix(
-        dyn_client=admin_client,
+        client=admin_client,
         pod_prefix=HOSTPATH_PROVISIONER_OPERATOR,
         namespace=hco_namespace.name,
     )
@@ -143,9 +145,7 @@ def hpp_operator_pod(admin_client, hco_namespace):
 @pytest.fixture(scope="module")
 def hpp_pool_deployments_scope_module(admin_client, hco_namespace):
     return [
-        dp
-        for dp in Deployment.get(dyn_client=admin_client, namespace=hco_namespace.name)
-        if dp.name.startswith(HPP_POOL)
+        dp for dp in Deployment.get(client=admin_client, namespace=hco_namespace.name) if dp.name.startswith(HPP_POOL)
     ]
 
 

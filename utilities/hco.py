@@ -1,40 +1,52 @@
 import json
 import logging
+import re
+from collections.abc import Collection, Iterator
 from contextlib import contextmanager
+from typing import TYPE_CHECKING, Any
 
 from kubernetes.dynamic.exceptions import NotFoundError, ResourceNotFoundError
 from ocp_resources.cdi import CDI
+from ocp_resources.custom_resource_definition import CustomResourceDefinition
 from ocp_resources.data_source import DataSource
 from ocp_resources.hyperconverged import HyperConverged
 from ocp_resources.kubevirt import KubeVirt
 from ocp_resources.namespace import Namespace
 from ocp_resources.network_addons_config import NetworkAddonsConfig
-from ocp_resources.resource import Resource, ResourceEditor, get_client
+from ocp_resources.resource import Resource, ResourceEditor
 from ocp_resources.ssp import SSP
 from pytest_testconfig import py_config
 from timeout_sampler import TimeoutExpiredError, TimeoutSampler
 
 import utilities.infra
-from utilities.constants import (
+from utilities.constants.hco import (
     DEFAULT_HCO_CONDITIONS,
     ENABLE_COMMON_BOOT_IMAGE_IMPORT,
     EXPECTED_STATUS_CONDITIONS,
+    FEATURE_GATES,
     HCO_SUBSCRIPTION,
     IMAGE_CRON_STR,
     SSP_CR_COMMON_TEMPLATES_LIST_KEY_NAME,
+)
+from utilities.constants.storage import StorageClassNames
+from utilities.constants.timeouts import (
     TIMEOUT_2MIN,
     TIMEOUT_4MIN,
     TIMEOUT_5MIN,
     TIMEOUT_5SEC,
     TIMEOUT_10MIN,
     TIMEOUT_30MIN,
-    StorageClassNames,
 )
 from utilities.ssp import (
     wait_for_at_least_one_auto_update_data_import_cron,
     wait_for_deleted_data_import_crons,
     wait_for_ssp_conditions,
 )
+from utilities.storage import verify_boot_sources_reimported
+
+if TYPE_CHECKING:
+    from kubernetes.dynamic import DynamicClient
+    from ocp_resources.data_import_cron import DataImportCron
 
 LOGGER = logging.getLogger(__name__)
 
@@ -57,20 +69,25 @@ HCO_JSONPATCH_ANNOTATION_COMPONENT_DICT = {
         "api_group_prefix": "ssp",
     },
 }
+_FG_LIST_HEADER = "Feature-Gate list:"
+# Matches "* gateName: <text> Phase: <Phase>" strictly without matching across other gate bullets
+_FG_PHASE_RE = re.compile(r"\*\s+([a-zA-Z0-9_]+):\s+[^*]+?Phase:\s+(\w+)", re.IGNORECASE)
+_FG_ENABLED_PHASES = frozenset({"beta"})
+_FG_DISABLED_PHASES = frozenset({"alpha", "deprecated"})
 
 
 class ResourceEditorValidateHCOReconcile(ResourceEditor):
     def __init__(
         self,
+        admin_client,
         hco_namespace="openshift-cnv",
         consecutive_checks_count=3,
         list_resource_reconcile=None,
         wait_for_reconcile_post_update=False,
-        admin_client=None,
         **kwargs,
     ):
         super().__init__(**kwargs)
-        self.admin_client = admin_client or get_client()
+        self.admin_client = admin_client
         self.hco_namespace = Namespace(client=self.admin_client, name=hco_namespace)
         self.wait_for_reconcile_post_update = wait_for_reconcile_post_update
         self._consecutive_checks_count = consecutive_checks_count
@@ -108,8 +125,7 @@ def wait_for_hco_conditions(
     condition_key2="status",
     list_dependent_crs_to_check=None,
 ):
-    """
-    Checking HCO conditions.
+    """Checking HCO conditions.
 
     If list_dependent_crs_to_check information is passed, we would wait for them to
     stabilize first, before checking hco.status.conditions. Please note, EXPECTED_STATUS_CONDITIONS defines what all
@@ -126,20 +142,17 @@ def wait_for_hco_conditions(
                 expected_conditions=EXPECTED_STATUS_CONDITIONS[resource],
                 consecutive_checks_count=consecutive_checks_count,
             )
-    try:
-        utilities.infra.wait_for_consistent_resource_conditions(
-            dynamic_client=admin_client,
-            namespace=hco_namespace.name,
-            expected_conditions=expected_conditions or DEFAULT_HCO_CONDITIONS,
-            resource_kind=HyperConverged,
-            condition_key1=condition_key1,
-            condition_key2=condition_key2,
-            total_timeout=wait_timeout,
-            polling_interval=sleep,
-            consecutive_checks_count=consecutive_checks_count,
-        )
-    except TimeoutExpiredError:
-        raise
+    utilities.infra.wait_for_consistent_resource_conditions(
+        dynamic_client=admin_client,
+        namespace=hco_namespace.name,
+        expected_conditions=expected_conditions or DEFAULT_HCO_CONDITIONS,
+        resource_kind=HyperConverged,
+        condition_key1=condition_key1,
+        condition_key2=condition_key2,
+        total_timeout=wait_timeout,
+        polling_interval=sleep,
+        consecutive_checks_count=consecutive_checks_count,
+    )
 
 
 def wait_for_ds(ds):
@@ -176,7 +189,7 @@ def wait_for_dp(dp):
             status = sample.get("status")
             metadata = sample.get("metadata")
             if metadata.get("generation") == status.get("observedGeneration") and status.get("replicas") == status.get(
-                "updatedReplicas"
+                "updatedReplicas",
             ):
                 break
     except TimeoutExpiredError:
@@ -185,37 +198,49 @@ def wait_for_dp(dp):
 
 
 def apply_np_changes(
-    admin_client, hco, hco_namespace, infra_placement=None, workloads_placement=None, exclude_deployments=None
+    admin_client,
+    hco,
+    hco_namespace,
+    infra_placement=None,
+    workloads_placement=None,
+    exclude_deployments=None,
 ):
-    current_infra = hco.instance.to_dict()["spec"].get("infra")
-    current_workloads = hco.instance.to_dict()["spec"].get("workloads")
+    node_placements = hco.instance.to_dict()["spec"].get("deployment", {}).get("nodePlacements", {})
+    current_infra = node_placements.get("infra")
+    current_workloads = node_placements.get("workload")
     target_infra = infra_placement if infra_placement is not None else current_infra
     target_workloads = workloads_placement if workloads_placement is not None else current_workloads
     if target_workloads != current_workloads or target_infra != current_infra:
         patch = {
             "spec": {
-                "infra": target_infra or None,
-                "workloads": target_workloads or None,
-            }
+                "deployment": {
+                    "nodePlacements": {
+                        "infra": target_infra or None,
+                        "workload": target_workloads or None,
+                    },
+                },
+            },
         }
         LOGGER.info(f"Updating HCO with node placement. {patch}")
         editor = ResourceEditor(patches={hco: patch})
         editor.update(backup_resources=False)
         wait_for_hco_post_update_stable_state(
-            admin_client=admin_client, hco_namespace=hco_namespace, exclude_deployments=exclude_deployments
+            admin_client=admin_client,
+            hco_namespace=hco_namespace,
+            exclude_deployments=exclude_deployments,
         )
     else:
         LOGGER.info("No actual changes to node placement configuration, skipping")
 
 
 def wait_for_hco_post_update_stable_state(admin_client, hco_namespace, exclude_deployments=None):
-    """
-    Waits for hco to reach stable state post hco update
+    """Waits for hco to reach stable state post hco update
 
     Args:
         admin_client (DynamicClient): Dynamic client object
         hco_namespace (Namespace): Namespace object
         exclude_deployments (list): List of deployment names to exclude from verification
+
     """
     exclude_deployments = exclude_deployments or []
 
@@ -258,8 +283,7 @@ def wait_for_hco_post_update_stable_state(admin_client, hco_namespace, exclude_d
 
 
 def add_labels_to_nodes(nodes, node_labels):
-    """
-    Adds given labels to a list of nodes
+    """Adds given labels to a list of nodes
 
     Args:
         nodes (list): list of nodes
@@ -280,7 +304,8 @@ def add_labels_to_nodes(nodes, node_labels):
 
 def get_hco_spec(admin_client, hco_namespace):
     return utilities.infra.get_hyperconverged_resource(
-        client=admin_client, hco_ns_name=hco_namespace.name
+        client=admin_client,
+        hco_ns_name=hco_namespace.name,
     ).instance.to_dict()["spec"]
 
 
@@ -298,8 +323,7 @@ def get_installed_hco_csv(admin_client, hco_namespace):
 
 
 def get_hco_version(client, hco_ns_name):
-    """
-    Get current hco version
+    """Get current hco version
 
     Args:
         client (DynamicClient): Dynamic client object
@@ -307,6 +331,7 @@ def get_hco_version(client, hco_ns_name):
 
     Returns:
         str: hyperconverged operator version
+
     """
     return (
         utilities.infra
@@ -317,8 +342,7 @@ def get_hco_version(client, hco_ns_name):
 
 
 def wait_for_hco_version(client, hco_ns_name, cnv_version):
-    """
-    Wait for hco version to get updated.
+    """Wait for hco version to get updated.
 
     Args:
         client (DynamicClient): Dynamic client object
@@ -330,6 +354,7 @@ def wait_for_hco_version(client, hco_ns_name, cnv_version):
 
     Raises:
         TimeoutExpiredError: if hco resource is not updated with expected version string
+
     """
     samples = TimeoutSampler(
         wait_timeout=TIMEOUT_30MIN,
@@ -350,12 +375,13 @@ def wait_for_hco_version(client, hco_ns_name, cnv_version):
 
 
 def disable_common_boot_image_import_hco_spec(
-    admin_client,
-    hco_resource,
-    golden_images_namespace,
-    golden_images_data_import_crons,
-):
-    if hco_resource.instance.spec[ENABLE_COMMON_BOOT_IMAGE_IMPORT]:
+    admin_client: DynamicClient,
+    hco_resource: HyperConverged,
+    golden_images_namespace: Namespace,
+    golden_images_data_import_crons: list[DataImportCron],
+    exclude_data_source_names: Collection[str] | None = None,
+) -> Iterator[None]:
+    if hco_resource.instance.spec.workloadSources.enableCommonBootImageImport:
         update_common_boot_image_import_spec(
             hco_resource=hco_resource,
             enable=False,
@@ -367,13 +393,19 @@ def disable_common_boot_image_import_hco_spec(
             hco_resource=hco_resource,
             admin_client=admin_client,
             namespace=golden_images_namespace,
+            exclude_data_source_names=exclude_data_source_names,
         )
     else:
         yield
 
 
-def enable_common_boot_image_import_spec_wait_for_data_import_cron(hco_resource, admin_client, namespace):
-    hco_namespace = Namespace(name=hco_resource.namespace)
+def enable_common_boot_image_import_spec_wait_for_data_import_cron(
+    hco_resource: HyperConverged,
+    admin_client: DynamicClient,
+    namespace: Namespace,
+    exclude_data_source_names: Collection[str] | None = None,
+) -> None:
+    hco_namespace = Namespace(client=admin_client, name=hco_resource.namespace)
     update_common_boot_image_import_spec(
         hco_resource=hco_resource,
         enable=True,
@@ -381,6 +413,12 @@ def enable_common_boot_image_import_spec_wait_for_data_import_cron(hco_resource,
     wait_for_at_least_one_auto_update_data_import_cron(admin_client=admin_client, namespace=namespace)
     wait_for_ssp_conditions(admin_client=admin_client, hco_namespace=hco_namespace)
     wait_for_hco_conditions(admin_client=admin_client, hco_namespace=hco_namespace)
+    assert verify_boot_sources_reimported(
+        admin_client=admin_client,
+        namespace=namespace.name,
+        consecutive_checks_count=1,
+        exclude_data_source_names=exclude_data_source_names,
+    )
 
 
 def update_common_boot_image_import_spec(hco_resource, enable):
@@ -390,7 +428,7 @@ def update_common_boot_image_import_spec(hco_resource, enable):
             for sample in TimeoutSampler(
                 wait_timeout=TIMEOUT_2MIN,
                 sleep=5,
-                func=lambda: _hco_resource.instance.spec[ENABLE_COMMON_BOOT_IMAGE_IMPORT] == _enable,
+                func=lambda: _hco_resource.instance.spec.workloadSources.enableCommonBootImageImport == _enable,
             ):
                 if sample:
                     return
@@ -399,7 +437,7 @@ def update_common_boot_image_import_spec(hco_resource, enable):
             raise
 
     editor = ResourceEditor(
-        patches={hco_resource: {"spec": {ENABLE_COMMON_BOOT_IMAGE_IMPORT: enable}}},
+        patches={hco_resource: {"spec": {"workloadSources": {ENABLE_COMMON_BOOT_IMAGE_IMPORT: enable}}}},
     )
     editor.update(backup_resources=True)
     _wait_for_spec_update(_hco_resource=hco_resource, _enable=enable)
@@ -420,8 +458,8 @@ def get_json_patch_annotation_values(component, path, value=None, op="add"):
                 "op": op,
                 "path": f"/spec/{component_dict.get('config', '')}{path}",
                 "value": value,
-            }
-        ])
+            },
+        ]),
     }
 
 
@@ -429,13 +467,14 @@ def hco_cr_jsonpatch_annotations_dict(component, path, value=None, op="add"):
     # https://github.com/kubevirt/hyperconverged-cluster-operator/blob/main/docs/cluster-configuration.md#jsonpatch-annotations
     return {
         "metadata": {
-            "annotations": get_json_patch_annotation_values(component=component, path=path, value=value, op=op)
-        }
+            "annotations": get_json_patch_annotation_values(component=component, path=path, value=value, op=op),
+        },
     }
 
 
 @contextmanager
 def update_hco_annotations(
+    admin_client,
     resource,
     path,
     value=None,
@@ -444,10 +483,10 @@ def update_hco_annotations(
     op="add",
     resource_list=None,
 ):
-    """
-    Update jsonpatch annotation in HCO CR.
+    """Update jsonpatch annotation in HCO CR.
 
     Args:
+        admin_client (DynamicClient): Kubernetes admin client
         resource (HyperConverged): HCO resource object
         path (str): key path in KubeVirt CR
         value (any): key value
@@ -475,12 +514,27 @@ def update_hco_annotations(
     # '[{"op": "add", "path": "/spec/configuration/machineType", "value": "pc-q35-rhel8.4.0"},
     # {"op": "add", "path": "/spec/configuration/cpuModel", "value": "Haswell-noTSX"}]]'
     if resource_existing_jsonpatch_annotation and not overwrite_patches:
-        hco_annotations_dict = hco_config_jsonpath_dict["metadata"]["annotations"]
-        hco_annotations_dict[jsonpatch_key] = (
-            f"{resource_existing_jsonpatch_annotation[:-1]},{hco_annotations_dict[jsonpatch_key][1:]}"
-        )
+        try:
+            existing_patches = json.loads(resource_existing_jsonpatch_annotation)
+        except json.JSONDecodeError, TypeError:
+            LOGGER.warning(
+                f"Existing jsonpatch annotation for key {jsonpatch_key!r} is not valid JSON "
+                f"({resource_existing_jsonpatch_annotation!r}); ignoring and overwriting.",
+            )
+            existing_patches = None
+        if isinstance(existing_patches, list) and existing_patches:
+            hco_annotations_dict = hco_config_jsonpath_dict["metadata"]["annotations"]
+            hco_annotations_dict[jsonpatch_key] = json.dumps(
+                existing_patches + json.loads(hco_annotations_dict[jsonpatch_key])
+            )
+        elif existing_patches is not None and not isinstance(existing_patches, list):
+            LOGGER.warning(
+                f"Existing jsonpatch annotation for key {jsonpatch_key!r} is not a list "
+                f"(got {type(existing_patches).__name__!r}); ignoring and overwriting.",
+            )
 
     with ResourceEditorValidateHCOReconcile(
+        admin_client=admin_client,
         patches={resource: hco_config_jsonpath_dict},
         list_resource_reconcile=resource_list,
         wait_for_reconcile_post_update=True,
@@ -510,7 +564,12 @@ def update_hco_templates_spec(
     golden_images_namespace=None,
 ):
     with ResourceEditorValidateHCOReconcile(
-        patches={hyperconverged_resource: {"spec": {SSP_CR_COMMON_TEMPLATES_LIST_KEY_NAME: [updated_template]}}},
+        admin_client=admin_client,
+        patches={
+            hyperconverged_resource: {
+                "spec": {"workloadSources": {SSP_CR_COMMON_TEMPLATES_LIST_KEY_NAME: [updated_template]}},
+            },
+        },
         list_resource_reconcile=[SSP, CDI],
         wait_for_reconcile_post_update=True,
     ):
@@ -528,16 +587,18 @@ def update_hco_templates_spec(
 
 @contextmanager
 def enabled_aaq_in_hco(client, hco_namespace, hyperconverged_resource, enable_acrq_support=False):
-    patches = {hyperconverged_resource: {"spec": {"enableApplicationAwareQuota": True}}}
+    application_aware_config = {"enable": True}
     if enable_acrq_support:
-        patches[hyperconverged_resource]["spec"]["applicationAwareConfig"] = {
-            "allowApplicationAwareClusterResourceQuota": True
-        }
+        application_aware_config["allowApplicationAwareClusterResourceQuota"] = True
+    patches = {
+        hyperconverged_resource: {"spec": {"deployment": {"applicationAwareConfig": application_aware_config}}},
+    }
 
     with ResourceEditorValidateHCOReconcile(
         patches=patches,
         list_resource_reconcile=[KubeVirt],
         wait_for_reconcile_post_update=True,
+        admin_client=client,
     ):
         yield
     # need to wait when all AAQ system pods removed
@@ -545,7 +606,7 @@ def enabled_aaq_in_hco(client, hco_namespace, hyperconverged_resource, enable_ac
         wait_timeout=TIMEOUT_5MIN,
         sleep=TIMEOUT_5SEC,
         func=utilities.infra.get_pod_by_name_prefix,
-        dyn_client=client,
+        client=client,
         pod_prefix="aaq-(controller|server)",
         namespace=hco_namespace.name,
         get_all=True,
@@ -558,5 +619,117 @@ def enabled_aaq_in_hco(client, hco_namespace, hyperconverged_resource, enable_ac
     except TimeoutExpiredError:
         LOGGER.error(f"Some AAQ pods still present: {sample}")
         raise
-    except NotFoundError | ResourceNotFoundError:
+    except NotFoundError, ResourceNotFoundError:
         LOGGER.info("AAQ system PODs removed.")
+
+
+def get_hco_feature_gates(hco: HyperConverged) -> list[dict[str, str]]:
+    """Return the live HCO spec.featureGates list.
+
+    Args:
+        hco: HyperConverged resource to read.
+
+    Returns:
+        The feature-gates list. Missing or null is treated as an empty list (phase defaults).
+
+    Raises:
+        TypeError: If spec.featureGates is present but not a list (for example a v1beta1 dict).
+    """
+    gates = hco.instance.to_dict()["spec"].get("featureGates")
+    if gates is None:
+        return []
+    if not isinstance(gates, list):
+        raise TypeError(f"spec.featureGates must be a list, got {type(gates).__name__}: {gates}")
+    return gates
+
+
+def parse_hco_fg_phases(admin_client: DynamicClient) -> dict[str, str]:
+    """Discover feature-gate lifecycle phases from the v1 HCO CRD description.
+
+    Args:
+        admin_client: Dynamic client used to read the HyperConverged CRD.
+
+    Returns:
+        Map of gate name to lower-cased phase (alpha, beta, deprecated).
+
+    Raises:
+        ValueError: If no phases are parsed (the CRD description format likely changed).
+    """
+    crd = CustomResourceDefinition(client=admin_client, name=f"hyperconvergeds.{Resource.ApiGroup.HCO_KUBEVIRT_IO}")
+    versions = crd.instance.to_dict()["spec"]["versions"]
+    v1_version = next(version for version in versions if version["name"] == Resource.ApiVersion.V1)
+    description = v1_version["schema"]["openAPIV3Schema"]["properties"]["spec"]["properties"]["featureGates"].get(
+        "description", ""
+    )
+    gate_list = description.split(_FG_LIST_HEADER, 1)[-1] if _FG_LIST_HEADER in description else ""
+    phases = {name: phase.lower() for name, phase in _FG_PHASE_RE.findall(gate_list)}
+    if not phases:
+        raise ValueError(
+            "Failed to parse feature gate phases from the HCO CRD; "
+            "the featureGates description format may have changed."
+        )
+    return phases
+
+
+def is_feature_gate_enabled(hco_resource: HyperConverged, name: str) -> bool:
+    """Return whether a feature gate is effectively enabled on the HCO CR.
+
+    A list entry wins: omitted ``state`` is Enabled. An absent gate uses its CRD
+    lifecycle-phase default (beta enabled; alpha/deprecated disabled).
+
+    Args:
+        hco_resource: HyperConverged resource to read.
+        name: Feature gate name.
+
+    Returns:
+        True if the gate is enabled (explicitly or by phase default).
+
+    Raises:
+        KeyError: If the gate is absent from the CR and unknown in the CRD.
+        ValueError: If the CRD phase string is not a known lifecycle phase.
+    """
+    for entry in get_hco_feature_gates(hco=hco_resource):
+        if entry.get("name") == name:
+            return entry.get("state", "Enabled") != "Disabled"
+
+    phases = parse_hco_fg_phases(admin_client=hco_resource.client)
+    if name not in phases:
+        raise KeyError(f"Feature gate {name!r} not found in HCO CRD definitions.")
+
+    phase = phases[name]
+    if phase in _FG_ENABLED_PHASES:
+        return True
+    if phase in _FG_DISABLED_PHASES:
+        return False
+    raise ValueError(f"Unknown feature gate phase {phase!r} for {name!r}.")
+
+
+def hco_feature_gates_patch(
+    hco_resource: HyperConverged,
+    enable: list[str] | None = None,
+    disable: list[str] | None = None,
+) -> dict[str, Any]:
+    """Build a merge-patch for HCO spec.featureGates preserving existing gates.
+
+    Args:
+        hco_resource: HyperConverged resource whose current list is merged.
+        enable: Gate names to enable (``state`` omitted).
+        disable: Gate names to disable (``state: Disabled``).
+
+    Returns:
+        Patch dict of the form ``{"spec": {"featureGates": [...]}}``.
+
+    Raises:
+        ValueError: If both enable and disable are empty.
+    """
+    deltas = {name: True for name in enable or []}
+    deltas.update({name: False for name in disable or []})
+
+    if not deltas:
+        raise ValueError("At least one gate must be passed to enable or disable.")
+
+    merged = [dict(entry) for entry in get_hco_feature_gates(hco=hco_resource) if entry.get("name") not in deltas]
+    merged.extend(
+        {"name": name} if enabled else {"name": name, "state": "Disabled"} for name, enabled in deltas.items()
+    )
+    return {"spec": {FEATURE_GATES: merged}}

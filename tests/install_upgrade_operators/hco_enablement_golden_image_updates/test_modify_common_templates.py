@@ -10,15 +10,16 @@ from ocp_resources.ssp import SSP
 
 from tests.install_upgrade_operators.constants import KEY_PATH_SEPARATOR
 from tests.install_upgrade_operators.hco_enablement_golden_image_updates.utils import (
-    get_data_import_cron_by_name,
-    get_modifed_common_template_names,
+    get_data_import_crons_by_prefix,
+    get_modified_common_template_names,
     get_template_dict_by_name,
 )
-from utilities.constants import (
+from utilities.constants.hco import (
     DATA_IMPORT_CRON_ENABLE,
     SSP_CR_COMMON_TEMPLATES_LIST_KEY_NAME,
-    WILDCARD_CRON_EXPRESSION,
 )
+from utilities.constants.pytest import QUARANTINED
+from utilities.constants.storage import WILDCARD_CRON_EXPRESSION
 from utilities.hco import ResourceEditorValidateHCOReconcile
 
 pytestmark = [pytest.mark.gating, pytest.mark.arm64, pytest.mark.s390x]
@@ -100,9 +101,10 @@ def updated_common_template(
         )
     LOGGER.info(f"Common templates {updated_templates}, updating to: {updated_common_template}")
     with ResourceEditorValidateHCOReconcile(
+        admin_client=admin_client,
         patches={
             hyperconverged_resource_scope_function: {
-                "spec": {SSP_CR_COMMON_TEMPLATES_LIST_KEY_NAME: updated_common_template_dict_list}
+                "spec": {"workloadSources": {SSP_CR_COMMON_TEMPLATES_LIST_KEY_NAME: updated_common_template_dict_list}}
             }
         },
         list_resource_reconcile=[CDI, SSP],
@@ -110,7 +112,9 @@ def updated_common_template(
     ):
         yield updated_templates
 
-    modified_common_templates = get_modifed_common_template_names(hyperconverged=hyperconverged_resource_scope_function)
+    modified_common_templates = get_modified_common_template_names(
+        hyperconverged=hyperconverged_resource_scope_function
+    )
     assert not modified_common_templates, f"Following templates were not reverted back: {modified_common_templates}"
 
 
@@ -159,13 +163,23 @@ class TestModifyCommonTemplateSpec:
             pytest.param(
                 {"num_templates": 1, "update_dict": UPDATE_STORAGE_CLASS_IN_SPEC},
                 UPDATE_STORAGE_CLASS_IN_SPEC,
-                marks=pytest.mark.polarion("CNV-8740"),
+                marks=(
+                    pytest.mark.polarion("CNV-8740"),
+                    pytest.mark.xfail(
+                        reason=(
+                            f"{QUARANTINED}: VolumeSnapshot source causes DV leftover when applying "
+                            f"non-existent storage class. DV is in pending not cleaned up; Tracked in CNV-80607"
+                        ),
+                        run=False,
+                    ),
+                ),
             ),
         ],
         indirect=["updated_common_template"],
     )
     def test_common_template_modify_spec(
         self,
+        admin_client,
         updated_common_template,
         updated_template_names,
         hyperconverged_status_templates_scope_function,
@@ -200,19 +214,23 @@ class TestModifyCommonTemplateSpec:
             if ssp_error:
                 errors.append(f"Mismatch for template in ssp.spec: {template_name}: {''.join(ssp_error)}.\n")
 
-            data_import_cron_error = validate_template_change(
-                template_dict=benedict(
-                    get_data_import_cron_by_name(
-                        cron_name=template_name, namespace=golden_images_namespace.name
-                    ).instance.to_dict(),
-                    keypath_separator=KEY_PATH_SEPARATOR,
-                ),
-                expected_dict=expected_value,
-            )
-            if data_import_cron_error:
-                errors.append(
-                    f"Mismatch for template: {template_name} in dataimportcron.spec: {''.join(data_import_cron_error)}."
+            for data_import_cron in get_data_import_crons_by_prefix(
+                cron_prefix=template_name,
+                namespace=golden_images_namespace.name,
+                admin_client=admin_client,
+            ):
+                data_import_cron_error = validate_template_change(
+                    template_dict=benedict(
+                        data_import_cron.instance.to_dict(),
+                        keypath_separator=KEY_PATH_SEPARATOR,
+                    ),
+                    expected_dict=expected_value,
                 )
+                if data_import_cron_error:
+                    errors.append(
+                        f"Mismatch for {data_import_cron.name} in dataimportcron.spec: "
+                        f"{''.join(data_import_cron_error)}."
+                    )
         assert not errors, "".join(errors)
 
 
@@ -251,6 +269,7 @@ class TestCommonTemplatesEnableDisable:
     )
     def test_common_template_config_disable(
         self,
+        admin_client,
         updated_common_template,
         updated_template_names,
         hyperconverged_status_templates_scope_function,
@@ -280,7 +299,11 @@ class TestCommonTemplatesEnableDisable:
                 )
 
             with pytest.raises(ResourceNotFoundError):
-                get_data_import_cron_by_name(cron_name=template_name, namespace=golden_images_namespace.name)
+                get_data_import_crons_by_prefix(
+                    cron_prefix=template_name,
+                    namespace=golden_images_namespace.name,
+                    admin_client=admin_client,
+                )
         assert not errors, (
             f"Enabling/Disabling common templates via HCO failed with following reasons: {' '.join(errors)}"
         )

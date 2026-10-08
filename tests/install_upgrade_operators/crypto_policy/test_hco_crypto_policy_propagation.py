@@ -2,38 +2,43 @@ import logging
 
 import pytest
 from ocp_resources.hyperconverged import HyperConverged
-from pytest_testconfig import config as py_config
+from ocp_resources.mig_controller import MigController
 
 from tests.install_upgrade_operators.crypto_policy.constants import (
     CRYPTO_POLICY_SPEC_DICT,
+    MANAGED_CRS_LIST,
 )
 from tests.install_upgrade_operators.crypto_policy.utils import (
     assert_crypto_policy_propagated_to_components,
-    get_resource_crypto_policy,
     set_hco_crypto_policy,
 )
-from utilities.constants import TLS_SECURITY_PROFILE
+from utilities.constants.hco import TLS_SECURITY_PROFILE
 
 LOGGER = logging.getLogger(__name__)
 pytestmark = [pytest.mark.post_upgrade, pytest.mark.sno, pytest.mark.s390x]
 
 
 @pytest.fixture()
-def hco_crypto_policy(hco_namespace):
-    return get_resource_crypto_policy(
-        resource=HyperConverged,
-        name=py_config["hco_cr_name"],
-        key_name=TLS_SECURITY_PROFILE,
-        namespace=hco_namespace.name,
-    )
+def hco_crypto_policy(
+    hyperconverged_resource_scope_function, updated_hco_crypto_policy, cnv_crypto_policy_matrix__function__
+):
+    hco_spec = hyperconverged_resource_scope_function.instance.to_dict()["spec"]
+    tls_profile = hco_spec.get("security", {}).get(TLS_SECURITY_PROFILE)
+    if not tls_profile:
+        return None
+    # OCP 4.22+ API adds empty profile-type keys (e.g. old: {}, custom: {}) as CRD defaults
+    expected = CRYPTO_POLICY_SPEC_DICT[cnv_crypto_policy_matrix__function__]
+    return {policy_key: policy_value for policy_key, policy_value in tls_profile.items() if policy_key in expected}
 
 
 @pytest.fixture()
 def updated_hco_crypto_policy(
+    admin_client,
     hyperconverged_resource_scope_function,
     cnv_crypto_policy_matrix__function__,
 ):
     with set_hco_crypto_policy(
+        admin_client=admin_client,
         hco_resource=hyperconverged_resource_scope_function,
         tls_spec=CRYPTO_POLICY_SPEC_DICT[cnv_crypto_policy_matrix__function__],
     ):
@@ -42,6 +47,7 @@ def updated_hco_crypto_policy(
 
 @pytest.mark.polarion("CNV-9331")
 def test_set_hco_crypto_policy(
+    admin_client,
     cnv_crypto_policy_matrix__function__,
     updated_hco_crypto_policy,
     hco_crypto_policy,
@@ -53,7 +59,9 @@ def test_set_hco_crypto_policy(
         f"Expected HCO crypto policy: '{expected_hco_crypto_policy}'\n"
     )
     assert_crypto_policy_propagated_to_components(
-        resources_dict=resources_dict,
         crypto_policy=cnv_crypto_policy_matrix__function__,
+        resources_dict=resources_dict,
         updated_resource_kind=HyperConverged.kind,
+        admin_client=admin_client,
+        managed_crs_list=[*MANAGED_CRS_LIST, MigController],
     )

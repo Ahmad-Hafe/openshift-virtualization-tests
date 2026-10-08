@@ -3,13 +3,24 @@ GPU PCI Passthrough VM
 """
 
 import pytest
+from ocp_resources.daemonset import DaemonSet
 from ocp_resources.kubevirt import KubeVirt
 from ocp_resources.resource import ResourceEditor
 from timeout_sampler import TimeoutExpiredError, TimeoutSampler
 
-from tests.virt.node.gpu.constants import DEVICE_ID_STR, GPU_DEVICE_NAME_STR, NVIDIA_VFIO_MANAGER_DS
-from tests.virt.node.gpu.utils import wait_for_manager_pods_deployed
-from utilities.constants import KERNEL_DRIVER, TIMEOUT_1MIN, TIMEOUT_5SEC
+from tests.virt.node.gpu.constants import (
+    DEVICE_ID_STR,
+    GPU_DEVICE_NAME_STR,
+    GPU_WORKLOAD_CONFIG_LABEL,
+    NVIDIA_VFIO_MANAGER_DS,
+)
+from tests.virt.node.gpu.utils import wait_for_ds_ready
+from utilities.constants.namespaces import NamespacesNames
+from utilities.constants.timeouts import (
+    TIMEOUT_1MIN,
+    TIMEOUT_5SEC,
+)
+from utilities.constants.virt import KERNEL_DRIVER
 from utilities.hco import ResourceEditorValidateHCOReconcile
 from utilities.infra import label_nodes
 from utilities.virt import get_nodes_gpu_info
@@ -17,12 +28,24 @@ from utilities.virt import get_nodes_gpu_info
 
 @pytest.fixture(scope="session")
 def gpu_nodes_labeled_with_vm_passthrough(nodes_with_supported_gpus):
-    yield from label_nodes(nodes=nodes_with_supported_gpus, labels={"nvidia.com/gpu.workload.config": "vm-passthrough"})
+    yield from label_nodes(nodes=nodes_with_supported_gpus, labels={GPU_WORKLOAD_CONFIG_LABEL: "vm-passthrough"})
 
 
 @pytest.fixture(scope="session")
-def gpu_passthrough_ready_nodes(admin_client, gpu_nodes_labeled_with_vm_passthrough):
-    wait_for_manager_pods_deployed(admin_client=admin_client, ds_name=NVIDIA_VFIO_MANAGER_DS)
+def nvidia_vfio_manager_ds(admin_client):
+    return DaemonSet(
+        client=admin_client,
+        namespace=NamespacesNames.NVIDIA_GPU_OPERATOR,
+        name=NVIDIA_VFIO_MANAGER_DS,
+    )
+
+
+@pytest.fixture(scope="session")
+def gpu_passthrough_ready_nodes(nvidia_vfio_manager_ds, gpu_nodes_labeled_with_vm_passthrough, gpu_nodes):
+    wait_for_ds_ready(
+        ds=nvidia_vfio_manager_ds,
+        expected=len(gpu_nodes),
+    )
     yield gpu_nodes_labeled_with_vm_passthrough
 
 
@@ -55,18 +78,21 @@ def fail_if_device_unbound_to_vfiopci_driver(workers_utility_pods, gpu_passthrou
 
 
 @pytest.fixture(scope="class")
-def hco_cr_with_permitted_hostdevices(hyperconverged_resource_scope_class, supported_gpu_device):
+def hco_cr_with_permitted_hostdevices(admin_client, hyperconverged_resource_scope_class, supported_gpu_device):
     with ResourceEditorValidateHCOReconcile(
+        admin_client=admin_client,
         patches={
             hyperconverged_resource_scope_class: {
                 "spec": {
-                    "permittedHostDevices": {
-                        "pciHostDevices": [
-                            {
-                                "pciDeviceSelector": supported_gpu_device[DEVICE_ID_STR],
-                                "resourceName": supported_gpu_device[GPU_DEVICE_NAME_STR],
-                            }
-                        ]
+                    "virtualization": {
+                        "permittedHostDevices": {
+                            "pciHostDevices": [
+                                {
+                                    "pciDeviceSelector": supported_gpu_device[DEVICE_ID_STR],
+                                    "resourceName": supported_gpu_device[GPU_DEVICE_NAME_STR],
+                                }
+                            ]
+                        }
                     }
                 }
             }

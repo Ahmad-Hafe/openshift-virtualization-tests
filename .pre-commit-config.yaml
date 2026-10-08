@@ -1,9 +1,12 @@
 default_language_version:
-  python: python3
+  python: python3.14
+
+ci:
+  skip: [check-jsonschema]
 
 repos:
   - repo: https://github.com/PyCQA/autoflake
-    rev: "v2.3.1"
+    rev: "v2.4.0"
     hooks:
       - id: autoflake
         args:
@@ -13,7 +16,7 @@ repos:
         stages: [pre-commit]
 
   - repo: https://github.com/astral-sh/ruff-pre-commit
-    rev: v0.14.10
+    rev: v0.16.4
     hooks:
       - id: ruff
         stages: [pre-commit]
@@ -44,7 +47,9 @@ repos:
     rev: "7.3.0"
     hooks:
       - id: flake8
+        language_version: python3.14
         args: [--config=.flake8]
+        exclude: "(utilities/unittests/|utilities/junit_ai_utils\\.py|scripts/std_placeholder_stats/tests/|scripts/coderabbit_retry/tests/test_coderabbit_retry\\.py)"
         additional_dependencies:
           [
             "git+https://github.com/RedHatQE/flake8-plugins.git@v1.0.0",
@@ -59,13 +64,22 @@ repos:
       - id: gitlint
         stages: [commit-msg]
 
+  - repo: https://github.com/python-jsonschema/check-jsonschema
+    rev: "0.38.0"
+    hooks:
+      - id: check-jsonschema
+        name: Validate .coderabbit.yaml against schema
+        files: ^\.coderabbit\.yaml$
+        args: ["--schemafile", "https://coderabbit.ai/integrations/schema.v2.json"]
+        stages: [pre-commit]
+
   - repo: https://github.com/gitleaks/gitleaks
     rev: "v8.30.0"
     hooks:
       - id: gitleaks
 
   - repo: https://github.com/pre-commit/mirrors-mypy
-    rev: v1.19.1
+    rev: v2.3.1
     hooks:
       - id: mypy
         exclude: "test_(.*).py$"

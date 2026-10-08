@@ -8,7 +8,11 @@ from ocp_resources.custom_resource_definition import CustomResourceDefinition
 from ocp_resources.resource import Resource
 from timeout_sampler import retry
 
-from utilities.constants import BASE_EXCEPTIONS_DICT, TIMEOUT_3MIN, TIMEOUT_10SEC
+from utilities.constants.cluster import BASE_EXCEPTIONS_DICT
+from utilities.constants.timeouts import (
+    TIMEOUT_3MIN,
+    TIMEOUT_10SEC,
+)
 
 LOGGER = logging.getLogger(__name__)
 
@@ -37,7 +41,7 @@ def get_cnv_crds(admin_client: DynamicClient) -> list[CustomResourceDefinition]:
     """
     return [
         crd
-        for crd in CustomResourceDefinition.get(dyn_client=admin_client)
+        for crd in CustomResourceDefinition.get(client=admin_client)
         if crd.name.endswith(Resource.ApiGroup.KUBEVIRT_IO)
     ]
 

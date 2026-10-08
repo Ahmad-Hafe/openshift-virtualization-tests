@@ -12,7 +12,8 @@ from tests.virt.cluster.common_templates.custom_namespace.utils import (
     wait_for_edited_label_reconciliation,
     wait_for_template_by_name,
 )
-from utilities.constants import UNPRIVILEGED_USER, NamespacesNames
+from utilities.constants.namespaces import NamespacesNames
+from utilities.constants.pytest import UNPRIVILEGED_USER
 
 LOGGER = logging.getLogger(__name__)
 
@@ -132,6 +133,7 @@ class TestCustomNamespace:
     def test_base_templates_exist_in_default_namespace_after_revert(
         self,
         admin_client,
+        unprivileged_client,
         hco_namespace,
         base_templates,
         deleted_base_templates,
@@ -140,7 +142,7 @@ class TestCustomNamespace:
         verify_base_templates_exist_in_namespace(
             client=admin_client,
             original_base_templates=base_templates,
-            namespace=Namespace(name=NamespacesNames.OPENSHIFT),
+            namespace=Namespace(client=unprivileged_client, name=NamespacesNames.OPENSHIFT),
         )
 
     @pytest.mark.polarion("CNV-8152")

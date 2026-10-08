@@ -4,12 +4,15 @@ import pytest
 from kubernetes.dynamic.exceptions import BadRequestError
 from ocp_resources.config_map import ConfigMap
 from ocp_resources.hyperconverged import HyperConverged
+from ocp_resources.resource import Resource
 from ocp_resources.secret import Secret
 from ocp_resources.virtual_machine import VirtualMachine
 from pytest_testconfig import config as py_config
 
 from tests.install_upgrade_operators.product_uninstall.constants import BLOCK_REMOVAL_TEST_NODE_ID
-from utilities.constants import CDI_SECRETS, DEFAULT_HCO_CONDITIONS, TIMEOUT_10MIN
+from utilities.constants.hco import DEFAULT_HCO_CONDITIONS
+from utilities.constants.storage import CDI_SECRETS
+from utilities.constants.timeouts import TIMEOUT_10MIN
 from utilities.hco import (
     ResourceEditorValidateHCOReconcile,
     get_hco_version,
@@ -29,19 +32,24 @@ DV_PARAMS = {
 }
 
 
-def assert_expected_strategy(resource_objects, expected_strategy):
-    incorrect_components = {
-        component: resource_obj.instance.spec.uninstallStrategy
-        for component, resource_obj in resource_objects.items()
-        if resource_obj.instance.spec.uninstallStrategy != expected_strategy
-    }
+def get_uninstall_strategy(resource_obj: Resource) -> str:
+    if resource_obj.kind == HyperConverged.kind:
+        return resource_obj.instance.spec.deployment.uninstallStrategy
+    return resource_obj.instance.spec.uninstallStrategy
 
+
+def assert_expected_strategy(resource_objects: dict[str, Resource], expected_strategy: str) -> None:
+    incorrect_components = {
+        component: strategy
+        for component, resource_obj in resource_objects.items()
+        if (strategy := get_uninstall_strategy(resource_obj=resource_obj)) != expected_strategy
+    }
     assert not incorrect_components, (
-        f"Incorrect uninstallStrategy found for following component(s) {incorrect_components}"
+        f"Incorrect uninstallStrategy found for following components: {incorrect_components}"
     )
 
 
-def delete_cdi_configmap_and_secret(hco_namespace_name):
+def delete_cdi_configmap_and_secret(hco_namespace_name, admin_client):
     cdi_configmaps = [
         "cdi-apiserver-signer-bundle",
         "cdi-uploadproxy-signer-bundle",
@@ -49,14 +57,14 @@ def delete_cdi_configmap_and_secret(hco_namespace_name):
         "cdi-uploadserver-signer-bundle",
     ]
     secret_objects = [
-        Secret(name=_secret, namespace=hco_namespace_name)
+        Secret(name=_secret, namespace=hco_namespace_name, client=admin_client)
         for _secret in CDI_SECRETS
-        if Secret(name=_secret, namespace=hco_namespace_name).exists
+        if Secret(name=_secret, namespace=hco_namespace_name, client=admin_client).exists
     ]
     configmap_objects = [
-        ConfigMap(name=_cm, namespace=hco_namespace_name)
+        ConfigMap(name=_cm, namespace=hco_namespace_name, client=admin_client)
         for _cm in cdi_configmaps
-        if ConfigMap(name=_cm, namespace=hco_namespace_name).exists
+        if ConfigMap(name=_cm, namespace=hco_namespace_name, client=admin_client).exists
     ]
 
     for resource in secret_objects + configmap_objects:
@@ -133,7 +141,10 @@ def hco_uninstall_strategy_remove_workloads(
     hyperconverged_resource_scope_function,
 ):
     with ResourceEditorValidateHCOReconcile(
-        patches={hyperconverged_resource_scope_function: {"spec": {"uninstallStrategy": REMOVE_STRATEGY}}}
+        admin_client=admin_client,
+        patches={
+            hyperconverged_resource_scope_function: {"spec": {"deployment": {"uninstallStrategy": REMOVE_STRATEGY}}}
+        },
     ):
         wait_for_hco_conditions(
             admin_client=admin_client,
@@ -167,7 +178,7 @@ def stopped_fedora_vm(hco_fedora_vm):
 @pytest.fixture(scope="function")
 def removed_hco(admin_client, hco_namespace, hyperconverged_resource_scope_function):
     hyperconverged_resource_scope_function.delete(wait=True, timeout=TIMEOUT_10MIN)
-    delete_cdi_configmap_and_secret(hco_namespace_name=hco_namespace.name)
+    delete_cdi_configmap_and_secret(hco_namespace_name=hco_namespace.name, admin_client=admin_client)
     yield
 
     # Recreate HCO, if it doesn't exist

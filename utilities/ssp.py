@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import json
 import logging
 import os
@@ -5,6 +7,7 @@ import re
 import shlex
 import urllib.request
 from contextlib import contextmanager
+from typing import TYPE_CHECKING
 
 from kubernetes.dynamic import DynamicClient
 from kubernetes.dynamic.exceptions import NotFoundError
@@ -17,15 +20,18 @@ from pyhelper_utils.shell import run_ssh_commands
 from pytest_testconfig import config as py_config
 from timeout_sampler import TimeoutExpiredError, TimeoutSampler
 
+if TYPE_CHECKING:
+    from ocp_resources.resource import Resource
+
 import utilities.infra
 import utilities.storage
 import utilities.virt
-from utilities.constants import (
-    DEFAULT_RESOURCE_CONDITIONS,
-    EIGHT_CPU_SOCKETS,
-    FOUR_GI_MEMORY,
+from utilities.constants.components import (
     SSP_KUBEVIRT_HYPERCONVERGED,
     SSP_OPERATOR,
+)
+from utilities.constants.hco import DEFAULT_RESOURCE_CONDITIONS
+from utilities.constants.timeouts import (
     TCP_TIMEOUT_30SEC,
     TIMEOUT_2MIN,
     TIMEOUT_3MIN,
@@ -33,6 +39,10 @@ from utilities.constants import (
     TIMEOUT_5SEC,
     TIMEOUT_6MIN,
     TIMEOUT_10SEC,
+)
+from utilities.constants.virt import (
+    EIGHT_CPU_SOCKETS,
+    FOUR_GI_MEMORY,
 )
 
 LOGGER = logging.getLogger(__name__)
@@ -94,13 +104,13 @@ def matrix_auto_boot_data_import_cron_prefixes():
 
 
 def get_data_import_crons(admin_client, namespace):
-    return list(DataImportCron.get(dyn_client=admin_client, namespace=namespace.name))
+    return list(DataImportCron.get(client=admin_client, namespace=namespace.name))
 
 
 def get_ssp_resource(admin_client, namespace):
     try:
         for ssp in SSP.get(
-            dyn_client=admin_client,
+            client=admin_client,
             name=SSP_KUBEVIRT_HYPERCONVERGED,
             namespace=namespace.name,
         ):
@@ -130,7 +140,7 @@ def wait_for_ssp_conditions(
     )
 
 
-def wait_for_condition_message_value(resource, expected_message):
+def wait_for_condition_message_value(resource: Resource, expected_message: str) -> None:
     LOGGER.info(f"Verify {resource.name} conditions contain expected message: {expected_message}")
     sample = None
     try:
@@ -139,7 +149,7 @@ def wait_for_condition_message_value(resource, expected_message):
             sleep=TIMEOUT_5SEC,
             func=lambda: resource.instance.status.conditions,
         ):
-            if any([condition["message"] == expected_message for condition in sample]):
+            if sample and any(condition.get("message") == expected_message for condition in sample):
                 return
     except TimeoutExpiredError:
         LOGGER.error(
@@ -244,9 +254,9 @@ def validate_os_info_vmi_vs_windows_os(vm):
     assert not data_mismatch, f"Data mismatch {data_mismatch}!\nVMI: {vmi_info}\nOS: {windows_info}"
 
 
-def is_ssp_pod_running(dyn_client: DynamicClient, hco_namespace: Namespace) -> bool:
+def is_ssp_pod_running(client: DynamicClient, hco_namespace: Namespace) -> bool:
     pod = utilities.infra.get_pod_by_name_prefix(
-        dyn_client=dyn_client,
+        client=client,
         pod_prefix=SSP_OPERATOR,
         namespace=hco_namespace.name,
     )
@@ -254,7 +264,7 @@ def is_ssp_pod_running(dyn_client: DynamicClient, hco_namespace: Namespace) -> b
 
 
 def verify_ssp_pod_is_running(
-    dyn_client: DynamicClient,
+    client: DynamicClient,
     hco_namespace: Namespace,
     wait_timeout: int = TIMEOUT_6MIN,
     sleep: int = TIMEOUT_10SEC,
@@ -269,7 +279,7 @@ def verify_ssp_pod_is_running(
     is up and running for at least 'consecutive_checks_count'
 
     Args:
-        dyn_client (DynamicClient): Dynamic client object
+        client (DynamicClient): Dynamic client object
         hco_namespace (Namespace): Namespace object
         wait_timeout (int) : Maximum time to wait till SSP pod is up
         sleep (int): polling interval
@@ -284,7 +294,7 @@ def verify_ssp_pod_is_running(
         wait_timeout=wait_timeout,
         sleep=sleep,
         func=is_ssp_pod_running,
-        dyn_client=dyn_client,
+        client=client,
         hco_namespace=hco_namespace,
     )
     sample = None
@@ -305,8 +315,11 @@ def verify_ssp_pod_is_running(
             raise
 
 
-def cluster_instance_type_for_hot_plug(guest_sockets: int, cpu_model: str | None) -> VirtualMachineClusterInstancetype:
+def cluster_instance_type_for_hot_plug(
+    client: DynamicClient, guest_sockets: int, cpu_model: str | None
+) -> VirtualMachineClusterInstancetype:
     return VirtualMachineClusterInstancetype(
+        client=client,
         name=f"hot-plug-{guest_sockets}-cpu-instance-type",
         memory={"guest": FOUR_GI_MEMORY},
         cpu={

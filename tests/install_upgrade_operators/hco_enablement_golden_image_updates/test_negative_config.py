@@ -15,7 +15,7 @@ from tests.install_upgrade_operators.hco_enablement_golden_image_updates.utils i
     CUSTOM_CRON_TEMPLATE,
     get_template_dict_by_name,
 )
-from utilities.constants import (
+from utilities.constants.hco import (
     DATA_IMPORT_CRON_ENABLE,
     SSP_CR_COMMON_TEMPLATES_LIST_KEY_NAME,
 )
@@ -44,7 +44,7 @@ def editor_hyperconverged_custom_template(common_templates_scope_session, hyperc
     return ResourceEditor(
         patches={
             hyperconverged_resource_scope_function: {
-                "spec": {SSP_CR_COMMON_TEMPLATES_LIST_KEY_NAME: [custom_template_dict]}
+                "spec": {"workloadSources": {SSP_CR_COMMON_TEMPLATES_LIST_KEY_NAME: [custom_template_dict]}}
             }
         },
     )

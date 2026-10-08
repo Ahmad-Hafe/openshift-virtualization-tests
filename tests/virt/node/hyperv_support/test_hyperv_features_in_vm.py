@@ -8,7 +8,7 @@ from tests.os_params import (
     WINDOWS_LATEST,
     WINDOWS_LATEST_LABELS,
 )
-from utilities.constants import VIRT_LAUNCHER
+from utilities.constants.components import VIRT_LAUNCHER
 from utilities.virt import vm_instance_from_template
 
 LOGGER = logging.getLogger(__name__)
@@ -60,6 +60,7 @@ def verify_evmcs_related_attributes(vmi_xml_dict):
 )
 @pytest.mark.special_infra
 @pytest.mark.high_resource_vm
+@pytest.mark.windows
 class TestWindowsHyperVFlags:
     @pytest.mark.parametrize(
         "hyperv_vm",
@@ -84,6 +85,7 @@ class TestWindowsHyperVFlags:
     )
     def test_vm_hyperv_labels_on_launcher_pod(
         self,
+        admin_client,
         hyperv_vm,
     ):
         LOGGER.info(
@@ -91,10 +93,12 @@ class TestWindowsHyperVFlags:
             "and they match the hosting node labels"
         )
         virt_launcher_hyperv_labels = get_hyperv_enabled_labels(
-            instance_labels=hyperv_vm.vmi.virt_launcher_pod.instance.spec.nodeSelector
+            instance_labels=hyperv_vm.vmi.get_virt_launcher_pod(
+                privileged_client=admin_client
+            ).instance.spec.nodeSelector
         )
         node_hyperv_labels = get_hyperv_enabled_labels(
-            instance_labels=hyperv_vm.privileged_vmi.virt_launcher_pod.node.instance.metadata.labels
+            instance_labels=hyperv_vm.vmi.get_node(privileged_client=admin_client).instance.metadata.labels
         )
         assert virt_launcher_hyperv_labels, (
             f"hyperv labels are missing from {VIRT_LAUNCHER} pod node selector, "
@@ -122,10 +126,13 @@ class TestWindowsHyperVFlags:
     )
     def test_vm_added_hyperv_features(
         self,
+        admin_client,
         hyperv_vm,
     ):
         LOGGER.info("Verify added hyperv feature is added to libvirt")
-        vendor_id = hyperv_vm.privileged_vmi.xml_dict["domain"]["features"]["hyperv"]["vendor_id"]
+        vendor_id = hyperv_vm.vmi.get_xml_dict(privileged_client=admin_client)["domain"]["features"]["hyperv"][
+            "vendor_id"
+        ]
         assert vendor_id["@state"] == "on" and vendor_id["@value"] == "randomid", f"Vendor id in libvirt: {vendor_id}"
 
     @pytest.mark.parametrize(
@@ -142,8 +149,8 @@ class TestWindowsHyperVFlags:
         ],
         indirect=True,
     )
-    def test_windows_vm_with_evmcs_feature(self, hyperv_vm):
-        verify_evmcs_related_attributes(vmi_xml_dict=hyperv_vm.privileged_vmi.xml_dict)
+    def test_windows_vm_with_evmcs_feature(self, admin_client, hyperv_vm):
+        verify_evmcs_related_attributes(vmi_xml_dict=hyperv_vm.vmi.get_xml_dict(privileged_client=admin_client))
 
 
 @pytest.mark.parametrize(
@@ -166,9 +173,9 @@ class TestFedoraHyperVFlags:
         ],
         indirect=True,
     )
-    def test_fedora_vm_with_evmcs_feature(self, hyperv_vm):
+    def test_fedora_vm_with_evmcs_feature(self, admin_client, hyperv_vm):
         LOGGER.info("Verify added hyperv feature evmcs is added to libvirt")
-        hyperv_vm_xml = hyperv_vm.privileged_vmi.xml_dict
+        hyperv_vm_xml = hyperv_vm.vmi.get_xml_dict(privileged_client=admin_client)
         evmcs_feature = hyperv_vm_xml["domain"]["features"]["hyperv"]["evmcs"]
         assert evmcs_feature["@state"] == "on", f"evmcs in libvirt: {evmcs_feature}"
 

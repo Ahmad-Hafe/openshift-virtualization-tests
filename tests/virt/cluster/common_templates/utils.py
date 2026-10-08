@@ -2,9 +2,8 @@ import json
 import logging
 import re
 import shlex
-from datetime import datetime, timedelta, timezone
-from functools import cache
-from typing import Generator, Optional
+from collections.abc import Generator
+from datetime import UTC, datetime, timedelta, timezone
 
 import bitmath
 import pytest
@@ -17,12 +16,14 @@ from pyhelper_utils.shell import run_ssh_commands
 from pytest import FixtureRequest
 from timeout_sampler import TimeoutExpiredError, TimeoutSampler
 
-from tests.virt.utils import get_or_create_golden_image_data_source
-from utilities.constants import (
+from utilities.constants.images import (
     OS_FLAVOR_RHEL,
     OS_FLAVOR_WINDOWS,
+)
+from utilities.constants.timeouts import (
     TCP_TIMEOUT_30SEC,
     TIMEOUT_1MIN,
+    TIMEOUT_2MIN,
     TIMEOUT_15SEC,
     TIMEOUT_90SEC,
 )
@@ -31,9 +32,13 @@ from utilities.infra import (
     get_linux_os_info,
     run_virtctl_command,
 )
-from utilities.jira import is_jira_open
 from utilities.ssp import get_windows_os_info
-from utilities.virt import VirtualMachineForTestsFromTemplate, delete_guestosinfo_keys, get_virtctl_os_info
+from utilities.virt import (
+    VirtualMachineForTestsFromTemplate,
+    delete_guestosinfo_keys,
+    get_or_create_golden_image_data_source,
+    get_virtctl_os_info,
+)
 
 LOGGER = logging.getLogger(__name__)
 
@@ -51,34 +56,14 @@ def vm_os_version(vm):
     grep_cmd = os_name.title() if "fedora" in vm.os_flavor else os.replace("-", ".")
     command = shlex.split(f"cat /etc/{os_name}-release | grep {grep_cmd}")
 
-    run_ssh_commands(host=vm.ssh_exec, commands=command)
-
-
-def restart_qemu_guest_agent_service(vm):
-    run_ssh_commands(host=vm.ssh_exec, commands=shlex.split("sudo systemctl restart qemu-guest-agent"))
+    run_ssh_commands(host=vm.ssh_exec, commands=command, wait_timeout=TIMEOUT_2MIN)
 
 
 # Guest agent data comparison functions.
-def validate_os_info_virtctl_vs_linux_os(vm):
+def validate_os_info_virtctl_vs_linux_os(vm, admin_client):
     data_mismatch = []
-    virtctl_info = None
-    if "rhel-7" in vm.name:
-        # Needed for rhel-7 because guest agent is restarted before check
-        # and virtctl needs to re-sync the data
-        try:
-            for sampler in TimeoutSampler(
-                wait_timeout=TIMEOUT_1MIN, sleep=TIMEOUT_15SEC, func=get_virtctl_os_info, vm=vm
-            ):
-                if virtctl_info := sampler:
-                    break
-        except TimeoutExpiredError:
-            raise ValueError("Virtctl OS info not updated after service restart!")
-    else:
-        virtctl_info = get_virtctl_os_info(vm=vm)
-
+    virtctl_info = get_virtctl_os_info(vm=vm)
     linux_info = get_linux_os_info(ssh_exec=vm.ssh_exec)
-    if is_jira_67104_bug_open():
-        virtctl_info.pop("load", None)
 
     for os_param_name, os_param_value in virtctl_info.items():
         if os_param_value != linux_info.get(os_param_name):
@@ -86,11 +71,11 @@ def validate_os_info_virtctl_vs_linux_os(vm):
 
     assert not data_mismatch, (
         f"Data mismatch {data_mismatch}!\nVirtctl: {virtctl_info}\nCNV: {get_cnv_os_info(vm=vm)}\n"
-        f"Libvirt: {get_libvirt_os_info(vm=vm)}\nOS: {linux_info}"
+        f"Libvirt: {get_libvirt_os_info(vm=vm, admin_client=admin_client)}\nOS: {linux_info}"
     )
 
 
-def validate_fs_info_virtctl_vs_linux_os(vm):
+def validate_fs_info_virtctl_vs_linux_os(vm, admin_client):
     orig_virtctl_info = None
     orig_linux_info = get_linux_fs_info(ssh_exec=vm.ssh_exec)
     try:
@@ -108,11 +93,11 @@ def validate_fs_info_virtctl_vs_linux_os(vm):
     except TimeoutExpiredError:
         raise ValueError(
             f"Data mismatch!\nVirtctl: {orig_virtctl_info}\nCNV: {get_cnv_fs_info(vm=vm)}\n"
-            f"Libvirt: {get_libvirt_fs_info(vm=vm)}\nOS: {orig_linux_info}"
+            f"Libvirt: {get_libvirt_fs_info(vm=vm, admin_client=admin_client)}\nOS: {orig_linux_info}"
         )
 
 
-def validate_user_info_virtctl_vs_linux_os(vm):
+def validate_user_info_virtctl_vs_linux_os(vm, admin_client):
     data_mismatch = []
     virtctl_info = None
     linux_info = get_linux_user_info(vm=vm)
@@ -134,11 +119,11 @@ def validate_user_info_virtctl_vs_linux_os(vm):
 
     assert not data_mismatch, (
         f"Data mismatch {data_mismatch}!\nVirtctl: {virtctl_info}\nCNV: {get_cnv_user_info(vm=vm)}\n"
-        f"Libvirt: {get_libvirt_user_info(vm=vm)}\nOS: {linux_info}"
+        f"Libvirt: {get_libvirt_user_info(vm=vm, admin_client=admin_client)}\nOS: {linux_info}"
     )
 
 
-def validate_os_info_virtctl_vs_windows_os(vm):
+def validate_os_info_virtctl_vs_windows_os(vm, admin_client):
     virtctl_info = get_virtctl_os_info(vm=vm)
     windows_info = get_windows_os_info(ssh_exec=vm.ssh_exec)
 
@@ -155,11 +140,11 @@ def validate_os_info_virtctl_vs_windows_os(vm):
 
     assert not data_mismatch, (
         f"Data mismatch {data_mismatch}!\nVirtctl: {virtctl_info}\nCNV: {get_cnv_os_info(vm=vm)}\n"
-        f"Libvirt: {get_libvirt_os_info(vm=vm)}\nOS: {windows_info}"
+        f"Libvirt: {get_libvirt_os_info(vm=vm, admin_client=admin_client)}\nOS: {windows_info}"
     )
 
 
-def validate_fs_info_virtctl_vs_windows_os(vm):
+def validate_fs_info_virtctl_vs_windows_os(vm, admin_client):
     orig_virtctl_info = None
     orig_windows_info = get_windows_fs_info(ssh_exec=vm.ssh_exec)
     try:
@@ -177,11 +162,11 @@ def validate_fs_info_virtctl_vs_windows_os(vm):
     except TimeoutExpiredError:
         raise ValueError(
             f"Data mismatch!\nVirtctl: {orig_virtctl_info}\nCNV: {get_cnv_fs_info(vm=vm)}\n"
-            f"Libvirt: {get_libvirt_fs_info(vm=vm)}\nOS: {orig_windows_info}"
+            f"Libvirt: {get_libvirt_fs_info(vm=vm, admin_client=admin_client)}\nOS: {orig_windows_info}"
         )
 
 
-def validate_user_info_virtctl_vs_windows_os(vm):
+def validate_user_info_virtctl_vs_windows_os(vm, admin_client):
     def _get_vm_timezone_diff():
         vm_timezone_diff = get_virtctl_os_info(vm=vm)["timezone"]
         # Get timezone diff from UTC
@@ -189,19 +174,24 @@ def validate_user_info_virtctl_vs_windows_os(vm):
         return int(re.search(r".*, [-]?(\d+)", vm_timezone_diff).group(1))
 
     virtctl_info = get_virtctl_user_info(vm=vm)
-    windows_info = run_ssh_commands(host=vm.ssh_exec, commands=["quser"], tcp_timeout=TCP_TIMEOUT_30SEC)[0]
+    windows_info = run_ssh_commands(
+        host=vm.ssh_exec,
+        commands=["quser"],
+        tcp_timeout=TCP_TIMEOUT_30SEC,
+        wait_timeout=TIMEOUT_2MIN,
+    )[0]
     # Match timezone to VM's timezone and not use UTC
     virtctl_time = virtctl_info["loginTime"] - _get_vm_timezone_diff()
     data_mismatch = []
     if virtctl_info["userName"].lower() not in windows_info:
         data_mismatch.append("user name mismatch")
     # Windows date format - 11/4/2020 (-m/-d/Y)
-    if datetime.fromtimestamp(timestamp=virtctl_time, tz=timezone.utc).strftime("%-m/%-d/%Y") not in windows_info:
+    if datetime.fromtimestamp(timestamp=virtctl_time, tz=UTC).strftime("%-m/%-d/%Y") not in windows_info:
         data_mismatch.append("login time mismatch")
 
     assert not data_mismatch, (
         f"Data mismatch {data_mismatch}!\nVirtctl: {virtctl_info}\nCNV: {get_cnv_user_info(vm=vm)}"
-        f"\nLibvirt: {get_libvirt_user_info(vm=vm)}\nOS: {windows_info}"
+        f"\nLibvirt: {get_libvirt_user_info(vm=vm, admin_client=admin_client)}\nOS: {windows_info}"
     )
 
 
@@ -228,11 +218,11 @@ def get_cnv_os_info(vm):
     return delete_guestosinfo_keys(data=data)
 
 
-def get_libvirt_os_info(vm):
-    agentinfo = execute_virsh_qemu_agent_command(vm=vm, command="guest-info")
-    hostname = execute_virsh_qemu_agent_command(vm=vm, command="guest-get-host-name")
-    osinfo = execute_virsh_qemu_agent_command(vm=vm, command="guest-get-osinfo")
-    timezone = execute_virsh_qemu_agent_command(vm=vm, command="guest-get-timezone")
+def get_libvirt_os_info(vm, admin_client):
+    agentinfo = execute_virsh_qemu_agent_command(vm=vm, command="guest-info", admin_client=admin_client)
+    hostname = execute_virsh_qemu_agent_command(vm=vm, command="guest-get-host-name", admin_client=admin_client)
+    osinfo = execute_virsh_qemu_agent_command(vm=vm, command="guest-get-osinfo", admin_client=admin_client)
+    timezone = execute_virsh_qemu_agent_command(vm=vm, command="guest-get-timezone", admin_client=admin_client)
 
     return {
         "guestAgentVersion": agentinfo["version"],
@@ -299,7 +289,7 @@ def get_cnv_fs_info(vm):
     return guest_agent_disk_info_parser(disk_info=vm.vmi.guest_fs_info["items"])
 
 
-def get_libvirt_fs_info(vm):
+def get_libvirt_fs_info(vm, admin_client):
     """
     Returns FS data dict in format:
     {
@@ -310,13 +300,13 @@ def get_libvirt_fs_info(vm):
         "total": <total bytes>,
     }
     """
-    fsinfo = execute_virsh_qemu_agent_command(vm=vm, command="guest-get-fsinfo")
+    fsinfo = execute_virsh_qemu_agent_command(vm=vm, command="guest-get-fsinfo", admin_client=admin_client)
     return guest_agent_disk_info_parser(disk_info=fsinfo)
 
 
 def get_linux_fs_info(ssh_exec):
     cmd = shlex.split("df -TB1 | grep /dev/vd")
-    out = run_ssh_commands(host=ssh_exec, commands=cmd)[0]
+    out = run_ssh_commands(host=ssh_exec, commands=cmd, wait_timeout=TIMEOUT_2MIN)[0]
     disks = out.strip().split()
     return {
         "name": disks[0].split("/dev/")[1],
@@ -331,13 +321,30 @@ def get_linux_fs_info(ssh_exec):
 
 def get_windows_fs_info(ssh_exec):
     disk_name_cmd = shlex.split("fsutil volume list")
-    disk_name = run_ssh_commands(host=ssh_exec, commands=disk_name_cmd, tcp_timeout=TCP_TIMEOUT_30SEC)[0]
+    disk_name = run_ssh_commands(
+        host=ssh_exec,
+        commands=disk_name_cmd,
+        tcp_timeout=TCP_TIMEOUT_30SEC,
+        wait_timeout=TIMEOUT_2MIN,
+    )[0]
     disk_space_cmd = shlex.split("fsutil volume diskfree C:")
     disk_space = (
-        run_ssh_commands(host=ssh_exec, commands=disk_space_cmd, tcp_timeout=TCP_TIMEOUT_30SEC)[0].strip().split("\r\n")
+        run_ssh_commands(
+            host=ssh_exec,
+            commands=disk_space_cmd,
+            tcp_timeout=TCP_TIMEOUT_30SEC,
+            wait_timeout=TIMEOUT_2MIN,
+        )[0]
+        .strip()
+        .split("\r\n")
     )
     fs_type_cmd = shlex.split("fsutil fsinfo volumeinfo C:")
-    fs_type = run_ssh_commands(host=ssh_exec, commands=fs_type_cmd, tcp_timeout=TCP_TIMEOUT_30SEC)[0]
+    fs_type = run_ssh_commands(
+        host=ssh_exec,
+        commands=fs_type_cmd,
+        tcp_timeout=TCP_TIMEOUT_30SEC,
+        wait_timeout=TIMEOUT_2MIN,
+    )[0]
 
     windows_info = f"{disk_name} {windows_disk_space_parser(disk_space)} {fs_type}"
     windows_fs_info = re.search(
@@ -381,8 +388,8 @@ def get_cnv_user_info(vm):
         }
 
 
-def get_libvirt_user_info(vm):
-    userinfo = execute_virsh_qemu_agent_command(vm=vm, command="guest-get-users")
+def get_libvirt_user_info(vm, admin_client):
+    userinfo = execute_virsh_qemu_agent_command(vm=vm, command="guest-get-users", admin_client=admin_client)
     for user in userinfo:
         return {
             "userName": user.get("user"),
@@ -395,12 +402,28 @@ def get_linux_user_info(vm):
     if any(os_version in vm.name for os_version in ["rhel-7", "rhel-8", "centos-8"]):
         # Older versions use lastlog and who to get the login time
         cmd = shlex.split("lastlog | grep tty; who | awk \"'{print$3}'\"")
-        output = run_ssh_commands(host=ssh_exec, commands=cmd)[0].strip().split()
+        output = (
+            run_ssh_commands(
+                host=ssh_exec,
+                commands=cmd,
+                wait_timeout=TIMEOUT_2MIN,
+            )[0]
+            .strip()
+            .split()
+        )
         date = datetime.strptime(f"{output[7]}-{output[3]}-{output[4]} {output[5]}", "%Y-%b-%d %H:%M:%S")
     else:
         # Newer versions use last -w --time-format iso to get the login time
         cmd = shlex.split("last -w --time-format iso | grep 'tty.*still logged in'")
-        output = run_ssh_commands(host=ssh_exec, commands=cmd)[0].strip().split()
+        output = (
+            run_ssh_commands(
+                host=ssh_exec,
+                commands=cmd,
+                wait_timeout=TIMEOUT_2MIN,
+            )[0]
+            .strip()
+            .split()
+        )
         date = datetime.fromisoformat(output[2])
 
     timestamp = date.replace(tzinfo=timezone(timedelta(seconds=int(ssh_exec.os.timezone.offset) * 36))).timestamp()
@@ -437,9 +460,9 @@ def windows_disk_space_parser(fsinfo_list):
     return f"used {used}, total {total}\n"
 
 
-def execute_virsh_qemu_agent_command(vm, command):
+def execute_virsh_qemu_agent_command(vm, command, admin_client):
     domain = f"{vm.namespace}_{vm.vmi.name}"
-    output = vm.privileged_vmi.virt_launcher_pod.execute(
+    output = vm.vmi.get_virt_launcher_pod(privileged_client=admin_client).execute(
         command=["virsh", "qemu-agent-command", domain, f'{{"execute":"{command}"}}'],
         container="compute",
     )
@@ -459,12 +482,12 @@ def check_machine_type(vm):
     assert vm_machine_type != "", f"Machine type does not exist in VM: {vm_machine_type}"
 
 
-def check_vm_xml_clock(vm):
+def check_vm_xml_clock(vm, admin_client):
     """Verify clock values in VMI"""
 
-    clock_timer_list = vm.privileged_vmi.xml_dict["domain"]["clock"]["timer"]
-    assert [i for i in clock_timer_list if i["@name"] == "hpet"][0]["@present"] == "no"
-    assert [i for i in clock_timer_list if i["@name"] == "hypervclock"][0]["@present"] == "yes"
+    clock_timer_list = vm.vmi.get_xml_dict(privileged_client=admin_client)["domain"]["clock"]["timer"]
+    assert [timer for timer in clock_timer_list if timer["@name"] == "hpet"][0]["@present"] == "no"
+    assert [timer for timer in clock_timer_list if timer["@name"] == "hypervclock"][0]["@present"] == "yes"
 
 
 def set_vm_tablet_device_dict(tablet_params):
@@ -473,7 +496,7 @@ def set_vm_tablet_device_dict(tablet_params):
     return {"spec": {"template": {"spec": {"domain": {"devices": {"inputs": [tablet_params]}}}}}}
 
 
-def check_vm_xml_tablet_device(vm):
+def check_vm_xml_tablet_device(vm, admin_client):
     """Verifies vm tablet device info in VM XML vs VM instance attributes
     values.
     """
@@ -483,7 +506,9 @@ def check_vm_xml_tablet_device(vm):
     vm_instance_tablet_device_dict = vm.instance["spec"]["template"]["spec"]["domain"]["devices"]["inputs"][0]
 
     tablet_dict_from_xml = [
-        i for i in vm.privileged_vmi.xml_dict["domain"]["devices"]["input"] if i["@type"] == "tablet"
+        input_device
+        for input_device in vm.vmi.get_xml_dict(privileged_client=admin_client)["domain"]["devices"]["input"]
+        if input_device["@type"] == "tablet"
     ][0]
 
     assert tablet_dict_from_xml["@type"] == vm_instance_tablet_device_dict["type"], "Wrong device type"
@@ -496,7 +521,7 @@ def check_vm_xml_tablet_device(vm):
 
 def get_matrix_os_golden_image_data_source(
     admin_client: DynamicClient, golden_images_namespace: Namespace, os_matrix: dict[str, dict]
-) -> Generator[DataSource, None, None]:
+) -> Generator[DataSource]:
     """Retrieves or creates a DataSource object in golden image namespace specified in the OS matrix.
 
     Args:
@@ -518,8 +543,9 @@ def matrix_os_vm_from_template(
     namespace: Namespace,
     data_source_object: DataSource,
     os_matrix: dict[str, dict],
-    request: Optional[FixtureRequest] = None,
-    data_volume_template: Optional[dict[str, dict]] = None,
+    cpu_model: str | None = None,
+    request: FixtureRequest | None = None,
+    data_volume_template: dict[str, dict] | None = None,
 ) -> VirtualMachineForTestsFromTemplate:
     param_dict = request.param if request else {}
     os_matrix_key = [*os_matrix][0]
@@ -532,9 +558,5 @@ def matrix_os_vm_from_template(
         labels=Template.generate_template_labels(**os_matrix[os_matrix_key]["template_labels"]),
         data_volume_template=data_volume_template,
         vm_dict=param_dict.get("vm_dict"),
+        cpu_model=cpu_model,
     )
-
-
-@cache
-def is_jira_67104_bug_open():
-    return is_jira_open(jira_id="CNV-67104")

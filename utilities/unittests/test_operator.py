@@ -9,26 +9,20 @@ from kubernetes.dynamic.exceptions import ResourceNotFoundError
 from timeout_sampler import TimeoutExpiredError
 
 # Import after setting up mocks to avoid circular dependency
-from utilities.operator import (  # noqa: E402
-    apply_icsp_idms,
+from utilities.operator import (
+    TIMEOUT_75MIN,
     approve_install_plan,
     cluster_with_icsp,
     collect_mcp_data_on_update_timeout,
     consecutive_checks_for_mcp_condition,
     create_catalog_source,
-    create_icsp_idms_command,
-    create_icsp_idms_from_file,
     create_operator,
     create_operator_group,
     create_subscription,
-    delete_existing_icsp_idms,
     disable_default_sources_in_operatorhub,
-    generate_icsp_idms_file,
-    generate_unique_icsp_idms_file,
     get_catalog_source,
     get_cluster_operator_status_conditions,
     get_failed_cluster_operator,
-    get_generated_icsp_idms,
     get_hco_csv_name_by_version,
     get_install_plan_from_subscription,
     get_machine_config_pool_by_name,
@@ -59,63 +53,6 @@ from utilities.operator import (  # noqa: E402
 # ============================================================================
 
 
-class TestCreateIcspIdmsCommand:
-    """Test cases for create_icsp_idms_command function"""
-
-    def test_create_command_without_pull_secret(self):
-        """Test creating ICSP command without pull secret"""
-        result = create_icsp_idms_command(
-            image="registry.io/image:latest",
-            source_url="mirror.io",
-            folder_name="/tmp/manifests",
-        )
-        assert result == (
-            "oc adm catalog mirror registry.io/image:latest mirror.io --manifests-only --to-manifests /tmp/manifests "
-        )
-
-    def test_create_command_with_pull_secret(self):
-        """Test creating ICSP command with pull secret"""
-        result = create_icsp_idms_command(
-            image="registry.io/image:latest",
-            source_url="mirror.io",
-            folder_name="/tmp/manifests",
-            pull_secret="/path/to/pull-secret.json",
-        )
-        assert result == (
-            "oc adm catalog mirror registry.io/image:latest mirror.io "
-            "--manifests-only --to-manifests /tmp/manifests  "
-            "--registry-config=/path/to/pull-secret.json"
-        )
-
-    def test_create_command_with_filter_options(self):
-        """Test creating ICSP command with filter options"""
-        result = create_icsp_idms_command(
-            image="registry.io/image:latest",
-            source_url="mirror.io",
-            folder_name="/tmp/manifests",
-            filter_options="--filter-by-os=linux/amd64",
-        )
-        assert result == (
-            "oc adm catalog mirror registry.io/image:latest mirror.io "
-            "--manifests-only --to-manifests /tmp/manifests --filter-by-os=linux/amd64"
-        )
-
-    def test_create_command_with_all_parameters(self):
-        """Test creating ICSP command with all parameters"""
-        result = create_icsp_idms_command(
-            image="registry.io/image:v1.0",
-            source_url="mirror.example.com",
-            folder_name="/opt/manifests",
-            pull_secret="/etc/pull-secret",
-            filter_options="--filter-by-os=linux/arm64",
-        )
-        assert result == (
-            "oc adm catalog mirror registry.io/image:v1.0 mirror.example.com "
-            "--manifests-only --to-manifests /opt/manifests --filter-by-os=linux/arm64 "
-            "--registry-config=/etc/pull-secret"
-        )
-
-
 class TestClusterWithIcsp:
     """Test cases for cluster_with_icsp function"""
 
@@ -128,17 +65,21 @@ class TestClusterWithIcsp:
         mock_icsp2.name = "icsp-2"
 
         mock_icsp_class.get.return_value = [mock_icsp1, mock_icsp2]
+        mock_client = MagicMock()
 
-        result = cluster_with_icsp()
+        result = cluster_with_icsp(client=mock_client)
         assert result is True
+        mock_icsp_class.get.assert_called_once_with(dyn_client=mock_client)
 
     @patch("utilities.operator.ImageContentSourcePolicy")
     def test_cluster_with_icsp_absent(self, mock_icsp_class):
         """Test cluster_with_icsp returns False when no ICSP exists"""
         mock_icsp_class.get.return_value = []
+        mock_client = MagicMock()
 
-        result = cluster_with_icsp()
+        result = cluster_with_icsp(client=mock_client)
         assert result is False
+        mock_icsp_class.get.assert_called_once_with(dyn_client=mock_client)
 
 
 class TestGetCatalogSource:
@@ -154,11 +95,13 @@ class TestGetCatalogSource:
         mock_catalog.exists = True
         mock_catalog.name = "test-catalog"
         mock_catalog_source_class.return_value = mock_catalog
+        mock_client = MagicMock()
 
-        result = get_catalog_source("test-catalog")
+        result = get_catalog_source(client=mock_client, catalog_name="test-catalog")
 
         assert result == mock_catalog
         mock_catalog_source_class.assert_called_once_with(
+            client=mock_client,
             namespace="openshift-marketplace",
             name="test-catalog",
         )
@@ -172,8 +115,9 @@ class TestGetCatalogSource:
         mock_catalog = MagicMock()
         mock_catalog.exists = False
         mock_catalog_source_class.return_value = mock_catalog
+        mock_client = MagicMock()
 
-        result = get_catalog_source("nonexistent-catalog")
+        result = get_catalog_source(client=mock_client, catalog_name="nonexistent-catalog")
 
         assert result is None
 
@@ -212,11 +156,12 @@ class TestGetMachineConfigPoolByName:
         mock_mcp.exists = True
         mock_mcp.name = "worker"
         mock_mcp_class.return_value = mock_mcp
+        mock_client = MagicMock()
 
-        result = get_machine_config_pool_by_name("worker")
+        result = get_machine_config_pool_by_name("worker", admin_client=mock_client)
 
         assert result == mock_mcp
-        mock_mcp_class.assert_called_once_with(name="worker")
+        mock_mcp_class.assert_called_once_with(name="worker", client=mock_client)
 
     @patch("utilities.operator.MachineConfigPool")
     def test_get_mcp_not_exists(self, mock_mcp_class):
@@ -224,9 +169,10 @@ class TestGetMachineConfigPoolByName:
         mock_mcp = MagicMock()
         mock_mcp.exists = False
         mock_mcp_class.return_value = mock_mcp
+        mock_client = MagicMock()
 
         with pytest.raises(ResourceNotFoundError, match="OperatorHub nonexistent not found"):
-            get_machine_config_pool_by_name("nonexistent")
+            get_machine_config_pool_by_name("nonexistent", admin_client=mock_client)
 
     @patch("utilities.operator.MachineConfigPool")
     def test_get_mcp_master_pool(self, mock_mcp_class):
@@ -235,8 +181,9 @@ class TestGetMachineConfigPoolByName:
         mock_mcp.exists = True
         mock_mcp.name = "master"
         mock_mcp_class.return_value = mock_mcp
+        mock_client = MagicMock()
 
-        result = get_machine_config_pool_by_name("master")
+        result = get_machine_config_pool_by_name("master", admin_client=mock_client)
 
         assert result == mock_mcp
 
@@ -251,11 +198,12 @@ class TestGetOperatorHub:
         mock_operator_hub.exists = True
         mock_operator_hub.name = "cluster"
         mock_operator_hub_class.return_value = mock_operator_hub
+        mock_client = MagicMock()
 
-        result = get_operator_hub()
+        result = get_operator_hub(client=mock_client)
 
         assert result == mock_operator_hub
-        mock_operator_hub_class.assert_called_once_with(name="cluster")
+        mock_operator_hub_class.assert_called_once_with(client=mock_client, name="cluster")
 
     @patch("utilities.operator.OperatorHub")
     def test_get_operator_hub_not_exists(self, mock_operator_hub_class):
@@ -263,9 +211,10 @@ class TestGetOperatorHub:
         mock_operator_hub = MagicMock()
         mock_operator_hub.exists = False
         mock_operator_hub_class.return_value = mock_operator_hub
+        mock_client = MagicMock()
 
         with pytest.raises(ResourceNotFoundError, match="OperatorHub cluster not found"):
-            get_operator_hub()
+            get_operator_hub(client=mock_client)
 
 
 class TestGetFailedClusterOperator:
@@ -626,265 +575,6 @@ class TestWaitForMcpUpdatedConditionTrue:
         assert call_kwargs["exceptions_dict"] == {"Exception": []}
 
 
-# ============================================================================
-# NEW COMPREHENSIVE TESTS FOR UNCOVERED FUNCTIONS
-# ============================================================================
-
-
-class TestGenerateIcspIdmsFile:
-    """Test cases for generate_icsp_idms_file function"""
-
-    @patch("utilities.operator.os.path.isfile")
-    @patch("utilities.operator.os.path.join")
-    @patch("utilities.operator.run_command")
-    @patch("utilities.operator.generate_unique_icsp_idms_file")
-    @patch("utilities.operator.IDMS_FILE", "imageDigestMirrorSet.yaml")
-    @patch("utilities.operator.ICSP_FILE", "imageContentSourcePolicy.yaml")
-    def test_generate_idms_file_success(
-        self,
-        mock_generate_unique,
-        mock_run_command,
-        mock_join,
-        mock_isfile,
-    ):
-        """Test generating IDMS file successfully"""
-        mock_run_command.return_value = (True, "", "")
-        mock_join.return_value = "/tmp/manifests/imageDigestMirrorSet.yaml"
-        mock_isfile.return_value = True
-
-        result = generate_icsp_idms_file(
-            folder_name="/tmp/manifests",
-            command="oc adm catalog mirror ...",
-            is_idms_file=True,
-        )
-
-        assert result == "/tmp/manifests/imageDigestMirrorSet.yaml"
-        mock_run_command.assert_called_once()
-        mock_isfile.assert_called_once_with("/tmp/manifests/imageDigestMirrorSet.yaml")
-        mock_generate_unique.assert_not_called()
-
-    @patch("utilities.operator.os.path.isfile")
-    @patch("utilities.operator.os.path.join")
-    @patch("utilities.operator.run_command")
-    @patch("utilities.operator.ICSP_FILE", "imageContentSourcePolicy.yaml")
-    def test_generate_icsp_file_success(
-        self,
-        mock_run_command,
-        mock_join,
-        mock_isfile,
-    ):
-        """Test generating ICSP file successfully"""
-        mock_run_command.return_value = (True, "", "")
-        mock_join.return_value = "/tmp/manifests/imageContentSourcePolicy.yaml"
-        mock_isfile.return_value = True
-
-        result = generate_icsp_idms_file(
-            folder_name="/tmp/manifests",
-            command="oc adm catalog mirror ...",
-            is_idms_file=False,
-        )
-
-        assert result == "/tmp/manifests/imageContentSourcePolicy.yaml"
-
-    @patch("utilities.operator.os.path.isfile")
-    @patch("utilities.operator.os.path.join")
-    @patch("utilities.operator.run_command")
-    @patch("utilities.operator.generate_unique_icsp_idms_file")
-    @patch("utilities.operator.IDMS_FILE", "imageDigestMirrorSet.yaml")
-    def test_generate_idms_file_with_version(
-        self,
-        mock_generate_unique,
-        mock_run_command,
-        mock_join,
-        mock_isfile,
-    ):
-        """Test generating IDMS file with CNV version"""
-        mock_run_command.return_value = (True, "", "")
-        mock_join.return_value = "/tmp/manifests/imageDigestMirrorSet.yaml"
-        mock_isfile.return_value = True
-        mock_generate_unique.return_value = "/tmp/manifests/imageDigestMirrorSet4200.yaml"
-
-        result = generate_icsp_idms_file(
-            folder_name="/tmp/manifests",
-            command="oc adm catalog mirror ...",
-            is_idms_file=True,
-            cnv_version="v4.20.0",
-        )
-
-        assert result == "/tmp/manifests/imageDigestMirrorSet4200.yaml"
-        mock_generate_unique.assert_called_once_with(
-            file_name="/tmp/manifests/imageDigestMirrorSet.yaml",
-            version_string="4200",
-        )
-
-    @patch("utilities.operator.os.path.isfile")
-    @patch("utilities.operator.os.path.join")
-    @patch("utilities.operator.run_command")
-    def test_generate_icsp_file_command_failure(
-        self,
-        mock_run_command,
-        mock_join,
-        mock_isfile,
-    ):
-        """Test generating ICSP file when command fails"""
-        mock_run_command.return_value = (False, "", "Error")
-
-        with pytest.raises(AssertionError):
-            generate_icsp_idms_file(
-                folder_name="/tmp/manifests",
-                command="oc adm catalog mirror ...",
-                is_idms_file=False,
-            )
-
-    @patch("utilities.operator.os.path.isfile")
-    @patch("utilities.operator.os.path.join")
-    @patch("utilities.operator.run_command")
-    def test_generate_icsp_file_not_exist(
-        self,
-        mock_run_command,
-        mock_join,
-        mock_isfile,
-    ):
-        """Test generating ICSP file when file doesn't exist"""
-        mock_run_command.return_value = (True, "", "")
-        mock_join.return_value = "/tmp/manifests/imageContentSourcePolicy.yaml"
-        mock_isfile.return_value = False
-
-        with pytest.raises(AssertionError, match="file does not exist"):
-            generate_icsp_idms_file(
-                folder_name="/tmp/manifests",
-                command="oc adm catalog mirror ...",
-                is_idms_file=False,
-            )
-
-
-class TestGenerateUniqueIcspIdmsFile:
-    """Test cases for generate_unique_icsp_idms_file function"""
-
-    @patch("utilities.operator.os.rename")
-    @patch("utilities.operator.yaml.dump")
-    @patch("utilities.operator.yaml.safe_load")
-    @patch("builtins.open", create=True)
-    def test_generate_unique_file_success(
-        self,
-        mock_open,
-        mock_safe_load,
-        mock_dump,
-        mock_rename,
-    ):
-        """Test generating unique ICSP/IDMS file"""
-        mock_safe_load.return_value = {
-            "metadata": {"name": "original-name"},
-            "spec": {},
-        }
-
-        result = generate_unique_icsp_idms_file(
-            file_name="/tmp/imageContentSourcePolicy.yaml",
-            version_string="4200",
-        )
-
-        assert result == "/tmp/imageContentSourcePolicy4200.yaml"
-        mock_rename.assert_called_once_with(
-            "/tmp/imageContentSourcePolicy.yaml",
-            "/tmp/imageContentSourcePolicy4200.yaml",
-        )
-
-    @patch("utilities.operator.os.rename")
-    @patch("utilities.operator.yaml.dump")
-    @patch("utilities.operator.yaml.safe_load")
-    @patch("builtins.open", create=True)
-    def test_generate_unique_file_metadata_update(
-        self,
-        mock_open,
-        mock_safe_load,
-        mock_dump,
-        mock_rename,
-    ):
-        """Test metadata name is updated correctly"""
-        original_yaml = {"metadata": {"name": "original-name"}, "spec": {}}
-        mock_safe_load.return_value = original_yaml
-
-        generate_unique_icsp_idms_file(
-            file_name="/tmp/imageDigestMirrorSet.yaml",
-            version_string="4210",
-        )
-
-        # Verify yaml.dump was called with updated metadata
-        call_args = mock_dump.call_args[0]
-        assert call_args[0]["metadata"]["name"] == "iib-4210"
-
-
-class TestCreateIcspIdmsFromFile:
-    """Test cases for create_icsp_idms_from_file function"""
-
-    @patch("utilities.operator.run_command")
-    def test_create_icsp_from_file_success(self, mock_run_command):
-        """Test creating ICSP from file successfully"""
-        mock_run_command.return_value = (True, "", "")
-
-        create_icsp_idms_from_file("/tmp/imageContentSourcePolicy.yaml")
-
-        mock_run_command.assert_called_once()
-        call_args = mock_run_command.call_args[1]["command"]
-        assert "oc" in call_args
-        assert "create" in call_args
-        assert "-f" in call_args
-
-    @patch("utilities.operator.run_command")
-    def test_create_icsp_from_file_failure(self, mock_run_command):
-        """Test creating ICSP from file when command fails"""
-        mock_run_command.return_value = (False, "", "Error")
-
-        with pytest.raises(AssertionError):
-            create_icsp_idms_from_file("/tmp/imageContentSourcePolicy.yaml")
-
-
-class TestDeleteExistingIcspIdms:
-    """Test cases for delete_existing_icsp_idms function"""
-
-    @patch("utilities.operator.ImageContentSourcePolicy")
-    def test_delete_existing_icsp(self, mock_icsp_class):
-        """Test deleting existing ICSP resources"""
-        mock_icsp1 = MagicMock()
-        mock_icsp1.name = "iib-4200"
-        mock_icsp2 = MagicMock()
-        mock_icsp2.name = "iib-4210"
-        mock_icsp3 = MagicMock()
-        mock_icsp3.name = "other-icsp"
-
-        mock_icsp_class.get.return_value = [mock_icsp1, mock_icsp2, mock_icsp3]
-
-        delete_existing_icsp_idms(name="iib", is_idms_file=False)
-
-        mock_icsp1.delete.assert_called_once_with(wait=True)
-        mock_icsp2.delete.assert_called_once_with(wait=True)
-        mock_icsp3.delete.assert_not_called()
-
-    @patch("utilities.operator.ImageDigestMirrorSet")
-    def test_delete_existing_idms(self, mock_idms_class):
-        """Test deleting existing IDMS resources"""
-        mock_idms1 = MagicMock()
-        mock_idms1.name = "iib-4200"
-
-        mock_idms_class.get.return_value = [mock_idms1]
-
-        delete_existing_icsp_idms(name="iib", is_idms_file=True)
-
-        mock_idms1.delete.assert_called_once_with(wait=True)
-
-    @patch("utilities.operator.ImageContentSourcePolicy")
-    def test_delete_existing_icsp_no_matches(self, mock_icsp_class):
-        """Test deleting ICSP when no resources match"""
-        mock_icsp = MagicMock()
-        mock_icsp.name = "other-icsp"
-
-        mock_icsp_class.get.return_value = [mock_icsp]
-
-        delete_existing_icsp_idms(name="iib", is_idms_file=False)
-
-        mock_icsp.delete.assert_not_called()
-
-
 class TestGetMcpsWithDifferentTransitionTimes:
     """Test cases for get_mcps_with_different_transition_times function"""
 
@@ -1074,7 +764,7 @@ class TestWaitForMcpUpdateEnd:
 
         wait_for_mcp_update_end([mock_mcp])
 
-        mock_wait_updated.assert_called_once_with(machine_config_pools_list=[mock_mcp])
+        mock_wait_updated.assert_called_once_with(machine_config_pools_list=[mock_mcp], timeout=TIMEOUT_75MIN)
         mock_wait_ready.assert_called_once_with(machine_config_pools_list=[mock_mcp])
 
 
@@ -1233,9 +923,12 @@ class TestWaitForCatalogSourceDisabled:
         mock_sampler_instance.__iter__ = MagicMock(return_value=iter([None]))
         mock_sampler.return_value = mock_sampler_instance
 
-        wait_for_catalog_source_disabled("test-catalog")
+        mock_client = MagicMock()
+        wait_for_catalog_source_disabled(client=mock_client, catalog_name="test-catalog")
 
         mock_sampler.assert_called_once()
+        assert mock_sampler.call_args.kwargs["client"] == mock_client
+        assert mock_sampler.call_args.kwargs["catalog_name"] == "test-catalog"
 
     @patch("utilities.operator.TimeoutSampler")
     @patch("utilities.operator.get_catalog_source")
@@ -1254,9 +947,10 @@ class TestWaitForCatalogSourceDisabled:
                 raise TimeoutExpiredError("Timeout")
 
         mock_sampler.return_value = MockSamplerIterator()
+        mock_client = MagicMock()
 
         with pytest.raises(TimeoutExpiredError):
-            wait_for_catalog_source_disabled("test-catalog")
+            wait_for_catalog_source_disabled(client=mock_client, catalog_name="test-catalog")
 
 
 class TestCreateCatalogSource:
@@ -1267,6 +961,7 @@ class TestCreateCatalogSource:
     def test_create_catalog_source(self, mock_catalog_class, mock_config):
         """Test creating catalog source"""
         mock_config.__getitem__.return_value = "openshift-marketplace"
+        mock_client = MagicMock()
 
         mock_catalog = MagicMock()
         mock_catalog.__enter__ = MagicMock(return_value=mock_catalog)
@@ -1276,6 +971,7 @@ class TestCreateCatalogSource:
         result = create_catalog_source(
             catalog_name="test-catalog",
             image="registry.io/catalog:latest",
+            admin_client=mock_client,
         )
 
         assert result == mock_catalog
@@ -1351,10 +1047,12 @@ class TestCreateOperatorGroup:
         mock_og.__enter__ = MagicMock(return_value=mock_og)
         mock_og.__exit__ = MagicMock(return_value=False)
         mock_og_class.return_value = mock_og
+        mock_client = MagicMock()
 
         result = create_operator_group(
             operator_group_name="test-og",
             namespace_name="test-namespace",
+            admin_client=mock_client,
         )
 
         assert result == mock_og
@@ -1363,6 +1061,7 @@ class TestCreateOperatorGroup:
             namespace="test-namespace",
             target_namespaces=None,
             teardown=False,
+            client=mock_client,
         )
 
     @patch("utilities.operator.OperatorGroup")
@@ -1372,10 +1071,12 @@ class TestCreateOperatorGroup:
         mock_og.__enter__ = MagicMock(return_value=mock_og)
         mock_og.__exit__ = MagicMock(return_value=False)
         mock_og_class.return_value = mock_og
+        mock_client = MagicMock()
 
         create_operator_group(
             operator_group_name="test-og",
             namespace_name="test-namespace",
+            admin_client=mock_client,
             target_namespaces=["ns1", "ns2"],
         )
 
@@ -1391,6 +1092,7 @@ class TestCreateSubscription:
     def test_create_subscription_basic(self, mock_sub_class, mock_config):
         """Test creating subscription with default values"""
         mock_config.__getitem__.return_value = "openshift-marketplace"
+        mock_client = MagicMock()
 
         mock_sub = MagicMock()
         mock_sub.__enter__ = MagicMock(return_value=mock_sub)
@@ -1402,6 +1104,7 @@ class TestCreateSubscription:
             package_name="test-package",
             namespace_name="test-namespace",
             catalogsource_name="test-catalog",
+            admin_client=mock_client,
         )
 
         assert result == mock_sub
@@ -1414,6 +1117,7 @@ class TestCreateSubscription:
     def test_create_subscription_custom(self, mock_sub_class, mock_config):
         """Test creating subscription with custom values"""
         mock_config.__getitem__.return_value = "openshift-marketplace"
+        mock_client = MagicMock()
 
         mock_sub = MagicMock()
         mock_sub.__enter__ = MagicMock(return_value=mock_sub)
@@ -1425,6 +1129,7 @@ class TestCreateSubscription:
             package_name="test-package",
             namespace_name="test-namespace",
             catalogsource_name="test-catalog",
+            admin_client=mock_client,
             channel_name="candidate",
             install_plan_approval="Manual",
         )
@@ -1715,16 +1420,19 @@ class TestCreateOperator:
         mock_operator = MagicMock()
         mock_operator.exists = False
         mock_operator_class.return_value = mock_operator
+        mock_client = MagicMock()
 
         result = create_operator(
             mock_operator_class,
             "test-operator",
+            admin_client=mock_client,
             namespace_name="test-namespace",
         )
 
         mock_operator_class.assert_called_once_with(
             name="test-operator",
             namespace="test-namespace",
+            client=mock_client,
         )
         mock_operator.deploy.assert_called_once_with(wait=True)
         assert result == mock_operator
@@ -1735,10 +1443,11 @@ class TestCreateOperator:
         mock_operator = MagicMock()
         mock_operator.exists = False
         mock_operator_class.return_value = mock_operator
+        mock_client = MagicMock()
 
-        create_operator(mock_operator_class, "test-operator")
+        create_operator(mock_operator_class, "test-operator", admin_client=mock_client)
 
-        mock_operator_class.assert_called_once_with(name="test-operator")
+        mock_operator_class.assert_called_once_with(name="test-operator", client=mock_client)
         mock_operator.deploy.assert_called_once_with(wait=True)
 
     def test_create_operator_already_exists(self):
@@ -1747,10 +1456,12 @@ class TestCreateOperator:
         mock_operator = MagicMock()
         mock_operator.exists = True
         mock_operator_class.return_value = mock_operator
+        mock_client = MagicMock()
 
         result = create_operator(
             mock_operator_class,
             "test-operator",
+            admin_client=mock_client,
             namespace_name="test-namespace",
         )
 
@@ -1769,14 +1480,14 @@ class TestWaitForPackageManifestToExist:
         mock_sampler,
     ):
         """Test waiting for package manifest to exist"""
-        mock_dyn_client = MagicMock()
+        mock_client = MagicMock()
 
         mock_sampler_instance = MagicMock()
         mock_sampler_instance.__iter__ = MagicMock(return_value=iter([{"name": "test"}]))
         mock_sampler.return_value = mock_sampler_instance
 
         wait_for_package_manifest_to_exist(
-            mock_dyn_client,
+            mock_client,
             "test-cr",
             "test-catalog",
         )
@@ -1824,7 +1535,7 @@ class TestUpdateImageInCatalogSource:
         mock_wait_manifest,
     ):
         """Test updating image in existing catalog source"""
-        mock_dyn_client = MagicMock()
+        mock_client = MagicMock()
 
         mock_catalog = MagicMock()
         mock_get_catalog.return_value = mock_catalog
@@ -1833,7 +1544,7 @@ class TestUpdateImageInCatalogSource:
         mock_editor_class.return_value = mock_editor
 
         update_image_in_catalog_source(
-            mock_dyn_client,
+            mock_client,
             "registry.io/catalog:v2",
             "test-catalog",
             "test-cr",
@@ -1852,12 +1563,12 @@ class TestUpdateImageInCatalogSource:
         mock_wait_manifest,
     ):
         """Test creating new catalog source when it doesn't exist"""
-        mock_dyn_client = MagicMock()
+        mock_client = MagicMock()
 
         mock_get_catalog.return_value = None
 
         update_image_in_catalog_source(
-            mock_dyn_client,
+            mock_client,
             "registry.io/catalog:v2",
             "test-catalog",
             "test-cr",
@@ -1865,127 +1576,3 @@ class TestUpdateImageInCatalogSource:
 
         mock_create_catalog.assert_called_once()
         mock_wait_manifest.assert_called_once()
-
-
-class TestGetGeneratedIcspIdms:
-    """Test cases for get_generated_icsp_idms function"""
-
-    @patch("utilities.operator.generate_icsp_idms_file")
-    @patch("utilities.operator.create_icsp_idms_command")
-    @patch("utilities.operator.BREW_REGISTERY_SOURCE", "brew.registry.io")
-    def test_get_generated_idms_with_brew(
-        self,
-        mock_create_command,
-        mock_generate_file,
-    ):
-        """Test generating IDMS with brew registry"""
-        mock_create_command.return_value = "oc adm catalog mirror ..."
-        mock_generate_file.return_value = "/tmp/manifests/idms.yaml"
-
-        result = get_generated_icsp_idms(
-            image_url="brew.registry.io/image:latest",
-            registry_source="mirror.io",
-            generated_pulled_secret="/tmp/pull-secret.json",
-            pull_secret_directory="/tmp/manifests",
-            is_idms_cluster=True,
-        )
-
-        assert result == "/tmp/manifests/idms.yaml"
-        # Verify pull_secret was used for brew registry
-        call_kwargs = mock_create_command.call_args[1]
-        assert call_kwargs["pull_secret"] == "/tmp/pull-secret.json"
-        assert call_kwargs["source_url"] == "brew.registry.io"
-
-    @patch("utilities.operator.generate_icsp_idms_file")
-    @patch("utilities.operator.create_icsp_idms_command")
-    def test_get_generated_icsp_without_brew(
-        self,
-        mock_create_command,
-        mock_generate_file,
-    ):
-        """Test generating ICSP without brew registry"""
-        mock_create_command.return_value = "oc adm catalog mirror ..."
-        mock_generate_file.return_value = "/tmp/manifests/icsp.yaml"
-
-        result = get_generated_icsp_idms(
-            image_url="registry.io/image:latest",
-            registry_source="mirror.io",
-            generated_pulled_secret="/tmp/pull-secret.json",
-            pull_secret_directory="/tmp/manifests",
-            is_idms_cluster=False,
-        )
-
-        assert result == "/tmp/manifests/icsp.yaml"
-        # Verify pull_secret was None for non-brew registry
-        call_kwargs = mock_create_command.call_args[1]
-        assert call_kwargs["pull_secret"] is None
-
-
-class TestApplyIcspIdms:
-    """Test cases for apply_icsp_idms function"""
-
-    @patch("utilities.operator.wait_for_mcp_update_completion")
-    @patch("utilities.operator.create_icsp_idms_from_file")
-    @patch("utilities.operator.delete_existing_icsp_idms")
-    @patch("utilities.operator.ResourceEditor")
-    def test_apply_icsp_with_delete(
-        self,
-        mock_editor_class,
-        mock_delete,
-        mock_create,
-        mock_wait_completion,
-    ):
-        """Test applying ICSP with delete option"""
-        mock_mcp = MagicMock()
-        mock_node = MagicMock()
-
-        mock_editor = MagicMock()
-        mock_editor.__enter__ = MagicMock(return_value=mock_editor)
-        mock_editor.__exit__ = MagicMock(return_value=False)
-        mock_editor_class.return_value = mock_editor
-
-        apply_icsp_idms(
-            file_paths=["/tmp/icsp1.yaml", "/tmp/icsp2.yaml"],
-            machine_config_pools=[mock_mcp],
-            mcp_conditions={"worker": []},
-            nodes=[mock_node],
-            is_idms_file=False,
-            delete_file=True,
-        )
-
-        mock_delete.assert_called_once_with(name="iib", is_idms_file=False)
-        assert mock_create.call_count == 2
-        mock_wait_completion.assert_called_once()
-
-    @patch("utilities.operator.wait_for_mcp_update_completion")
-    @patch("utilities.operator.create_icsp_idms_from_file")
-    @patch("utilities.operator.delete_existing_icsp_idms")
-    @patch("utilities.operator.ResourceEditor")
-    def test_apply_idms_without_delete(
-        self,
-        mock_editor_class,
-        mock_delete,
-        mock_create,
-        mock_wait_completion,
-    ):
-        """Test applying IDMS without delete option"""
-        mock_mcp = MagicMock()
-        mock_node = MagicMock()
-
-        mock_editor = MagicMock()
-        mock_editor.__enter__ = MagicMock(return_value=mock_editor)
-        mock_editor.__exit__ = MagicMock(return_value=False)
-        mock_editor_class.return_value = mock_editor
-
-        apply_icsp_idms(
-            file_paths=["/tmp/idms.yaml"],
-            machine_config_pools=[mock_mcp],
-            mcp_conditions={"master": []},
-            nodes=[mock_node],
-            is_idms_file=True,
-            delete_file=False,
-        )
-
-        mock_delete.assert_not_called()
-        mock_create.assert_called_once_with(file_path="/tmp/idms.yaml")
-        mock_wait_completion.assert_called_once()

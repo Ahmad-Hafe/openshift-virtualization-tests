@@ -3,23 +3,31 @@ WSL2 test
 Note: The windows image runs the WSL guest (Fedora-33) at boot.
 """
 
+from __future__ import annotations
+
 import logging
 import re
 import shlex
+from typing import TYPE_CHECKING
 
 import pytest
-from ocp_resources.template import Template
+from ocp_resources.virtual_machine_cluster_preference import VirtualMachineClusterPreference
+from ocp_resources.virtual_machine_instancetype import VirtualMachineInstancetype
 from pyhelper_utils.shell import run_ssh_commands
 
-from tests.virt.constants import WINDOWS_10_WSL, WINDOWS_11_WSL
-from tests.virt.utils import verify_wsl2_guest_works
-from utilities.constants import TCP_TIMEOUT_30SEC, Images
+from tests.utils import verify_wsl2_guest_works
+from tests.virt.constants import WINDOWS_11_WSL
+from utilities.constants import Images
+from utilities.constants.images import OS_FLAVOR_WINDOWS
+from utilities.constants.timeouts import TCP_TIMEOUT_30SEC, TIMEOUT_2MIN
 from utilities.virt import (
-    VirtualMachineForTestsFromTemplate,
-    get_windows_os_dict,
+    VirtualMachineForTests,
     migrate_vm_and_verify,
     running_vm,
 )
+
+if TYPE_CHECKING:
+    from kubernetes.dynamic import DynamicClient
 
 pytestmark = [pytest.mark.special_infra, pytest.mark.high_resource_vm]
 
@@ -39,6 +47,7 @@ def get_windows_vm_resource_usage(vm):
         host=vm.ssh_exec,
         commands=shlex.split("python C:\\\\tools\\\\cpu_mem_usage.py"),
         tcp_timeout=TCP_TIMEOUT_30SEC,
+        wait_timeout=TIMEOUT_2MIN,
     )[0]
     LOGGER.info(f"Windows VM CPU and Memory usage: {usage}")
     out = re.search(r".*CPU usage: (?P<cpu>.*),.*\(RAM\):(?P<ram>.*)", usage)
@@ -52,55 +61,64 @@ def assert_windows_host_resource_usage(vm):
 
 
 @pytest.fixture(scope="class")
+def wsl2_vm_instance_type(unprivileged_client, namespace):
+    with VirtualMachineInstancetype(
+        client=unprivileged_client,
+        namespace=namespace.name,
+        name="wsl2-windows-instance-type",
+        cpu={"guest": 12},
+        memory={"guest": Images.Windows.DEFAULT_MEMORY_SIZE_WSL},
+    ) as instance_type:
+        yield instance_type
+
+
+@pytest.fixture(scope="class")
 def windows_wsl2_vm(
-    request,
     namespace,
     unprivileged_client,
+    wsl2_vm_instance_type,
     golden_image_data_volume_template_for_test_scope_class,
     modern_cpu_for_migration,
     vm_cpu_flags,
 ):
-    """Create Windows 10/11 VM, Run VM and wait for WSL2 guest to start"""
-    win_ver = request.param["win_ver"]
-    with VirtualMachineForTestsFromTemplate(
-        name=f"{win_ver}-wsl2",
-        labels=Template.generate_template_labels(**get_windows_os_dict(windows_version=win_ver)["template_labels"]),
+    """Create Windows 11 VM, run VM and wait for WSL2 guest to start."""
+    preference_name = f"windows.{golden_image_data_volume_template_for_test_scope_class['spec']['sourceRef']['name'].removeprefix('win')}"
+    with VirtualMachineForTests(
+        name="win-wsl2",
         namespace=namespace.name,
         client=unprivileged_client,
+        vm_instance_type=wsl2_vm_instance_type,
+        vm_preference=VirtualMachineClusterPreference(client=unprivileged_client, name=preference_name),
         data_volume_template=golden_image_data_volume_template_for_test_scope_class,
         cpu_model=modern_cpu_for_migration,
         cpu_flags=vm_cpu_flags,
-        memory_guest=Images.Windows.DEFAULT_MEMORY_SIZE_WSL,
-        cpu_cores=8,
+        os_flavor=OS_FLAVOR_WINDOWS,
+        disk_type=None,
+        exclude_from_descheduler=True,
     ) as vm:
         running_vm(vm=vm)
         yield vm
 
 
 @pytest.fixture()
-def migrated_wsl2_vm(windows_wsl2_vm):
-    migrate_vm_and_verify(vm=windows_wsl2_vm, check_ssh_connectivity=True)
+def migrated_wsl2_vm(admin_client: DynamicClient, windows_wsl2_vm: VirtualMachineForTests) -> VirtualMachineForTests:
+    migrate_vm_and_verify(vm=windows_wsl2_vm, client=admin_client, check_ssh_connectivity=True)
     return windows_wsl2_vm
 
 
 @pytest.mark.ibm_bare_metal
 @pytest.mark.tier3
 @pytest.mark.parametrize(
-    "golden_image_data_source_for_test_scope_class, windows_wsl2_vm",
+    "golden_image_data_source_for_test_scope_class",
     [
         pytest.param(
-            {"os_dict": WINDOWS_10_WSL},
-            {"win_ver": "win-10"},
-            id="Windows-10",
-        ),
-        pytest.param(
             {"os_dict": WINDOWS_11_WSL},
-            {"win_ver": "win-11"},
             id="Windows-11",
         ),
     ],
     indirect=True,
 )
+@pytest.mark.windows
 class TestWSL2:
     @pytest.mark.dependency(name=f"{TESTS_CLASS_NAME}::wsl2_guest")
     @pytest.mark.polarion("CNV-6023")

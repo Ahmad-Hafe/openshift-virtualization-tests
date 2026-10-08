@@ -6,23 +6,29 @@ from ocp_resources.resource import ResourceEditor
 from timeout_sampler import TimeoutSampler
 
 from tests.os_params import RHEL_LATEST, RHEL_LATEST_LABELS
-from utilities.constants import (
-    EVICTIONSTRATEGY,
-    LIVE_MIGRATE,
+from utilities.constants.timeouts import (
     TIMEOUT_3MIN,
     TIMEOUT_5MIN,
+)
+from utilities.constants.virt import (
+    EVICTIONSTRATEGY,
+    LIVE_MIGRATE,
 )
 from utilities.hco import ResourceEditorValidateHCOReconcile
 from utilities.virt import (
     check_migration_process_after_node_drain,
-    node_mgmt_console,
+    drain_node,
     restart_vm_wait_for_running_vm,
     wait_for_node_schedulable_status,
 )
 
 LOGGER = logging.getLogger(__name__)
 
-pytestmark = [pytest.mark.arm64, pytest.mark.rwx_default_storage]
+pytestmark = [
+    pytest.mark.arm64,
+    pytest.mark.rwx_default_storage,
+    pytest.mark.data_collector_scope(scope="module"),
+]
 
 
 def wait_for_vm_uid_mismatch(vmi, vmi_old_uid):
@@ -42,9 +48,11 @@ def assert_vm_restarts_after_node_drain(source_node, vmi, vmi_old_uid):
 
 
 @pytest.fixture()
-def drained_node(vm_for_test_from_template_scope_class):
-    source_node = vm_for_test_from_template_scope_class.privileged_vmi.node
-    with node_mgmt_console(node=source_node, node_mgmt="drain"):
+def drained_node(admin_client, hco_namespace, compact_cluster, vm_for_test_from_template_scope_class):
+    source_node = vm_for_test_from_template_scope_class.vmi.get_node(privileged_client=admin_client)
+    with drain_node(
+        admin_client=admin_client, node=source_node, hco_namespace=hco_namespace, compact_cluster=compact_cluster
+    ):
         yield source_node
 
 
@@ -55,10 +63,12 @@ def vmi_old_uid(vm_for_test_from_template_scope_class):
 
 @pytest.fixture()
 def hco_cr_with_evictionstrategy_none(
+    admin_client,
     hyperconverged_resource_scope_function,
 ):
     with ResourceEditorValidateHCOReconcile(
-        patches={hyperconverged_resource_scope_function: {"spec": {EVICTIONSTRATEGY: "None"}}},
+        admin_client=admin_client,
+        patches={hyperconverged_resource_scope_function: {"spec": {"virtualization": {EVICTIONSTRATEGY: "None"}}}},
         list_resource_reconcile=[KubeVirt],
         wait_for_reconcile_post_update=True,
     ):
@@ -119,14 +129,15 @@ def test_evictionstrategy_in_kubevirt(sno_cluster, kubevirt_config_scope_module)
     ],
     indirect=True,
 )
-@pytest.mark.usefixtures("cluster_cpu_model_scope_class")
 class TestEvictionStrategy:
     @pytest.mark.polarion("CNV-10087")
     def test_hco_evictionstrategy_livemigrate_vm_no_evictionstrategy(
-        self, unprivileged_client, vm_for_test_from_template_scope_class, drained_node
+        self, admin_client, unprivileged_client, vm_for_test_from_template_scope_class, drained_node
     ):
         check_migration_process_after_node_drain(
-            dyn_client=unprivileged_client, vm=vm_for_test_from_template_scope_class
+            client=unprivileged_client,
+            vm=vm_for_test_from_template_scope_class,
+            admin_client=admin_client,
         )
 
     @pytest.mark.polarion("CNV-10088")
@@ -163,6 +174,7 @@ class TestEvictionStrategy:
     @pytest.mark.polarion("CNV-10357")
     def test_hco_evictionstrategy_none_vm_evictionstrategy_livemigrate(
         self,
+        admin_client,
         unprivileged_client,
         vm_for_test_from_template_scope_class,
         hco_cr_with_evictionstrategy_none,
@@ -170,5 +182,7 @@ class TestEvictionStrategy:
         drained_node,
     ):
         check_migration_process_after_node_drain(
-            dyn_client=unprivileged_client, vm=vm_for_test_from_template_scope_class
+            client=unprivileged_client,
+            vm=vm_for_test_from_template_scope_class,
+            admin_client=admin_client,
         )

@@ -1,13 +1,17 @@
 import logging
 from collections import defaultdict
 
-from kubernetes.client.rest import ApiException
-from kubernetes.dynamic.exceptions import NotFoundError, ResourceNotFoundError
+from kubernetes.dynamic import DynamicClient
+from kubernetes.dynamic.exceptions import NotFoundError
 from ocp_resources.pod import Pod
 from ocp_resources.resource import ResourceEditor
 from timeout_sampler import TimeoutExpiredError, TimeoutSampler
 
-from utilities.constants import (
+from utilities.constants.cluster import (
+    NODE_ROLE_KUBERNETES_IO,
+    WORKER_NODE_LABEL_KEY,
+)
+from utilities.constants.components import (
     BRIDGE_MARKER,
     CDI_APISERVER,
     CDI_DEPLOYMENT,
@@ -17,27 +21,27 @@ from utilities.constants import (
     HCO_OPERATOR,
     HCO_WEBHOOK,
     HYPERCONVERGED_CLUSTER_CLI_DOWNLOAD,
-    IMAGE_CRON_STR,
     KUBE_CNI_LINUX_BRIDGE_PLUGIN,
     KUBEMACPOOL_CERT_MANAGER,
     KUBEMACPOOL_MAC_CONTROLLER_MANAGER,
     KUBEVIRT_APISERVER_PROXY,
     KUBEVIRT_CONSOLE_PLUGIN,
     KUBEVIRT_IPAM_CONTROLLER_MANAGER,
-    NODE_ROLE_KUBERNETES_IO,
     SSP_OPERATOR,
-    TIMEOUT_4MIN,
-    TIMEOUT_5MIN,
-    TIMEOUT_5SEC,
-    TIMEOUT_10MIN,
-    TIMEOUT_30SEC,
     VIRT_API,
     VIRT_CONTROLLER,
     VIRT_EXPORTPROXY,
     VIRT_HANDLER,
     VIRT_OPERATOR,
     VIRT_TEMPLATE_VALIDATOR,
-    WORKER_NODE_LABEL_KEY,
+)
+from utilities.constants.hco import IMAGE_CRON_STR
+from utilities.constants.timeouts import (
+    TIMEOUT_4MIN,
+    TIMEOUT_5MIN,
+    TIMEOUT_5SEC,
+    TIMEOUT_10MIN,
+    TIMEOUT_30SEC,
 )
 from utilities.hco import wait_for_hco_post_update_stable_state
 
@@ -55,12 +59,12 @@ SELECTORS = [
     ("op-comp", "op3"),
 ]
 
-INFRA_LABEL_1 = {"nodePlacement": {"nodeSelector": {"infra-comp": "infra1"}}}
-INFRA_LABEL_2 = {"nodePlacement": {"nodeSelector": {"infra-comp": "infra2"}}}
-INFRA_LABEL_3 = {"nodePlacement": {"nodeSelector": {"infra-comp": "infra3"}}}
-WORK_LABEL_1 = {"nodePlacement": {"nodeSelector": {"work-comp": "work1"}}}
-WORK_LABEL_2 = {"nodePlacement": {"nodeSelector": {"work-comp": "work2"}}}
-WORK_LABEL_3 = {"nodePlacement": {"nodeSelector": {"work-comp": "work3"}}}
+INFRA_LABEL_1 = {"nodeSelector": {"infra-comp": "infra1"}}
+INFRA_LABEL_2 = {"nodeSelector": {"infra-comp": "infra2"}}
+INFRA_LABEL_3 = {"nodeSelector": {"infra-comp": "infra3"}}
+WORK_LABEL_1 = {"nodeSelector": {"work-comp": "work1"}}
+WORK_LABEL_2 = {"nodeSelector": {"work-comp": "work2"}}
+WORK_LABEL_3 = {"nodeSelector": {"work-comp": "work3"}}
 
 SUBSCRIPTION_NODE_SELCTOR_1 = {"op-comp": "op1"}
 SUBSCRIPTION_NODE_SELCTOR_2 = {"op-comp": "op2"}
@@ -75,77 +79,73 @@ SUBSCRIPTION_TOLERATIONS = [
 
 
 NODE_PLACEMENT_INFRA = {
-    "nodePlacement": {
-        "affinity": {
-            "nodeAffinity": {
-                "requiredDuringSchedulingIgnoredDuringExecution": {
-                    "nodeSelectorTerms": [
-                        {
-                            "matchExpressions": [
-                                {
-                                    "key": "infra-comp",
-                                    "operator": "In",
-                                    "values": ["infra1", "infra2"],
-                                }
-                            ]
-                        }
-                    ]
-                }
+    "affinity": {
+        "nodeAffinity": {
+            "requiredDuringSchedulingIgnoredDuringExecution": {
+                "nodeSelectorTerms": [
+                    {
+                        "matchExpressions": [
+                            {
+                                "key": "infra-comp",
+                                "operator": "In",
+                                "values": ["infra1", "infra2"],
+                            }
+                        ]
+                    }
+                ]
             }
-        },
-        "nodeSelector": {"infra-comp": "infra1"},
-        "tolerations": [
-            {
-                "effect": "NoSchedule",
-                "key": WORKER_NODE_LABEL_KEY,
-                "operator": "Exists",
-            }
-        ],
-    }
+        }
+    },
+    "nodeSelector": {"infra-comp": "infra1"},
+    "tolerations": [
+        {
+            "effect": "NoSchedule",
+            "key": WORKER_NODE_LABEL_KEY,
+            "operator": "Exists",
+        }
+    ],
 }
 
 NODE_PLACEMENT_WORKLOADS = {
-    "nodePlacement": {
-        "affinity": {
-            "nodeAffinity": {
-                "preferredDuringSchedulingIgnoredDuringExecution": [
+    "affinity": {
+        "nodeAffinity": {
+            "preferredDuringSchedulingIgnoredDuringExecution": [
+                {
+                    "preference": {
+                        "matchExpressions": [
+                            {
+                                "key": "work-comp",
+                                "operator": "In",
+                                "values": ["work1", "work2"],
+                            }
+                        ]
+                    },
+                    "weight": 1,
+                }
+            ],
+            "requiredDuringSchedulingIgnoredDuringExecution": {
+                "nodeSelectorTerms": [
                     {
-                        "preference": {
-                            "matchExpressions": [
-                                {
-                                    "key": "work-comp",
-                                    "operator": "In",
-                                    "values": ["work1", "work2"],
-                                }
-                            ]
-                        },
-                        "weight": 1,
+                        "matchExpressions": [
+                            {
+                                "key": "work-comp",
+                                "operator": "In",
+                                "values": ["work1", "work2"],
+                            }
+                        ]
                     }
-                ],
-                "requiredDuringSchedulingIgnoredDuringExecution": {
-                    "nodeSelectorTerms": [
-                        {
-                            "matchExpressions": [
-                                {
-                                    "key": "work-comp",
-                                    "operator": "In",
-                                    "values": ["work1", "work2"],
-                                }
-                            ]
-                        }
-                    ]
-                },
-            }
-        },
-        "nodeSelector": {"work-comp": "work2"},
-        "tolerations": [
-            {
-                "effect": "NoSchedule",
-                "key": WORKER_NODE_LABEL_KEY,
-                "operator": "Exists",
-            }
-        ],
-    }
+                ]
+            },
+        }
+    },
+    "nodeSelector": {"work-comp": "work2"},
+    "tolerations": [
+        {
+            "effect": "NoSchedule",
+            "key": WORKER_NODE_LABEL_KEY,
+            "operator": "Exists",
+        }
+    ],
 }
 
 # Below list consists of Infrastructure and Workloads pods based on Daemonset and Deployments.
@@ -355,7 +355,7 @@ def get_pod_per_nodes(admin_client, hco_namespace, filter_pods_by_name=None):
     def _get_pods_per_nodes(_filter_pods_by_name):
         pods_per_nodes = defaultdict(list)
         for pod in Pod.get(
-            dyn_client=admin_client,
+            client=admin_client,
             namespace=hco_namespace.name,
         ):
             if _filter_pods_by_name and _filter_pods_by_name in pod.name:
@@ -366,11 +366,8 @@ def get_pod_per_nodes(admin_client, hco_namespace, filter_pods_by_name=None):
                 # to filter out terminating pods, see: https://github.com/kubernetes/kubectl/issues/450
                 if pod.instance.metadata.get("deletionTimestamp") is None:
                     pods_per_nodes[pod.node.name].append(pod)
-            except ApiException as ex:
-                if ex.reason == ResourceNotFoundError:
-                    LOGGER.debug(
-                        f"Ignoring pods that disappeared during the query. node={pod.node.name} pod={pod.name}"
-                    )
+            except NotFoundError:
+                LOGGER.warning(f"Ignoring pods that disappeared during the query. node={pod.node.name} pod={pod.name}")
         return pods_per_nodes
 
     pod_names_per_nodes = {}
@@ -424,9 +421,9 @@ def update_subscription_config(admin_client, hco_namespace, subscription, config
     )
 
 
-def pods_with_node_selector(namespace_name, node_selectors):
+def pods_with_node_selector(namespace_name: str, node_selectors: set[str], admin_client: DynamicClient) -> list[str]:
     pods_with_labels = []
-    for pod in list(Pod.get(namespace=namespace_name)):
+    for pod in list(Pod.get(namespace=namespace_name, client=admin_client)):
         node_selectors_from_pod = pod.instance.spec.get("nodeSelector", [])
         LOGGER.info(f"Node selector for pod {pod.name}: {node_selectors_from_pod}")
         if node_selectors_from_pod and (set(node_selectors_from_pod.keys()).intersection(node_selectors)):
@@ -434,7 +431,7 @@ def pods_with_node_selector(namespace_name, node_selectors):
     return pods_with_labels
 
 
-def wait_for_pod_node_selector_clean_up(namespace_name):
+def wait_for_pod_node_selector_clean_up(namespace_name: str, admin_client: DynamicClient) -> None:
     node_selectors = set(list(zip(*SELECTORS))[0])
     LOGGER.info(f"Looking for pods with nodeSelectors keys: {node_selectors}")
     samples = TimeoutSampler(
@@ -443,6 +440,7 @@ def wait_for_pod_node_selector_clean_up(namespace_name):
         func=pods_with_node_selector,
         namespace_name=namespace_name,
         node_selectors=node_selectors,
+        admin_client=admin_client,
         exceptions_dict={NotFoundError: []},
     )
     sample = None

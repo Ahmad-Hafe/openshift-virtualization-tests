@@ -4,7 +4,15 @@ import pytest
 from ocp_resources.daemonset import DaemonSet
 from ocp_resources.deployment import Deployment
 
-from tests.network.constants import EXPECTED_CNAO_COMP_NAMES
+from utilities.constants.components import CLUSTER_NETWORK_ADDONS_OPERATOR
+
+EXPECTED_CNAO_COMP_NAMES = [
+    "multus",
+    CLUSTER_NETWORK_ADDONS_OPERATOR,
+    "kubemacpool",
+    "bridge",
+    "ovs-cni",
+]
 
 pytestmark = pytest.mark.sno
 
@@ -14,7 +22,7 @@ def network_daemonset_deployment_resources(admin_client, hco_namespace):
     return [
         resource
         for _type in [DaemonSet, Deployment]
-        for resource in _type.get(dyn_client=admin_client, namespace=hco_namespace.name)
+        for resource in _type.get(client=admin_client, namespace=hco_namespace.name)
         if any(component in resource.name for component in EXPECTED_CNAO_COMP_NAMES)
     ]
 

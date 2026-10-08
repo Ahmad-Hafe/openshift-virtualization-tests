@@ -1,11 +1,14 @@
-# -*- coding: utf-8 -*-
-import contextlib
 import shlex
-from ipaddress import ip_interface
+from collections.abc import Generator
 
 import pytest
+from kubernetes.dynamic import DynamicClient
 from pyhelper_utils.shell import run_ssh_commands
 
+from libs.net import nodenetworkconfigurationpolicy as libnncp
+from libs.net.ip import random_ipv4_address
+from libs.net.netattachdef import CNIPluginBridgeConfig, NetConfig, NetworkAttachmentDefinition
+from tests.network.l2_bridge.libl2bridge import DHCP_INTERFACE_NAME, bridge_attached_vm
 from tests.network.libs.dhcpd import (
     DHCP_IP_RANGE_END,
     DHCP_IP_RANGE_START,
@@ -15,20 +18,13 @@ from tests.network.libs.dhcpd import (
     UNIQUE_CLIENT_ID,
     verify_dhcpd_activated,
 )
-from tests.network.libs.ip import random_ipv4_address
-from tests.network.utils import update_cloud_init_extra_user_data
+from utilities.constants.networking import LINUX_BRIDGE
 from utilities.data_utils import name_prefix
 from utilities.infra import get_node_selector_dict
 from utilities.network import (
-    cloud_init_network_data,
     get_vmi_mac_address_by_iface_name,
     network_device,
     network_nad,
-)
-from utilities.virt import (
-    VirtualMachineForTests,
-    fedora_vm_body,
-    prepare_cloud_init_user_data,
 )
 
 #: Test setup example (third octet is random)
@@ -39,11 +35,10 @@ from utilities.virt import (
 #       |.......|---eth4:172.16.4.1    : mpls test :                               172.16.4.2:eth4---|........|
 
 
-VMA_MPLS_LOOPBACK_IP = f"{random_ipv4_address(net_seed=5, host_address=1)}/32"
+VMA_MPLS_LOOPBACK_IP = str(random_ipv4_address(net_seed=5, host_address=1, subnet_length=32))
 VMA_MPLS_ROUTE_TAG = 100
-VMB_MPLS_LOOPBACK_IP = f"{random_ipv4_address(net_seed=6, host_address=1)}/32"
+VMB_MPLS_LOOPBACK_IP = str(random_ipv4_address(net_seed=6, host_address=1, subnet_length=32))
 VMB_MPLS_ROUTE_TAG = 200
-DHCP_INTERFACE_NAME = "eth3"
 
 
 @pytest.fixture(scope="class")
@@ -53,18 +48,18 @@ def l2_bridge_device_name(index_number):
 
 @pytest.fixture(scope="class")
 def l2_bridge_device_worker_1(
+    nmstate_dependent_placeholder,
     admin_client,
-    bridge_device_matrix__class__,
-    nodes_available_nics,
+    hosts_common_available_ports,
     worker_node1,
     l2_bridge_device_name,
 ):
     with network_device(
-        interface_type=bridge_device_matrix__class__,
+        interface_type=LINUX_BRIDGE,
         nncp_name=f"l2-bridge-{name_prefix(worker_node1.name)}",
         interface_name=l2_bridge_device_name,
         node_selector=get_node_selector_dict(node_selector=worker_node1.hostname),
-        ports=[nodes_available_nics[worker_node1.name][-1]],
+        ports=[hosts_common_available_ports[-1]],
         client=admin_client,
     ) as br:
         yield br
@@ -72,18 +67,18 @@ def l2_bridge_device_worker_1(
 
 @pytest.fixture(scope="class")
 def l2_bridge_device_worker_2(
+    nmstate_dependent_placeholder,
     admin_client,
-    bridge_device_matrix__class__,
-    nodes_available_nics,
+    hosts_common_available_ports,
     worker_node2,
     l2_bridge_device_name,
 ):
     with network_device(
-        interface_type=bridge_device_matrix__class__,
+        interface_type=LINUX_BRIDGE,
         nncp_name=f"l2-bridge-{name_prefix(worker_node2.name)}",
         interface_name=l2_bridge_device_name,
         node_selector=get_node_selector_dict(node_selector=worker_node2.hostname),
-        ports=[nodes_available_nics[worker_node2.name][-1]],
+        ports=[hosts_common_available_ports[-1]],
         client=admin_client,
     ) as br:
         yield br
@@ -92,17 +87,16 @@ def l2_bridge_device_worker_2(
 @pytest.fixture(scope="class")
 def dhcp_nad(
     admin_client,
-    bridge_device_matrix__class__,
     namespace,
     l2_bridge_device_worker_1,
     l2_bridge_device_worker_2,
+    cluster_vlan_ids,
     l2_bridge_device_name,
-    vlan_index_number,
 ):
-    vlan_tag = next(vlan_index_number)
+    vlan_tag = next(cluster_vlan_ids)
     with network_nad(
         namespace=namespace,
-        nad_type=bridge_device_matrix__class__,
+        nad_type=LINUX_BRIDGE,
         nad_name=f"{l2_bridge_device_name}-dhcp-broadcast-nad-vlan-{vlan_tag}",
         interface_name=l2_bridge_device_name,
         vlan=vlan_tag,
@@ -114,7 +108,6 @@ def dhcp_nad(
 @pytest.fixture(scope="class")
 def custom_eth_type_llpd_nad(
     admin_client,
-    bridge_device_matrix__class__,
     namespace,
     l2_bridge_device_worker_1,
     l2_bridge_device_worker_2,
@@ -122,7 +115,7 @@ def custom_eth_type_llpd_nad(
 ):
     with network_nad(
         namespace=namespace,
-        nad_type=bridge_device_matrix__class__,
+        nad_type=LINUX_BRIDGE,
         nad_name=f"{l2_bridge_device_name}-custom-eth-type-icmp-nad",
         interface_name=l2_bridge_device_name,
         client=admin_client,
@@ -133,7 +126,6 @@ def custom_eth_type_llpd_nad(
 @pytest.fixture(scope="class")
 def mpls_nad(
     admin_client,
-    bridge_device_matrix__class__,
     namespace,
     l2_bridge_device_worker_1,
     l2_bridge_device_worker_2,
@@ -141,7 +133,7 @@ def mpls_nad(
 ):
     with network_nad(
         namespace=namespace,
-        nad_type=bridge_device_matrix__class__,
+        nad_type=LINUX_BRIDGE,
         nad_name=f"{l2_bridge_device_name}-mpls-nad",
         interface_name=l2_bridge_device_name,
         client=admin_client,
@@ -152,7 +144,6 @@ def mpls_nad(
 @pytest.fixture(scope="class")
 def dot1q_nad(
     admin_client,
-    bridge_device_matrix__class__,
     namespace,
     l2_bridge_device_worker_1,
     l2_bridge_device_worker_2,
@@ -160,7 +151,7 @@ def dot1q_nad(
 ):
     with network_nad(
         namespace=namespace,
-        nad_type=bridge_device_matrix__class__,
+        nad_type=LINUX_BRIDGE,
         nad_name=f"{l2_bridge_device_name}-dot1q-nad",
         interface_name=l2_bridge_device_name,
         client=admin_client,
@@ -171,142 +162,6 @@ def dot1q_nad(
 @pytest.fixture(scope="class")
 def l2_bridge_all_nads(dhcp_nad, custom_eth_type_llpd_nad, mpls_nad, dot1q_nad):
     return [custom_eth_type_llpd_nad.name, mpls_nad.name, dhcp_nad.name, dot1q_nad.name]
-
-
-def _cloud_init_data(
-    vm_name,
-    ip_addresses,
-    mpls_local_ip,
-    mpls_local_tag,
-    mpls_dest_ip,
-    mpls_dest_tag,
-    mpls_route_next_hop,
-    cloud_init_extra_user_data,
-):
-    network_data_data = {
-        "ethernets": {
-            "eth1": {"addresses": [f"{ip_addresses[0]}/24"]},
-            "eth2": {"addresses": [f"{ip_addresses[1]}/24"]},
-            "eth4": {"addresses": [f"{ip_addresses[3]}/24"]},
-        },
-    }
-    # Only DHCP server VM (vm-fedora-1) should have IP on eth3 interface
-    if vm_name == "vm-fedora-1":
-        network_data_data["ethernets"][DHCP_INTERFACE_NAME] = {"addresses": [f"{ip_addresses[2]}/24"]}
-
-    # DHCP client VM (vm-fedora-2) should be with dhcp=false, will be activated in test 'test_dhcp_broadcast'.
-    if vm_name == "vm-fedora-2":
-        network_data_data["ethernets"][DHCP_INTERFACE_NAME] = {"dhcp4": False}
-
-    runcmd = [
-        "modprobe mpls_router",  # In order to test mpls we need to load driver
-        "sysctl -w net.mpls.platform_labels=1000",  # Activate mpls labeling feature
-        "sysctl -w net.mpls.conf.eth4.input=1",  # Allow incoming mpls traffic
-        "sysctl -w net.ipv4.conf.all.arp_ignore=1",  # 2 kernel flags are used to disable wrong arp behavior
-        "sysctl -w net.ipv4.conf.all.arp_announce=2",  # Send arp reply only if ip belongs to the interface
-        f"ip addr add {mpls_local_ip} dev lo",
-        f"ip -f mpls route add {mpls_local_tag} dev lo",
-        "nmcli connection up eth4",  # In order to add mpls route we need to make sure that connection is UP
-        f"ip route add {mpls_dest_ip} encap mpls {mpls_dest_tag} via inet {mpls_route_next_hop}",
-        "nmcli connection up eth2",
-        "ip route add 224.0.0.0/4 dev eth2",
-    ]
-
-    cloud_init_data = prepare_cloud_init_user_data(section="runcmd", data=runcmd)
-    cloud_init_data.update(cloud_init_network_data(data=network_data_data))
-
-    if cloud_init_extra_user_data:
-        update_cloud_init_extra_user_data(
-            cloud_init_data=cloud_init_data["userData"],
-            cloud_init_extra_user_data=cloud_init_extra_user_data,
-        )
-
-    return cloud_init_data
-
-
-class VirtualMachineAttachedToBridge(VirtualMachineForTests):
-    def __init__(
-        self,
-        name,
-        namespace,
-        interfaces,
-        ip_addresses,
-        mpls_local_tag,
-        mpls_local_ip,
-        mpls_dest_ip,
-        mpls_dest_tag,
-        mpls_route_next_hop,
-        client=None,
-        cloud_init_data=None,
-        node_selector=None,
-    ):
-        self.cloud_init_data = cloud_init_data
-        self.mpls_local_tag = mpls_local_tag
-        self.ip_addresses = ip_addresses
-        self.mpls_local_ip = ip_interface(address=mpls_local_ip).ip
-        self.mpls_dest_ip = mpls_dest_ip
-        self.mpls_dest_tag = mpls_dest_tag
-        self.mpls_route_next_hop = mpls_route_next_hop
-
-        networks = {}
-        for network in interfaces:
-            networks.update({network: network})
-
-        super().__init__(
-            name=name,
-            namespace=namespace,
-            interfaces=interfaces,
-            networks=networks,
-            client=client,
-            cloud_init_data=cloud_init_data,
-            node_selector=node_selector,
-        )
-
-    def to_dict(self):
-        self.body = fedora_vm_body(name=self.name)
-        super().to_dict()
-
-
-@contextlib.contextmanager
-def bridge_attached_vm(
-    name,
-    namespace,
-    interfaces,
-    ip_addresses,
-    mpls_local_tag,
-    mpls_dest_ip,
-    mpls_dest_tag,
-    mpls_route_next_hop,
-    mpls_local_ip,
-    cloud_init_extra_user_data=None,
-    client=None,
-    node_selector=None,
-):
-    cloud_init_data = _cloud_init_data(
-        vm_name=name,
-        ip_addresses=ip_addresses,
-        mpls_local_ip=mpls_local_ip,
-        mpls_local_tag=mpls_local_tag,
-        mpls_dest_ip=mpls_dest_ip,
-        mpls_dest_tag=mpls_dest_tag,
-        mpls_route_next_hop=mpls_route_next_hop,
-        cloud_init_extra_user_data=cloud_init_extra_user_data,
-    )
-    with VirtualMachineAttachedToBridge(
-        namespace=namespace,
-        name=name,
-        interfaces=interfaces,
-        ip_addresses=ip_addresses,
-        mpls_local_tag=mpls_local_tag,
-        mpls_local_ip=mpls_local_ip,
-        mpls_dest_ip=mpls_dest_ip,
-        mpls_dest_tag=mpls_dest_tag,
-        mpls_route_next_hop=mpls_route_next_hop,
-        client=client,
-        cloud_init_data=cloud_init_data,
-        node_selector=node_selector,
-    ) as vm:
-        yield vm
 
 
 @pytest.fixture(scope="class")
@@ -328,10 +183,10 @@ def l2_bridge_running_vm_a(
     }
 
     interface_ip_addresses = [
-        random_ipv4_address(net_seed=0, host_address=1),
-        random_ipv4_address(net_seed=2, host_address=1),
-        random_ipv4_address(net_seed=3, host_address=1),
-        random_ipv4_address(net_seed=4, host_address=1),
+        random_ipv4_address(net_seed=0, host_address=1).ip,
+        random_ipv4_address(net_seed=2, host_address=1).ip,
+        random_ipv4_address(net_seed=3, host_address=1).ip,
+        random_ipv4_address(net_seed=4, host_address=1).ip,
     ]
     with bridge_attached_vm(
         name="vm-fedora-1",
@@ -343,9 +198,10 @@ def l2_bridge_running_vm_a(
         mpls_local_ip=VMA_MPLS_LOOPBACK_IP,
         mpls_dest_ip=VMB_MPLS_LOOPBACK_IP,
         mpls_dest_tag=VMB_MPLS_ROUTE_TAG,
-        mpls_route_next_hop=random_ipv4_address(net_seed=4, host_address=2),
+        mpls_route_next_hop=random_ipv4_address(net_seed=4, host_address=2).ip,
         client=unprivileged_client,
         node_selector=get_node_selector_dict(node_selector=worker_node1.hostname),
+        dhcp_interface_config={"addresses": [f"{interface_ip_addresses[2]}/24"]},
     ) as vm:
         vm.start(wait=True)
         vm.wait_for_agent_connected()
@@ -355,10 +211,10 @@ def l2_bridge_running_vm_a(
 @pytest.fixture(scope="class")
 def l2_bridge_running_vm_b(namespace, worker_node2, l2_bridge_all_nads, unprivileged_client):
     interface_ip_addresses = [
-        random_ipv4_address(net_seed=0, host_address=2),
-        random_ipv4_address(net_seed=2, host_address=2),
-        random_ipv4_address(net_seed=3, host_address=2),
-        random_ipv4_address(net_seed=4, host_address=2),
+        random_ipv4_address(net_seed=0, host_address=2).ip,
+        random_ipv4_address(net_seed=2, host_address=2).ip,
+        random_ipv4_address(net_seed=3, host_address=2).ip,
+        random_ipv4_address(net_seed=4, host_address=2).ip,
     ]
     with bridge_attached_vm(
         name="vm-fedora-2",
@@ -369,9 +225,10 @@ def l2_bridge_running_vm_b(namespace, worker_node2, l2_bridge_all_nads, unprivil
         mpls_local_ip=VMB_MPLS_LOOPBACK_IP,
         mpls_dest_ip=VMA_MPLS_LOOPBACK_IP,
         mpls_dest_tag=VMA_MPLS_ROUTE_TAG,
-        mpls_route_next_hop=random_ipv4_address(net_seed=4, host_address=1),
+        mpls_route_next_hop=random_ipv4_address(net_seed=4, host_address=1).ip,
         client=unprivileged_client,
         node_selector=get_node_selector_dict(node_selector=worker_node2.hostname),
+        dhcp_interface_config={"dhcp4": False},
     ) as vm:
         vm.start(wait=True)
         vm.wait_for_agent_connected()
@@ -418,3 +275,22 @@ def started_vmb_dhcp_client(l2_bridge_running_vm_b, eth3_nmcli_connection_uuid):
             shlex.split("sudo systemctl restart qemu-guest-agent.service"),
         ],
     )
+
+
+@pytest.fixture(scope="class")
+def bridge_nad(
+    admin_client: DynamicClient,
+    namespace,
+    bridge_nncp: libnncp.NodeNetworkConfigurationPolicy,
+) -> Generator[NetworkAttachmentDefinition]:
+    config = NetConfig(
+        name="test-bridge-network",
+        plugins=[CNIPluginBridgeConfig(bridge=bridge_nncp.desired_state_spec.interfaces[0].name)],  # type: ignore
+    )
+    with NetworkAttachmentDefinition(
+        name="test-bridge-network",
+        namespace=namespace.name,
+        config=config,
+        client=admin_client,
+    ) as nad:
+        yield nad

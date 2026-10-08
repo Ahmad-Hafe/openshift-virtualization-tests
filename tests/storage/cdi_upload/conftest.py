@@ -7,8 +7,12 @@ import uuid
 
 import pytest
 from ocp_resources.datavolume import DataVolume
+from ocp_resources.user_defined_network import Layer2UserDefinedNetwork
 
-from utilities.constants import TIMEOUT_1MIN, TIMEOUT_2MIN, Images
+from libs.net.ip import random_ipv4_address
+from libs.net.udn import create_udn_namespace
+from utilities.constants import Images
+from utilities.constants.timeouts import TIMEOUT_1MIN, TIMEOUT_2MIN
 from utilities.storage import check_upload_virtctl_result, create_dv, get_downloaded_artifact, virtctl_upload_dv
 
 LOGGER = logging.getLogger(__name__)
@@ -49,6 +53,7 @@ def uploaded_dv_with_immediate_binding(
     local_path = f"{tmpdir}/{image_file}"
     get_downloaded_artifact(remote_name=request.param.get("remote_name"), local_name=local_path)
     with virtctl_upload_dv(
+        client=namespace.client,
         namespace=namespace.name,
         name=dv_name,
         size=request.param.get("dv_size"),
@@ -81,6 +86,7 @@ def uploaded_dv_scope_class(unprivileged_client, namespace, storage_class_name_s
     ) as dv:
         dv.wait_for_status(status=DataVolume.Status.UPLOAD_READY, timeout=TIMEOUT_2MIN)
         with virtctl_upload_dv(
+            client=namespace.client,
             namespace=namespace.name,
             name=dv.name,
             size=DEFAULT_DV_SIZE,
@@ -91,3 +97,25 @@ def uploaded_dv_scope_class(unprivileged_client, namespace, storage_class_name_s
         ) as upload_result:
             check_upload_virtctl_result(result=upload_result)
             yield dv
+
+
+@pytest.fixture(scope="module")
+def udn_namespace_for_dv_upload(admin_client):
+    yield from create_udn_namespace(name="test-cdi-upload-udn-ns", client=admin_client)
+
+
+@pytest.fixture(scope="module")
+def primary_udn_for_upload(admin_client, udn_namespace_for_dv_upload):
+    with Layer2UserDefinedNetwork(
+        name="layer2-udn-upload",
+        namespace=udn_namespace_for_dv_upload.name,
+        role="Primary",
+        subnets=[str(random_ipv4_address(net_seed=0, host_address=0))],
+        ipam={"lifecycle": "Persistent"},
+        client=admin_client,
+    ) as udn:
+        udn.wait_for_condition(
+            condition="NetworkAllocationSucceeded",
+            status=udn.Condition.Status.TRUE,
+        )
+        yield udn

@@ -2,15 +2,21 @@ import json
 import logging
 import os
 import shlex
+from datetime import UTC, datetime
 from functools import cache
 
+from _pytest.nodes import Collector
+from kubernetes.dynamic import DynamicClient
 from ocp_resources.namespace import Namespace
+from ocp_resources.virtual_machine import VirtualMachine
 from ocp_utilities.monitoring import Prometheus
+from pytest import Item
 from pytest_testconfig import config as py_config
 
 import utilities.hco
 import utilities.infra
-from utilities.constants import TIMEOUT_20MIN
+from utilities.cluster import cache_admin_client
+from utilities.constants.timeouts import TIMEOUT_10MIN, TIMEOUT_20MIN
 from utilities.must_gather import run_must_gather
 
 LOGGER = logging.getLogger(__name__)
@@ -111,12 +117,65 @@ def collect_alerts_data():
     )
 
 
-def collect_vnc_screenshot_for_vms(vm_name: str, vm_namespace: str) -> None:
-    base_dir = get_data_collector_base_directory()
-    utilities.infra.run_virtctl_command(
-        command=shlex.split(f"vnc screenshot {vm_name} -f {base_dir}/{vm_namespace}-{vm_name}.png"),
-        namespace=vm_namespace,
+def collect_vnc_screenshot_for_vms(vm: VirtualMachine) -> None:
+    """Collect a VNC screenshot for a VM when its state supports VNC access.
+
+    Args:
+        vm (VirtualMachine): VM object used to read status, name, and namespace.
+    """
+    printable_status = vm.instance.get("status", {}).get("printableStatus")
+    if printable_status in (VirtualMachine.Status.RUNNING, VirtualMachine.Status.MIGRATING):
+        base_dir = get_data_collector_base_directory()
+        utilities.infra.run_virtctl_command(
+            command=shlex.split(f"vnc screenshot {vm.name} -f {base_dir}/{vm.namespace}-{vm.name}.png"),
+            namespace=vm.namespace,
+        )
+    else:
+        LOGGER.warning(f"Skipping VNC screenshot for VM {vm.name}, status is '{printable_status}'.")
+
+
+def _get_cnv_must_gather_image(admin_client: DynamicClient) -> str:
+    """Resolve the CNV must-gather image from the installed HCO CSV.
+
+    Args:
+        admin_client: Cluster admin client used to query the CSV.
+
+    Returns:
+        The must-gather container image URL.
+    """
+    cnv_csv = utilities.hco.get_installed_hco_csv(
+        admin_client=admin_client,
+        hco_namespace=Namespace(client=admin_client, name=py_config["hco_namespace"]),
     )
+    return [image["image"] for image in cnv_csv.instance.spec.relatedImages if "must-gather" in image["name"]][0]
+
+
+def collect_must_gather_for_vm(vm: VirtualMachine, admin_client: DynamicClient | None = None) -> None:
+    """Run CNV must-gather --vm-incident for one VM at the current time.
+
+    Uses the product incident collector which gathers only data pertinent to
+    the VM: virt-launcher logs, node diagnostics, metrics, and storage chain.
+    No cluster-wide noise. Timeboxed to 10 minutes.
+
+    Args:
+        vm (VirtualMachine): VM whose incident data should be collected.
+        admin_client (DynamicClient | None): Optional cluster admin client; falls back to cache_admin_client().
+    """
+    try:
+        admin_client = admin_client or cache_admin_client()
+        must_gather_image = _get_cnv_must_gather_image(admin_client=admin_client)
+        incident_time = datetime.now(tz=UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+        LOGGER.info(f"Collecting vm-incident must-gather for VM {vm.name} at {incident_time}")
+        run_must_gather(
+            image_url=must_gather_image,
+            target_base_dir=os.path.join(get_data_collector_dir(), "vm_must_gather"),
+            script_name=f"NS={vm.namespace} VM={vm.name} /usr/bin/gather",
+            flag_names=f"vm-incident,incident-time={incident_time}",
+            timeout=f"{TIMEOUT_10MIN}s",
+            command_timeout=TIMEOUT_10MIN,
+        )
+    except Exception:
+        LOGGER.exception(f"[DATA_COLLECTOR] Failed to collect must-gather for VM {vm.name}")
 
 
 def collect_ocp_must_gather(since_time):
@@ -126,13 +185,8 @@ def collect_ocp_must_gather(since_time):
 
 
 def collect_default_cnv_must_gather_with_vm_gather(since_time, target_dir, admin_client):
-    cnv_csv = utilities.hco.get_installed_hco_csv(
-        admin_client=admin_client, hco_namespace=Namespace(name=py_config["hco_namespace"])
-    )
-    LOGGER.info(f"Collecting cnv-must gather using CSV: {cnv_csv.name}")
-    must_gather_image = [
-        image["image"] for image in cnv_csv.instance.spec.relatedImages if "must-gather" in image["name"]
-    ][0]
+    must_gather_image = _get_cnv_must_gather_image(admin_client=admin_client)
+    LOGGER.info("Collecting cnv-must gather for VMs")
     run_must_gather(
         image_url=must_gather_image,
         target_base_dir=target_dir,
@@ -162,11 +216,9 @@ def prepare_pytest_item_data_dir(item, output_dir):
         str: output dir full path
     """
     item_cls_name = item.cls.__name__ if item.cls else ""
-    tests_path = item.session.config.inicfg.get("testpaths")
-    # As of pytest 9, this is a ConfigValue object
-    if hasattr(tests_path, "value"):
-        tests_path = tests_path.value
-    assert tests_path, "pytest.ini must include testpaths"
+    testpaths = item.session.config.getini(name="testpaths")
+    assert testpaths, "pytest.ini must include testpaths"
+    tests_path = testpaths[0]
 
     fspath_split_str = "/" if tests_path != os.path.split(item.fspath.dirname)[1] else ""
     item_dir_log = os.path.join(
@@ -178,3 +230,22 @@ def prepare_pytest_item_data_dir(item, output_dir):
     )
     os.makedirs(item_dir_log, exist_ok=True)
     return item_dir_log
+
+
+def get_scope_identifier(node: Item | Collector, scope_value: str | None) -> str:
+    """
+    Get the identifier name based on data collection scope.
+
+    Args:
+        node: Pytest node (Item or Collector).
+        scope_value: Scope value from marker ("module", "class", or None for test).
+
+    Returns:
+        Database key for this scope.
+    """
+    if scope_value == "module":
+        return str(node.fspath)
+    elif scope_value == "class":
+        return f"{node.fspath}::{node.parent.name}" if node.parent else str(node.fspath)
+    else:
+        return f"{node.fspath}::{node.name}"

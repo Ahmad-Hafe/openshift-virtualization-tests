@@ -3,7 +3,8 @@ from typing import Any, Final
 
 import yaml
 
-from tests.network.libs.apimachinery import dict_normalization_for_dataclass
+from libs.net.apimachinery import dict_normalization_for_dataclass
+from libs.net.cluster import ipv4_supported_cluster, ipv6_supported_cluster
 
 NETWORK_DATA: Final[str] = "networkData"
 
@@ -26,7 +27,9 @@ class EthernetDevice:
     """
 
     dhcp4: bool | None = None
+    dhcp6: bool | None = None
     addresses: list[str] | None = None
+    gateway4: str | None = None
     gateway6: str | None = None
 
     match: MatchSelector | None = None
@@ -57,11 +60,16 @@ class NetworkData:
 class UserData:
     """Represents user configuration for cloud-init."""
 
-    users: list[Any]
     """
     Part of cloud-init's 'users and groups' module:
     https://cloudinit.readthedocs.io/en/latest/reference/modules.html#users-and-groups
     """
+    users: list[Any]
+    """
+    Commands to run on first boot:
+    https://cloudinit.readthedocs.io/en/latest/reference/modules.html#runcmd
+    """
+    runcmd: list[str] | None = None
 
 
 def todict(no_cloud: NetworkData | UserData) -> dict[str, Any]:
@@ -83,3 +91,22 @@ def format_cloud_config(userdata: UserData) -> str:
 
 def cloudinit(netdata: NetworkData) -> dict[str, Any]:
     return {NETWORK_DATA: todict(no_cloud=netdata)}
+
+
+def primary_iface_cloud_init() -> EthernetDevice | None:
+    """Return cloud-init ethernet config for the masquerade primary interface.
+
+    Configures a static IPv6 address on eth0 when the cluster supports IPv6,
+    enabling per-family connectivity verification. Returns None on IPv4-only clusters.
+
+    Returns:
+        EthernetDevice with static IPv6 and optional DHCP4, or None if IPv6 is not supported.
+    """
+    if ipv6_supported_cluster():
+        return EthernetDevice(
+            addresses=["fd10:0:2::2/120"],
+            gateway6="fd10:0:2::1",
+            dhcp4=ipv4_supported_cluster(),
+            dhcp6=False,
+        )
+    return None

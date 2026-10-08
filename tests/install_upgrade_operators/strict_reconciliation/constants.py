@@ -35,6 +35,7 @@ CNAO_CR_CERT_CONFIG_KEY_SERVER_RENEW_BEFORE_KEY = "certOverlapInterval"
 LIVE_MIGRATION_CONFIG_KEY = "liveMigrationConfig"
 ALLOW_AUTO_CONVERGE = "allowAutoConverge"
 ALLOW_POST_COPY = "allowPostCopy"
+ALLOW_WORKLOAD_DISRUPTION = "allowWorkloadDisruption"
 LIVE_MIGRATION_CONFIG_BANDWIDTH_PER_MIGRATION_KEY = "bandwidthPerMigration"
 COMPLETION_TIMEOUT_PER_GIB_KEY = "completionTimeoutPerGiB"
 COMPLETION_TIMEOUT_PER_GIB_VALUE = 777
@@ -78,6 +79,7 @@ EXPCT_CERTC_CUSTOM_SERVER_RB[HCO_CR_CERT_CONFIG_SERVER_KEY][HCO_CR_CERT_CONFIG_R
 EXPCT_LM_DEFAULTS = {
     ALLOW_POST_COPY: False,
     ALLOW_AUTO_CONVERGE: False,
+    ALLOW_WORKLOAD_DISRUPTION: False,
     PARALLEL_MIGRATIONS_PER_CLUSTER_KEY: LM_PARALLELMIGRATIONSPERCLUSTER_DEFAULT,
     PARALLEL_OUTBOUND_MIGRATIONS_PER_NODE_KEY: LM_PARALLELOUTBOUNDMIGRATIONSPERNODE_DEFAULT,
     COMPLETION_TIMEOUT_PER_GIB_KEY: LM_COMPLETIONTIMEOUTPERGIB_DEFAULT,
@@ -86,6 +88,7 @@ EXPCT_LM_DEFAULTS = {
 EXPCT_LM_CUSTOM = {
     ALLOW_POST_COPY: False,
     ALLOW_AUTO_CONVERGE: False,
+    ALLOW_WORKLOAD_DISRUPTION: False,
     PARALLEL_MIGRATIONS_PER_CLUSTER_KEY: LM_PARALLELMIGRATIONSPERCLUSTER_CUSTOM,
     PARALLEL_OUTBOUND_MIGRATIONS_PER_NODE_KEY: LM_PARALLELOUTBOUNDMIGRATIONSPERNODE_CUSTOM,
     COMPLETION_TIMEOUT_PER_GIB_KEY: LM_COMPLETIONTIMEOUTPERGIB_CUSTOM,
@@ -121,9 +124,13 @@ EXPCT_CERTC_CUSTOM = {
 
 CUSTOM_HCO_CR_SPEC = {
     "spec": {
-        LIVE_MIGRATION_CONFIG_KEY: EXPCT_LM_CUSTOM,
-        HCO_CR_CERT_CONFIG_KEY: EXPCT_CERTC_CUSTOM,
-    }
+        "virtualization": {
+            LIVE_MIGRATION_CONFIG_KEY: EXPCT_LM_CUSTOM,
+        },
+        "security": {
+            HCO_CR_CERT_CONFIG_KEY: EXPCT_CERTC_CUSTOM,
+        },
+    },
 }
 KUBEVIRT_DEFAULT = {KUBEVIRT_CR_CERT_CONFIG_SELF_SIGNED_KEY: EXPCT_CERTC_DEFAULTS}
 KUBEVIRT_CUSTOM = {
@@ -198,14 +205,12 @@ STORAGE_IMPORT_VALUE = {
         "private-registry-example-2:5000",
     ]
 }
-OBSOLETE_CPUS_KEY = "obsoleteCPUs"
-OBSOLETE_CPUS_VALUE_HCO_CR = {
-    "cpuModels": [
-        "487",
-        "pentium5",
-        "pentiumhome",
-    ],
-}
+OBSOLETE_CPU_MODELS_KEY = "obsoleteCPUModels"
+OBSOLETE_CPU_MODELS_VALUE_HCO_CR = [
+    "487",
+    "pentium5",
+    "pentiumhome",
+]
 OBSOLETE_CPUS_VALUE_KUBEVIRT_CR = {
     "obsoleteCPUModels": {
         "487": True,
@@ -213,17 +218,15 @@ OBSOLETE_CPUS_VALUE_KUBEVIRT_CR = {
         "pentiumhome": True,
     },
 }
-RESOURCE_REQUIREMENTS = {
-    "storageWorkloads": {
-        "limits": {
-            "cpu": "888k",
-            "memory": "123Mi",
-        },
-        "requests": {
-            "cpu": "555m",
-            "memory": "1Gi",
-        },
-    }
+WORKLOAD_RESOURCE_REQUIREMENTS = {
+    "limits": {
+        "cpu": "888k",
+        "memory": "123Mi",
+    },
+    "requests": {
+        "cpu": "555m",
+        "memory": "1Gi",
+    },
 }
 
 NP_INFRA_KEY = "infra"
@@ -249,55 +252,51 @@ NP_INFRA_VALUE_CDI_CR = {
     },
     "nodeSelector": {"test_case": "np"},
 }
-NP_INFRA_VALUE_HCO_CR = {
-    "nodePlacement": NP_INFRA_VALUE_CDI_CR,
-}
-NP_WORKLOADS_KEY_HCO_CR = "workloads"
+NP_INFRA_VALUE_HCO_CR = NP_INFRA_VALUE_CDI_CR
+NP_WORKLOADS_KEY_HCO_CR = "workload"
 NP_WORKLOADS_KEY_CDI_CR = "workload"
 NP_WORKLOADS_VALUE_HCO_CR = {
-    "nodePlacement": {
-        "affinity": {
-            "nodeAffinity": {
-                "requiredDuringSchedulingIgnoredDuringExecution": {
-                    "nodeSelectorTerms": [
-                        {
-                            "matchExpressions": [
-                                {
-                                    "key": "kubernetes.io/e2e-az-name",
-                                    "operator": "In",
-                                    "values": [
-                                        "e2e-az1",
-                                        "e2e-az2",
-                                    ],
-                                },
-                            ]
-                        }
-                    ]
-                },
-                "preferredDuringSchedulingIgnoredDuringExecution": [
+    "affinity": {
+        "nodeAffinity": {
+            "requiredDuringSchedulingIgnoredDuringExecution": {
+                "nodeSelectorTerms": [
                     {
-                        "weight": 1,
-                        "preference": {
-                            "matchExpressions": [
-                                {
-                                    "key": "my-cloud.io/num-cpus",
-                                    "operator": "Gt",
-                                    "values": ["8"],
-                                }
-                            ]
-                        },
+                        "matchExpressions": [
+                            {
+                                "key": "kubernetes.io/e2e-az-name",
+                                "operator": "In",
+                                "values": [
+                                    "e2e-az1",
+                                    "e2e-az2",
+                                ],
+                            },
+                        ]
                     }
-                ],
-            }
-        },
-        "nodeSelector": {"test_case": "np"},
-        "tolerations": [
-            {
-                "key": "npkey2",
-                "operator": "Exists",
-                "effect": "NoSchedule",
-            }
-        ],
+                ]
+            },
+            "preferredDuringSchedulingIgnoredDuringExecution": [
+                {
+                    "weight": 1,
+                    "preference": {
+                        "matchExpressions": [
+                            {
+                                "key": "my-cloud.io/num-cpus",
+                                "operator": "Gt",
+                                "values": ["8"],
+                            }
+                        ]
+                    },
+                }
+            ],
+        }
     },
+    "nodeSelector": {"test_case": "np"},
+    "tolerations": [
+        {
+            "key": "npkey2",
+            "operator": "Exists",
+            "effect": "NoSchedule",
+        }
+    ],
 }
-NP_WORKLOADS_VALUE_CDI_CR = NP_WORKLOADS_VALUE_HCO_CR["nodePlacement"]
+NP_WORKLOADS_VALUE_CDI_CR = NP_WORKLOADS_VALUE_HCO_CR

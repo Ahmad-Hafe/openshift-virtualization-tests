@@ -18,18 +18,17 @@ from ocp_resources.service_account import ServiceAccount
 
 from tests.storage.utils import import_image_to_dv, upload_image_to_dv
 from utilities.artifactory import get_test_artifact_server_url
-from utilities.constants import (
-    CDI_APISERVER,
+from utilities.constants import Images
+from utilities.constants.components import CDI_APISERVER, CDI_OPERATOR
+from utilities.constants.storage import (
     CDI_CONFIGMAPS,
     CDI_LABEL,
-    CDI_OPERATOR,
     CDI_SECRETS,
     CDI_UPLOAD,
     CDI_UPLOAD_TMP_PVC,
     SOURCE_POD,
-    TIMEOUT_10MIN,
-    Images,
 )
+from utilities.constants.timeouts import TIMEOUT_10MIN
 from utilities.storage import (
     create_dv,
     data_volume,
@@ -87,7 +86,7 @@ def verify_cdi_app_label(cdi_resources, cnv_version):
 def cdi_resources_scope_module(request, admin_client):
     rcs_object = request.param
     LOGGER.info(f"Get all resources with kind: {rcs_object.kind}")
-    resource_list = list(rcs_object.get(dyn_client=admin_client))
+    resource_list = list(rcs_object.get(client=admin_client))
     return [rcs for rcs in resource_list if rcs.name.startswith("cdi-")]
 
 
@@ -96,13 +95,12 @@ def data_volume_without_snapshot_capability_scope_function(
     request,
     namespace,
     storage_class_matrix_without_snapshot_capability_matrix__function__,
-    schedulable_nodes,
 ):
     yield from data_volume(
         request=request,
         namespace=namespace,
         storage_class_matrix=storage_class_matrix_without_snapshot_capability_matrix__function__,
-        schedulable_nodes=schedulable_nodes,
+        client=namespace.client,
     )
 
 
@@ -171,7 +169,7 @@ def test_verify_pod_cdi_label(cdi_resources_scope_module):
 @pytest.mark.sno
 @pytest.mark.polarion("CNV-3475")
 @pytest.mark.s390x
-def test_importer_pod_cdi_label(namespace, https_server_certificate):
+def test_importer_pod_cdi_label(namespace, admin_client, https_server_certificate):
     # verify "cdi.kubevirt.io" label is included in importer pod
     with import_image_to_dv(
         dv_name="cnv-3475",
@@ -183,13 +181,14 @@ def test_importer_pod_cdi_label(namespace, https_server_certificate):
         wait_for_cdi_worker_pod(
             pod_name="importer",
             storage_ns_name=namespace.name,
+            admin_client=admin_client,
         )
 
 
 @pytest.mark.sno
 @pytest.mark.polarion("CNV-3474")
 @pytest.mark.s390x
-def test_uploader_pod_cdi_label(unprivileged_client, namespace, storage_class_name_scope_module):
+def test_uploader_pod_cdi_label(unprivileged_client, admin_client, namespace, storage_class_name_scope_module):
     """
     Verify "cdi.kubevirt.io" label is included in uploader pod
     """
@@ -202,6 +201,7 @@ def test_uploader_pod_cdi_label(unprivileged_client, namespace, storage_class_na
         wait_for_cdi_worker_pod(
             pod_name=CDI_UPLOAD,
             storage_ns_name=namespace.name,
+            admin_client=admin_client,
         )
 
 
@@ -223,6 +223,7 @@ def test_uploader_pod_cdi_label(unprivileged_client, namespace, storage_class_na
 @pytest.mark.s390x
 def test_cloner_pods_cdi_label(
     unprivileged_client,
+    admin_client,
     namespace,
     data_volume_without_snapshot_capability_scope_function,
 ):
@@ -232,17 +233,20 @@ def test_cloner_pods_cdi_label(
         dv_name="dv-target",
         namespace=data_volume_without_snapshot_capability_scope_function.namespace,
         size=data_volume_without_snapshot_capability_scope_function.size,
-        source_pvc=data_volume_without_snapshot_capability_scope_function.name,
+        source_pvc_name=data_volume_without_snapshot_capability_scope_function.name,
+        source_pvc_namespace=data_volume_without_snapshot_capability_scope_function.namespace,
         storage_class=data_volume_without_snapshot_capability_scope_function.storage_class,
     ) as cdv:
         cdv.wait_for_status(status=DataVolume.Status.CLONE_IN_PROGRESS, timeout=TIMEOUT_10MIN)
         wait_for_cdi_worker_pod(
             pod_name=CDI_UPLOAD_TMP_PVC if cdv.pvc.use_populator else f"{CDI_UPLOAD}-dv-target",
             storage_ns_name=cdv.namespace,
+            admin_client=admin_client,
         )
         wait_for_cdi_worker_pod(
             pod_name=f"-{SOURCE_POD}",
             storage_ns_name=cdv.namespace,
+            admin_client=admin_client,
         )
 
 

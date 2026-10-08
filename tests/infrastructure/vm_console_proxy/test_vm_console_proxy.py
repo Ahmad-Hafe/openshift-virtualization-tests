@@ -3,13 +3,14 @@ import logging
 import pytest
 
 from tests.infrastructure.vm_console_proxy.utils import assert_resource_existence_and_availability
-from utilities.constants import TIMEOUT_1MIN
+from utilities.constants.timeouts import TIMEOUT_1MIN
 from utilities.vnc_utils import VNCConnection
 
 LOGGER = logging.getLogger(__name__)
 
 
 @pytest.mark.usefixtures("enabled_vm_console_proxy_spec")
+@pytest.mark.s390x
 class TestVmConsoleProxyEnablement:
     @pytest.mark.dependency(name="test_vm_proxy_cluster_resources_available")
     @pytest.mark.polarion("CNV-10416")

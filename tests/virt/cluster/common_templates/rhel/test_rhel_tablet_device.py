@@ -4,9 +4,12 @@ https://github.com/kubevirt/kubevirt/pull/1987
 https://libvirt.org/formatdomain.html#elementsInput
 """
 
+from __future__ import annotations
+
 import logging
 import re
 import shlex
+from typing import TYPE_CHECKING
 
 import pytest
 from kubernetes.dynamic.exceptions import UnprocessibleEntityError
@@ -15,8 +18,12 @@ from pyhelper_utils.shell import run_ssh_commands
 
 from tests.os_params import FEDORA_LATEST, RHEL_LATEST, RHEL_LATEST_LABELS
 from tests.virt.cluster.common_templates.utils import check_vm_xml_tablet_device, set_vm_tablet_device_dict
-from utilities.constants import VIRTIO
+from utilities.constants.timeouts import TIMEOUT_2MIN
+from utilities.constants.virt import VIRTIO
 from utilities.virt import VirtualMachineForTestsFromTemplate, migrate_vm_and_verify
+
+if TYPE_CHECKING:
+    from kubernetes.dynamic import DynamicClient
 
 LOGGER = logging.getLogger(__name__)
 
@@ -26,6 +33,7 @@ def check_vm_system_tablet_device(vm, expected_device):
     output = run_ssh_commands(
         host=vm.ssh_exec,
         commands=shlex.split(r"grep -rs '^QEMU *.* Tablet' /sys/devices ||true"),
+        wait_timeout=TIMEOUT_2MIN,
     )[0]
 
     assert re.search(rf"/sys/devices/pci(.*)QEMU {expected_device} Tablet", output), (
@@ -53,11 +61,11 @@ class TestRHELTabletDevice:
         ],
         indirect=True,
     )
-    def test_tablet_virtio_tablet_device(self, tablet_device_vm):
+    def test_tablet_virtio_tablet_device(self, admin_client, tablet_device_vm):
         LOGGER.info("Test tablet device - virtio bus.")
 
         check_vm_system_tablet_device(vm=tablet_device_vm, expected_device="Virtio")
-        check_vm_xml_tablet_device(vm=tablet_device_vm)
+        check_vm_xml_tablet_device(vm=tablet_device_vm, admin_client=admin_client)
 
     @pytest.mark.parametrize(
         "tablet_device_vm",
@@ -73,11 +81,11 @@ class TestRHELTabletDevice:
         ],
         indirect=True,
     )
-    def test_tablet_usb_tablet_device(self, tablet_device_vm):
+    def test_tablet_usb_tablet_device(self, admin_client, tablet_device_vm):
         LOGGER.info("Test tablet device -  USB bus.")
 
         check_vm_system_tablet_device(vm=tablet_device_vm, expected_device="USB")
-        check_vm_xml_tablet_device(vm=tablet_device_vm)
+        check_vm_xml_tablet_device(vm=tablet_device_vm, admin_client=admin_client)
 
     @pytest.mark.parametrize(
         "tablet_device_vm",
@@ -93,11 +101,11 @@ class TestRHELTabletDevice:
         ],
         indirect=True,
     )
-    def test_tablet_default_bus_tablet_device(self, tablet_device_vm):
+    def test_tablet_default_bus_tablet_device(self, admin_client, tablet_device_vm):
         LOGGER.info("Test tablet device - default device bus - USB.")
 
         check_vm_system_tablet_device(vm=tablet_device_vm, expected_device="USB")
-        check_vm_xml_tablet_device(vm=tablet_device_vm)
+        check_vm_xml_tablet_device(vm=tablet_device_vm, admin_client=admin_client)
 
     @pytest.mark.parametrize(
         "tablet_device_vm",
@@ -114,11 +122,12 @@ class TestRHELTabletDevice:
         ],
         indirect=True,
     )
-    def test_tablet_device_migrate_vm(self, tablet_device_vm):
-        migrate_vm_and_verify(vm=tablet_device_vm, check_ssh_connectivity=True)
+    def test_tablet_device_migrate_vm(
+        self, admin_client: DynamicClient, tablet_device_vm: VirtualMachineForTestsFromTemplate
+    ):
+        migrate_vm_and_verify(vm=tablet_device_vm, client=admin_client, check_ssh_connectivity=True)
 
 
-@pytest.mark.s390x
 @pytest.mark.parametrize(
     "golden_image_data_source_for_test_scope_class",
     [pytest.param({"os_dict": FEDORA_LATEST})],

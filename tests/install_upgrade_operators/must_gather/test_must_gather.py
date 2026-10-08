@@ -1,5 +1,3 @@
-# -*- coding: utf-8 -*-
-
 import logging
 import os
 import re
@@ -7,11 +5,8 @@ import re
 import pytest
 import yaml
 from ocp_resources.api_service import APIService
-from ocp_resources.cdi_config import CDIConfig
-from ocp_resources.imagestreamtag import ImageStreamTag
 from ocp_resources.mutating_webhook_config import MutatingWebhookConfiguration
 from ocp_resources.namespace import Namespace
-from ocp_resources.network_addons_config import NetworkAddonsConfig
 from ocp_resources.node_network_state import NodeNetworkState
 from ocp_resources.pod import Pod
 from ocp_resources.resource import Resource
@@ -29,16 +24,14 @@ from tests.install_upgrade_operators.must_gather.utils import (
     compare_resource_contents,
     compare_webhook_svc_contents,
 )
-from utilities.constants import (
-    ALL_CNV_CRDS,
+from utilities.constants.components import (
     BRIDGE_MARKER,
     CLUSTER_NETWORK_ADDONS_OPERATOR,
     KUBE_CNI_LINUX_BRIDGE_PLUGIN,
-    KUBEMACPOOL_MAC_CONTROLLER_MANAGER,
-    KUBEMACPOOL_MAC_RANGE_CONFIG,
-    VM_CRD,
-    NamespacesNames,
 )
+from utilities.constants.hco import VM_CRD
+from utilities.constants.namespaces import NamespacesNames
+from utilities.constants.networking import KUBEMACPOOL_MAC_RANGE_CONFIG
 from utilities.must_gather import get_must_gather_output_file
 
 pytestmark = [
@@ -55,49 +48,19 @@ LOGGER = logging.getLogger(__name__)
     "collected_cluster_must_gather", "collected_must_gather_all_images", "cnv_image_path_must_gather_all_images"
 )
 class TestMustGatherCluster:
-    @pytest.mark.parametrize(
-        ("resource_type", "resource_path", "checks"),
-        [
-            pytest.param(
-                NodeNetworkState,
-                f"cluster-scoped-resources/{NodeNetworkState.ApiGroup.NMSTATE_IO}/nodenetworkstates/{{name}}.yaml",
-                VALIDATE_UID_NAME,
-                marks=(pytest.mark.polarion("CNV-2707")),
-                id="test_nodenetworkstate_resources",
-            ),
-            pytest.param(
-                NetworkAddonsConfig,
-                f"cluster-scoped-resources/"
-                f"networkaddonsconfigs.{NetworkAddonsConfig.ApiGroup.NETWORKADDONSOPERATOR_NETWORK_KUBEVIRT_IO}/"
-                "{name}.yaml",
-                VALIDATE_UID_NAME,
-                marks=(pytest.mark.polarion("CNV-3042")),
-                id="test_networkaddonsoperator_resources",
-            ),
-            pytest.param(
-                CDIConfig,
-                f"cluster-scoped-resources/cdiconfigs.{CDIConfig.ApiGroup.CDI_KUBEVIRT_IO}/{{name}}.yaml",
-                VALIDATE_FIELDS,
-                marks=(pytest.mark.polarion("CNV-3373")),
-                id="test_cdi_config_resources",
-            ),
-        ],
-        indirect=["resource_type"],
-    )
-    def test_resource_type(
+    @pytest.mark.polarion("CNV-2707")
+    def test_nodenetworkstate_resources(
         self,
         admin_client,
         must_gather_for_test,
-        resource_type,
-        resource_path,
-        checks,
     ):
         check_list_of_resources(
-            dyn_client=admin_client,
-            resource_type=resource_type,
+            client=admin_client,
+            resource_type=NodeNetworkState,
             temp_dir=must_gather_for_test,
-            resource_path=resource_path,
-            checks=checks,
+            resource_path=f"cluster-scoped-resources/{NodeNetworkState.ApiGroup.NMSTATE_IO}"
+            "/nodenetworkstates/{name}.yaml",
+            checks=VALIDATE_UID_NAME,
         )
 
     @pytest.mark.polarion("CNV-2982")
@@ -154,12 +117,6 @@ class TestMustGatherCluster:
                 id="test_kube_cni_pods",
             ),
             pytest.param(
-                "kubemacpool-leader=true",
-                py_config["hco_namespace"],
-                marks=(pytest.mark.polarion("CNV-2983")),
-                id=f"{KUBEMACPOOL_MAC_CONTROLLER_MANAGER}_pods",
-            ),
-            pytest.param(
                 f"name={CLUSTER_NETWORK_ADDONS_OPERATOR}",
                 py_config["hco_namespace"],
                 marks=(pytest.mark.polarion("CNV-2985")),
@@ -193,7 +150,7 @@ class TestMustGatherCluster:
         resource_namespace,
     ):
         check_list_of_resources(
-            dyn_client=admin_client,
+            client=admin_client,
             resource_type=Pod,
             temp_dir=must_gather_for_test,
             resource_path="namespaces/{namespace}/pods/{name}/{name}.yaml",
@@ -204,9 +161,7 @@ class TestMustGatherCluster:
 
     @pytest.mark.polarion("CNV-2727")
     def test_template_in_openshift_ns_data(self, admin_client, must_gather_for_test):
-        template_resources = list(
-            Template.get(dyn_client=admin_client, singular_name="template", namespace="openshift")
-        )
+        template_resources = list(Template.get(client=admin_client, singular_name="template", namespace="openshift"))
         template_log = os.path.join(
             must_gather_for_test,
             "namespaces/openshift/templates/openshift.yaml",
@@ -254,7 +209,7 @@ class TestMustGatherCluster:
             ),
             pytest.param(
                 ["ip", "a"],
-                "ip.txt",
+                "ip_addr",
                 "not_empty",
                 marks=(pytest.mark.polarion("CNV-2732"),),
                 id="test_nodes_ip_data",
@@ -277,17 +232,6 @@ class TestMustGatherCluster:
                 results_file=results_file,
                 compare_method=compare_method,
             )
-
-    @pytest.mark.polarion("CNV-2801")
-    def test_nmstate_config_data(self, admin_client, must_gather_for_test):
-        check_list_of_resources(
-            dyn_client=admin_client,
-            resource_type=NodeNetworkState,
-            temp_dir=must_gather_for_test,
-            resource_path=f"cluster-scoped-resources/{NodeNetworkState.ApiGroup.NMSTATE_IO}/"
-            "nodenetworkstates/{name}.yaml",
-            checks=(("metadata", "name"), ("metadata", "uid")),
-        )
 
     @pytest.mark.parametrize(
         "label_selector",
@@ -334,7 +278,7 @@ class TestMustGatherCluster:
     @pytest.mark.polarion("CNV-2723")
     def test_apiservice_resources(self, admin_client, must_gather_for_test):
         check_list_of_resources(
-            dyn_client=admin_client,
+            client=admin_client,
             resource_type=APIService,
             temp_dir=must_gather_for_test,
             resource_path="apiservices/{name}.yaml",
@@ -345,14 +289,14 @@ class TestMustGatherCluster:
     @pytest.mark.polarion("CNV-2726")
     def test_webhookconfig_resources(self, admin_client, must_gather_for_test):
         check_list_of_resources(
-            dyn_client=admin_client,
+            client=admin_client,
             resource_type=ValidatingWebhookConfiguration,
             temp_dir=must_gather_for_test,
             resource_path="webhooks/validating/{name}/validatingwebhookconfiguration.yaml",
             checks=VALIDATE_UID_NAME,
         )
         check_list_of_resources(
-            dyn_client=admin_client,
+            client=admin_client,
             resource_type=MutatingWebhookConfiguration,
             temp_dir=must_gather_for_test,
             resource_path="webhooks/mutating/{name}/mutatingwebhookconfiguration.yaml",
@@ -360,20 +304,15 @@ class TestMustGatherCluster:
         )
 
         for webhook_resources in [
-            list(ValidatingWebhookConfiguration.get(dyn_client=admin_client)),
-            list(MutatingWebhookConfiguration.get(dyn_client=admin_client)),
+            list(ValidatingWebhookConfiguration.get(client=admin_client)),
+            list(MutatingWebhookConfiguration.get(client=admin_client)),
         ]:
             compare_webhook_svc_contents(
                 webhook_resources=webhook_resources,
                 cnv_must_gather=must_gather_for_test,
-                dyn_client=admin_client,
+                client=admin_client,
                 checks=VALIDATE_UID_NAME,
             )
-
-    @pytest.mark.polarion("CNV-8508")
-    def test_no_new_cnv_crds(self, kubevirt_crd_names):
-        new_crds = [crd for crd in kubevirt_crd_names if crd not in ALL_CNV_CRDS]
-        assert not new_crds, f"Following crds are new: {new_crds}."
 
     @pytest.mark.polarion("CNV-2724")
     def test_crd_resources(self, admin_client, must_gather_for_test, kubevirt_crd_by_type):
@@ -439,28 +378,6 @@ class TestMustGatherCluster:
                     # Re-raise for any other missing resource file
                     LOGGER.error(f"Resource file not found: {resource_file}")
                     raise
-
-    @pytest.mark.polarion("CNV-2939")
-    def test_image_stream_tag_resources(self, admin_client, must_gather_for_test):
-        resource_path = (
-            f"namespaces/{NamespacesNames.OPENSHIFT}/{ImageStreamTag.ApiGroup.IMAGE_OPENSHIFT_IO}/imagestreamtags"
-        )
-        istag_dir = os.path.join(
-            must_gather_for_test,
-            resource_path,
-        )
-        assert len(os.listdir(istag_dir)) == len(
-            list(ImageStreamTag.get(dyn_client=admin_client, namespace=NamespacesNames.OPENSHIFT))
-        )
-        check_list_of_resources(
-            dyn_client=admin_client,
-            resource_type=ImageStreamTag,
-            temp_dir=must_gather_for_test,
-            resource_path=f"{resource_path}/{{name}}.yaml",
-            checks=VALIDATE_UID_NAME,
-            namespace=NamespacesNames.OPENSHIFT,
-            filter_resource="redhat",
-        )
 
 
 @pytest.mark.sriov

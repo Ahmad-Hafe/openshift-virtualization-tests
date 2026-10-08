@@ -1,10 +1,16 @@
+from __future__ import annotations
+
 import logging
 import random
+from typing import TYPE_CHECKING
 
 import pytest
+from ocp_resources.cluster_operator import ClusterOperator
 from ocp_resources.multi_network_policy import MultiNetworkPolicy
 from ocp_resources.resource import ResourceEditor
 
+from libs.net.ip import random_ipv4_address
+from libs.net.vmspec import lookup_iface_status_ip
 from tests.network.flat_overlay.constants import (
     CONNECTION_REQUESTS,
     HTTP_SUCCESS_RESPONSE_STR,
@@ -17,14 +23,20 @@ from tests.network.flat_overlay.utils import (
     get_vm_connection_reply,
     get_vm_kubevirt_domain_label,
     is_port_number_available,
+    restart_ovnkube_node_daemonset,
     start_nc_response_on_vm,
-    wait_for_multi_network_policy_resources,
 )
-from tests.network.libs.ip import random_ipv4_address
-from utilities.constants import FLAT_OVERLAY_STR
-from utilities.infra import create_ns
-from utilities.network import assert_ping_successful, get_vmi_ip_v4_by_name, network_nad
+from utilities.constants.hco import DEFAULT_RESOURCE_CONDITIONS
+from utilities.constants.networking import FLAT_OVERLAY_STR
+from utilities.infra import create_ns, wait_for_consistent_resource_conditions
+from utilities.jira import is_jira_open
+from utilities.network import assert_ping_successful, network_nad
 from utilities.virt import migrate_vm_and_verify
+
+if TYPE_CHECKING:
+    from kubernetes.dynamic import DynamicClient
+
+    from utilities.virt import VirtualMachineForTests
 
 LOGGER = logging.getLogger(__name__)
 
@@ -39,15 +51,30 @@ GENEVE_HEADER = 16
 UDP_HEADER = 8
 IPV4_HEADER = 20
 ETHERNET_HEADER = 14
-SPECIFIC_HOST_MASK = "32"
+SPECIFIC_HOST_MASK = 32
 
 
 @pytest.fixture(scope="module")
-def enable_multi_network_policy_usage(admin_client, network_operator):
-    with ResourceEditor(patches={network_operator: {"spec": {"useMultiNetworkPolicy": True}}}):
-        wait_for_multi_network_policy_resources(admin_client=admin_client, deploy_mnp_crd=True)
+def multi_network_policy_enabled(admin_client, network_operator):
+    if network_operator.instance.spec.get("useMultiNetworkPolicy"):
         yield
-    wait_for_multi_network_policy_resources(admin_client=admin_client, deploy_mnp_crd=False)
+        return
+    with ResourceEditor(patches={network_operator: {"spec": {"useMultiNetworkPolicy": True}}}):
+        wait_for_consistent_resource_conditions(
+            dynamic_client=admin_client,
+            resource_kind=ClusterOperator,
+            resource_name="network",
+            expected_conditions=DEFAULT_RESOURCE_CONDITIONS,
+        )
+        if is_jira_open(jira_id="OCPBUGS-92080"):  # <skip-jira-utils-check>
+            restart_ovnkube_node_daemonset()
+        yield
+    wait_for_consistent_resource_conditions(
+        dynamic_client=admin_client,
+        resource_kind=ClusterOperator,
+        resource_name="network",
+        expected_conditions=DEFAULT_RESOURCE_CONDITIONS,
+    )
 
 
 @pytest.fixture(scope="module")
@@ -260,7 +287,7 @@ def flat_l2_jumbo_frame_packet_size(cluster_network_mtu):
 
 @pytest.fixture(scope="class")
 def vmc_flat_overlay_ip_address(vmc_flat_overlay, flat_overlay_vmc_vmd_nad):
-    return get_vmi_ip_v4_by_name(vm=vmc_flat_overlay, name=flat_overlay_vmc_vmd_nad.name)
+    return lookup_iface_status_ip(vm=vmc_flat_overlay, iface_name=flat_overlay_vmc_vmd_nad.name, ip_family=4)
 
 
 @pytest.fixture()
@@ -272,18 +299,21 @@ def ping_before_migration(vmd_flat_overlay, vmc_flat_overlay_ip_address):
 
 
 @pytest.fixture()
-def migrated_vmc_flat_overlay(vmc_flat_overlay):
-    migrate_vm_and_verify(vm=vmc_flat_overlay, check_ssh_connectivity=True)
+def migrated_vmc_flat_overlay(
+    admin_client: DynamicClient, vmc_flat_overlay: VirtualMachineForTests
+) -> VirtualMachineForTests:
+    migrate_vm_and_verify(vm=vmc_flat_overlay, client=admin_client, check_ssh_connectivity=True)
+    return vmc_flat_overlay
 
 
 @pytest.fixture(scope="class")
 def vmb_flat_overlay_ip_address(vmb_flat_overlay, flat_overlay_vma_vmb_nad):
-    return get_vmi_ip_v4_by_name(vm=vmb_flat_overlay, name=flat_overlay_vma_vmb_nad.name)
+    return lookup_iface_status_ip(vm=vmb_flat_overlay, iface_name=flat_overlay_vma_vmb_nad.name, ip_family=4)
 
 
 @pytest.fixture(scope="class")
 def vmd_flat_overlay_ip_address(vmd_flat_overlay, flat_overlay_vmc_vmd_nad):
-    return get_vmi_ip_v4_by_name(vm=vmd_flat_overlay, name=flat_overlay_vmc_vmd_nad.name)
+    return lookup_iface_status_ip(vm=vmd_flat_overlay, iface_name=flat_overlay_vmc_vmd_nad.name, ip_family=4)
 
 
 @pytest.fixture()
@@ -321,7 +351,7 @@ def vmb_ingress_multi_network_policy(
         network_name=flat_overlay_vma_vmb_nad.name,
         policy_types=["Ingress"],
         ingress=create_ip_block(
-            ip_address=f"{random_ipv4_address(net_seed=0, host_address=123)}/{SPECIFIC_HOST_MASK}",
+            ip_address=str(random_ipv4_address(net_seed=0, host_address=123, subnet_length=SPECIFIC_HOST_MASK)),
         ),
         client=admin_client,
     ) as mnp:

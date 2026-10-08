@@ -8,7 +8,7 @@ from utilities.infra import get_node_audit_log_line_dict
 
 LOGGER = logging.getLogger(__name__)
 
-DEPRECATED_API_MAX_VERSION = "1.25"
+DEPRECATED_API_MAX_VERSION = "1.35"
 DEPRECATED_API_LOG_ENTRY = '"k8s.io/deprecated":"true"'
 
 
@@ -41,10 +41,7 @@ def skip_component_check(user_agent, deprecation_version):
             return True
 
     # Skip if deprecated version is greater than DEPRECATED_API_MAX_VERSION
-    if Version(deprecation_version) > Version(DEPRECATED_API_MAX_VERSION):
-        return True
-
-    return False
+    return Version(deprecation_version) > Version(DEPRECATED_API_MAX_VERSION)
 
 
 def failure_not_in_component_list(component, annotations, audit_log_entry_dict):

@@ -1,25 +1,32 @@
+from __future__ import annotations
+
 import logging
 import shlex
+from typing import TYPE_CHECKING
 
 import pytest
-from ocp_resources.daemonset import DaemonSet
 from ocp_resources.resource import ResourceEditor
 from timeout_sampler import TimeoutExpiredError, TimeoutSampler
 
+from tests.utils import start_stress_on_vm
 from tests.virt.constants import REMOVE_NEWLINE
-from tests.virt.utils import build_node_affinity_dict, start_stress_on_vm
-from utilities.constants import TIMEOUT_5MIN, TIMEOUT_5SEC, TIMEOUT_20MIN, Images
+from tests.virt.utils import build_node_affinity_dict
+from utilities.constants import Images
+from utilities.constants.timeouts import (
+    TIMEOUT_5MIN,
+    TIMEOUT_5SEC,
+    TIMEOUT_20MIN,
+)
 from utilities.infra import ExecCommandOnPod
 from utilities.virt import VirtualMachineForTests, migrate_vm_and_verify, running_vm
+
+if TYPE_CHECKING:
+    from kubernetes.dynamic import DynamicClient
 
 LOGGER = logging.getLogger(__name__)
 
 pytestmark = [
-    pytest.mark.usefixtures(
-        "fail_if_wasp_agent_disabled",
-        "wasp_agent_active_and_ready",
-        "swap_is_available_on_nodes",
-    ),
+    pytest.mark.usefixtures("swap_is_available_on_nodes"),
     pytest.mark.swap,
 ]
 
@@ -31,11 +38,11 @@ SWAP_LABEL_VALUE = "test"
 SWAP_TEST_LABEL = {SWAP_LABEL_KEY: SWAP_LABEL_VALUE}
 
 
-def wait_virt_launcher_pod_using_swap(vm):
+def wait_virt_launcher_pod_using_swap(vm, admin_client):
     sampler = TimeoutSampler(
         wait_timeout=TIMEOUT_5MIN,
         sleep=TIMEOUT_5SEC,
-        func=vm.privileged_vmi.virt_launcher_pod.execute,
+        func=vm.vmi.get_virt_launcher_pod(privileged_client=admin_client).execute,
         command=shlex.split(f"bash -c 'cat {MEMORY_SWAP_CURRENT_PATH} | {REMOVE_NEWLINE}'"),
         container="compute",
     )
@@ -67,27 +74,6 @@ def node_affinity_for_swap_label():
 
 
 @pytest.fixture(scope="package")
-def wasp_agent_daemonset(hco_namespace):
-    yield DaemonSet(name="wasp-agent", namespace=hco_namespace.name)
-
-
-@pytest.fixture(scope="package")
-def fail_if_wasp_agent_disabled(wasp_agent_daemonset):
-    if not wasp_agent_daemonset.exists:
-        pytest.fail(reason="Wasp agent not deployed to cluster")
-
-
-@pytest.fixture(scope="package")
-def wasp_agent_active_and_ready(workers, wasp_agent_daemonset):
-    wasp_agent_ds_instance = wasp_agent_daemonset.instance
-    desired = wasp_agent_ds_instance.status.desiredNumberScheduled
-    ready = wasp_agent_ds_instance.status.numberReady
-    assert desired == ready == len(workers), (
-        f"Wasp not ready on all nodes. Number of workers: {len(workers)}, \nNumber of ready wasp agent pods: {ready}"
-    )
-
-
-@pytest.fixture(scope="package")
 def swap_is_available_on_nodes(workers, workers_utility_pods):
     nodes_without_swap = []
     for node in workers:
@@ -107,6 +93,7 @@ def calculated_vm_memory_size(available_memory_per_node, node_with_least_availab
 
 @pytest.fixture(scope="class")
 def vm_for_swap_usage_test(
+    unprivileged_client,
     namespace,
     cpu_for_migration,
     calculated_vm_memory_size,
@@ -115,6 +102,7 @@ def vm_for_swap_usage_test(
     with VirtualMachineForTests(
         name="vm-for-swap-usage-test",
         namespace=namespace.name,
+        client=unprivileged_client,
         cpu_model=cpu_for_migration,
         memory_guest=calculated_vm_memory_size,
         image=Images.Fedora.FEDORA_CONTAINER_IMAGE,
@@ -133,10 +121,11 @@ def swap_vm_stress_started(vm_for_swap_usage_test):
 
 
 @pytest.fixture()
-def vm_with_different_qos(request, namespace):
+def vm_with_different_qos(request, unprivileged_client, namespace):
     with VirtualMachineForTests(
         name=request.param["name"],
         namespace=namespace.name,
+        client=unprivileged_client,
         memory_requests=Images.Fedora.DEFAULT_MEMORY_SIZE,
         memory_limits=request.param.get("memory_limits"),
         image=Images.Fedora.FEDORA_CONTAINER_IMAGE,
@@ -155,14 +144,17 @@ def vm_with_different_qos(request, namespace):
         ),
         pytest.param(
             {"name": "guaranteed-vm", "memory_limits": Images.Fedora.DEFAULT_MEMORY_SIZE},
-            marks=pytest.mark.polarion("CNV-11488"),
+            marks=[
+                pytest.mark.polarion("CNV-11488"),
+                pytest.mark.jira("CNV-98658", run=False),
+            ],
             id="Guaranteed_QoS",
         ),
     ],
     indirect=True,
 )
-def test_swap_status_on_pod(vm_with_different_qos):
-    swap_max = vm_with_different_qos.privileged_vmi.virt_launcher_pod.execute(
+def test_swap_status_on_pod(admin_client, vm_with_different_qos):
+    swap_max = vm_with_different_qos.vmi.get_virt_launcher_pod(privileged_client=admin_client).execute(
         command=shlex.split(f"bash -c 'cat {MEMORY_SWAP_MAX_PATH} | {REMOVE_NEWLINE}'")
     )
     assert swap_max not in ["0", "max"] if "burstable" in vm_with_different_qos.name else swap_max == "0", (
@@ -175,19 +167,21 @@ class TestVMCanUseSwap:
     @pytest.mark.polarion("CNV-11258")
     def test_virt_launcher_pod_use_swap(
         self,
+        admin_client,
         hco_memory_overcommit_increased,
         node_with_min_memory_labeled_for_swap_test,
         vm_for_swap_usage_test,
         swap_vm_stress_started,
     ):
-        wait_virt_launcher_pod_using_swap(vm=vm_for_swap_usage_test)
+        wait_virt_launcher_pod_using_swap(vm=vm_for_swap_usage_test, admin_client=admin_client)
 
     @pytest.mark.dependency(depends=["test_virt_launcher_pod_use_swap"])
     @pytest.mark.polarion("CNV-11259")
-    def test_migrate_vm_using_swap(
-        self,
-        node_with_max_memory_labeled_for_swap_test,
-        vm_for_swap_usage_test,
-        migration_policy_with_allow_auto_converge,
-    ):
-        migrate_vm_and_verify(vm=vm_for_swap_usage_test, check_ssh_connectivity=True, timeout=TIMEOUT_20MIN)
+    @pytest.mark.usefixtures(
+        "node_with_max_memory_labeled_for_swap_test",
+        "migration_policy_with_allow_auto_converge",
+    )
+    def test_migrate_vm_using_swap(self, admin_client: DynamicClient, vm_for_swap_usage_test: VirtualMachineForTests):
+        migrate_vm_and_verify(
+            vm=vm_for_swap_usage_test, client=admin_client, check_ssh_connectivity=True, timeout=TIMEOUT_20MIN
+        )

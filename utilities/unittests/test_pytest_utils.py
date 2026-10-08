@@ -3,29 +3,147 @@
 """Unit tests for pytest_utils module"""
 
 from unittest.mock import MagicMock, mock_open, patch
+from xml.etree import ElementTree
 
+import paramiko
 import pytest
 
-from utilities.exceptions import MissingEnvironmentVariableError
+import utilities.constants
 
 # Circular dependencies are already mocked in conftest.py
+from utilities import pytest_utils as pytest_utils_module
+from utilities.constants.architecture import (
+    AMD_64,
+    ARM_64,
+    MULTIARCH,
+    S390X,
+)
+from utilities.constants.images import OS_FLAVOR_FEDORA
+from utilities.constants.instance_types import (
+    CENTOS_STREAM9_PREFERENCE,
+    RHEL9_PREFERENCE,
+)
+from utilities.exceptions import MissingEnvironmentVariableError, UnsupportedCPUArchitectureError
 from utilities.pytest_utils import (
+    _validate_storage_class_options,
+    assert_incremental_classes_fully_collected,
     config_default_storage_class,
     deploy_run_in_progress_config_map,
     deploy_run_in_progress_namespace,
     exit_pytest_execution,
+    filter_hpp_tests,
+    filter_multiarch_tests,
+    filter_ocs_tests,
+    filter_post_test_alerts_tests,
+    generate_common_template_matrix_dicts,
+    generate_instance_type_matrix_dicts,
     get_artifactory_server_url,
     get_base_matrix_name,
     get_cnv_version_explorer_url,
     get_current_running_data,
     get_matrix_params,
     get_tests_cluster_markers,
+    mark_nmstate_dependent_tests,
+    ocs_storage_class_in_matrix,
+    remove_tests_from_list,
     reorder_early_fixtures,
     run_in_progress_config_map,
     separator,
     skip_if_pytest_flags_exists,
     stop_if_run_in_progress,
+    update_cpu_arch_related_config,
+    update_latest_os_config,
+    validate_collected_tests_arch_params,
+    validate_cpu_arch_params,
 )
+
+
+class TestValidateCpuArchParams:
+    """Test cases for validate_cpu_arch_params function"""
+
+    @patch("utilities.pytest_utils.get_cluster_architecture", return_value={"amd64"})
+    def test_homogeneous_cluster_no_option_ok(self, mock_get_cluster_arch):
+        """Test homogeneous cluster with no --cpu-arch option does not raise"""
+        validate_cpu_arch_params(cpu_arch_option="")
+        mock_get_cluster_arch.assert_called_once()
+
+    @patch("utilities.pytest_utils.get_cluster_architecture", return_value={"unsupported_arch"})
+    def test_unsupported_cpu_architecture_raises(self, mock_get_cluster_arch):
+        """Test unsupported CPU architecture raises error"""
+        with pytest.raises(
+            UnsupportedCPUArchitectureError,
+            match="Node/s have unsupported CPU architecture/s",
+        ):
+            validate_cpu_arch_params(cpu_arch_option="")
+        mock_get_cluster_arch.assert_called_once()
+
+    @patch("utilities.pytest_utils.get_cluster_architecture", return_value={"amd64"})
+    def test_homogeneous_cluster_with_option_raises(self, mock_get_cluster_arch):
+        """Test homogeneous cluster with --cpu-arch option raises"""
+        with pytest.raises(
+            UnsupportedCPUArchitectureError,
+            match="`--cpu-arch` cmdline arg shouldn't be passed for homogeneous cluster",
+        ):
+            validate_cpu_arch_params(cpu_arch_option="amd64")
+        mock_get_cluster_arch.assert_called_once()
+
+    @patch("utilities.pytest_utils.get_cluster_architecture", return_value={"amd64", "arm64"})
+    def test_heterogeneous_cluster_no_option_raises(self, mock_get_cluster_arch):
+        """Test heterogeneous cluster without --cpu-arch option raises"""
+        with pytest.raises(
+            UnsupportedCPUArchitectureError,
+            match="`--cpu-arch` cmdline arg must be provided for heterogeneous cluster",
+        ):
+            validate_cpu_arch_params(cpu_arch_option="")
+        mock_get_cluster_arch.assert_called_once()
+
+    @patch("utilities.pytest_utils.get_cluster_architecture", return_value={"amd64", "arm64"})
+    def test_heterogeneous_cluster_option_not_in_cluster_raises(self, mock_get_cluster_arch):
+        """Test --cpu-arch value not in cluster arch list raises"""
+        with pytest.raises(
+            UnsupportedCPUArchitectureError,
+            match=r"unsupported value\(s\)",
+        ):
+            validate_cpu_arch_params(cpu_arch_option="s390x")
+        mock_get_cluster_arch.assert_called_once()
+
+    @patch("utilities.pytest_utils.get_cluster_architecture", return_value={"amd64", "arm64"})
+    def test_heterogeneous_cluster_valid_option_ok(self, mock_get_cluster_arch):
+        """Test heterogeneous cluster with valid --cpu-arch option does not raise"""
+        validate_cpu_arch_params(cpu_arch_option="amd64")
+        validate_cpu_arch_params(cpu_arch_option="arm64")
+        assert mock_get_cluster_arch.call_count == 2
+
+
+class TestValidateCollectedTestsArchParams:
+    """Test cases for validate_collected_tests_arch_params function"""
+
+    @patch("utilities.pytest_utils.py_config", {"cluster_type": "amd64"})
+    def test_multiarch_marked_tests_on_homogeneous_cluster_raises(self):
+        """Test multiarch-marked tests on homogeneous cluster raises"""
+        session = MagicMock()
+        session.items = [MagicMock()]
+        session.items[0].get_closest_marker = MagicMock(return_value=MagicMock())  # has multiarch
+        session.config.getoption = MagicMock(return_value="")
+        with pytest.raises(
+            UnsupportedCPUArchitectureError,
+            match="Tests marked with `multiarch` are not allowed for homogeneous cluster",
+        ):
+            validate_collected_tests_arch_params(session)
+
+    @patch("utilities.pytest_utils.py_config", {"cluster_type": "multiarch"})
+    def test_multi_arch_option_with_non_multiarch_tests_raises(self):
+        """Test multiple --cpu-arch values with tests not all multiarch raises"""
+        session = MagicMock()
+        item = MagicMock()
+        item.get_closest_marker = MagicMock(return_value=None)  # no multiarch
+        session.items = [item]
+        session.config.getoption = MagicMock(return_value="amd64,arm64")
+        with pytest.raises(
+            UnsupportedCPUArchitectureError,
+            match="Tests not marked with `multiarch` should not run with multiple values",
+        ):
+            validate_collected_tests_arch_params(session)
 
 
 class TestGetBaseMatrixName:
@@ -159,6 +277,10 @@ class TestConfigDefaultStorageClass:
                 {"new-sc": {"volume_mode": "Filesystem", "access_mode": "ReadWriteOnce"}},
                 {"original-sc": {"volume_mode": "Block", "access_mode": "ReadWriteMany"}},
             ],
+            "system_storage_class_matrix": [
+                {"new-sc": {"volume_mode": "Filesystem", "access_mode": "ReadWriteOnce"}},
+                {"original-sc": {"volume_mode": "Block", "access_mode": "ReadWriteMany"}},
+            ],
         },
     )
     def test_config_default_storage_class_cmd_override(self):
@@ -171,7 +293,7 @@ class TestConfigDefaultStorageClass:
 
         config_default_storage_class(mock_session)
 
-        from utilities.pytest_utils import py_config
+        from utilities.pytest_utils import py_config  # noqa: PLC0415
 
         assert py_config["default_storage_class"] == "new-sc"
         assert py_config["default_volume_mode"] == "Filesystem"
@@ -182,6 +304,10 @@ class TestConfigDefaultStorageClass:
         {
             "default_storage_class": "original-sc",
             "storage_class_matrix": [
+                {"first-sc": {"volume_mode": "Filesystem", "access_mode": "ReadWriteOnce"}},
+                {"second-sc": {"volume_mode": "Block", "access_mode": "ReadWriteMany"}},
+            ],
+            "system_storage_class_matrix": [
                 {"first-sc": {"volume_mode": "Filesystem", "access_mode": "ReadWriteOnce"}},
                 {"second-sc": {"volume_mode": "Block", "access_mode": "ReadWriteMany"}},
             ],
@@ -197,7 +323,7 @@ class TestConfigDefaultStorageClass:
 
         config_default_storage_class(mock_session)
 
-        from utilities.pytest_utils import py_config
+        from utilities.pytest_utils import py_config  # noqa: PLC0415
 
         assert py_config["default_storage_class"] == "first-sc"
         assert py_config["default_volume_mode"] == "Filesystem"
@@ -208,6 +334,10 @@ class TestConfigDefaultStorageClass:
         {
             "default_storage_class": "original-sc",
             "storage_class_matrix": [
+                {"first-sc": {"volume_mode": "Filesystem", "access_mode": "ReadWriteOnce"}},
+                {"original-sc": {"volume_mode": "Block", "access_mode": "ReadWriteMany"}},
+            ],
+            "system_storage_class_matrix": [
                 {"first-sc": {"volume_mode": "Filesystem", "access_mode": "ReadWriteOnce"}},
                 {"original-sc": {"volume_mode": "Block", "access_mode": "ReadWriteMany"}},
             ],
@@ -223,12 +353,18 @@ class TestConfigDefaultStorageClass:
 
         config_default_storage_class(mock_session)
 
-        from utilities.pytest_utils import py_config
+        from utilities.pytest_utils import py_config  # noqa: PLC0415
 
         # Should keep original-sc since it's in the matrix
         assert py_config["default_storage_class"] == "original-sc"
 
-    @patch("utilities.pytest_utils.py_config", {"default_storage_class": "original-sc"})
+    @patch(
+        "utilities.pytest_utils.py_config",
+        {
+            "default_storage_class": "original-sc",
+            "system_storage_class_matrix": [],
+        },
+    )
     def test_config_default_storage_class_no_changes(self):
         """Test no changes when no overrides provided"""
         mock_session = MagicMock()
@@ -239,10 +375,267 @@ class TestConfigDefaultStorageClass:
 
         config_default_storage_class(mock_session)
 
-        from utilities.pytest_utils import py_config
+        from utilities.pytest_utils import py_config  # noqa: PLC0415
 
         # Should remain unchanged
         assert py_config["default_storage_class"] == "original-sc"
+
+    @patch(
+        "utilities.pytest_utils.py_config",
+        {
+            "default_storage_class": "original-sc",
+            "system_storage_class_matrix": [
+                {"existing-sc-1": {"volume_mode": "Filesystem", "access_mode": "ReadWriteOnce"}},
+                {"existing-sc-2": {"volume_mode": "Block", "access_mode": "ReadWriteMany"}},
+            ],
+        },
+    )
+    @patch("utilities.pytest_utils.write_to_file")
+    @patch("utilities.pytest_utils.get_data_collector_base_directory", return_value="/tmp")
+    @patch("utilities.pytest_utils.pytest.exit", side_effect=SystemExit(4))
+    def test_config_default_storage_class_not_found_raises_error(
+        self, mock_pytest_exit, mock_get_base_dir, mock_write_to_file
+    ):
+        """Test clean exit when requested default storage class is not in system matrix"""
+        mock_session = MagicMock()
+        mock_session.config.getoption.side_effect = lambda name: {
+            "default_storage_class": "nonexistent-sc",
+            "storage_class_matrix": None,
+        }.get(name)
+
+        with pytest.raises(SystemExit):
+            config_default_storage_class(mock_session)
+
+        mock_pytest_exit.assert_called_once()
+        assert mock_pytest_exit.call_args[1]["returncode"] == 4
+        assert "nonexistent-sc" in mock_pytest_exit.call_args[1]["reason"]
+        mock_write_to_file.assert_called_once()
+
+    @patch(
+        "utilities.pytest_utils.py_config",
+        {
+            "default_storage_class": "original-sc",
+            "system_storage_class_matrix": [
+                {"existing-sc-1": {"volume_mode": "Filesystem", "access_mode": "ReadWriteOnce"}},
+                {"existing-sc-2": {"volume_mode": "Block", "access_mode": "ReadWriteMany"}},
+            ],
+        },
+    )
+    @patch("utilities.pytest_utils.write_to_file")
+    @patch("utilities.pytest_utils.get_data_collector_base_directory", return_value="/tmp")
+    @patch("utilities.pytest_utils.pytest.exit", side_effect=SystemExit(4))
+    def test_config_default_storage_class_invalid_matrix_values_raises_error(
+        self, mock_pytest_exit, mock_get_base_dir, mock_write_to_file
+    ):
+        """Test clean exit when --storage-class-matrix contains invalid storage class names"""
+        mock_session = MagicMock()
+        mock_session.config.getoption.side_effect = lambda name: {
+            "default_storage_class": None,
+            "storage_class_matrix": "nonexistent-sc,existing-sc-1",
+        }.get(name)
+
+        with pytest.raises(SystemExit):
+            config_default_storage_class(mock_session)
+
+        mock_pytest_exit.assert_called_once()
+        assert mock_pytest_exit.call_args[1]["returncode"] == 4
+        assert "nonexistent-sc" in mock_pytest_exit.call_args[1]["reason"]
+        mock_write_to_file.assert_called_once()
+
+    @patch(
+        "utilities.pytest_utils.py_config",
+        {
+            "default_storage_class": "original-sc",
+            "system_storage_class_matrix": [
+                {"sc-1": {"volume_mode": "Filesystem", "access_mode": "ReadWriteOnce"}},
+                {"sc-2": {"volume_mode": "Block", "access_mode": "ReadWriteMany"}},
+            ],
+        },
+    )
+    @patch("utilities.pytest_utils.write_to_file")
+    @patch("utilities.pytest_utils.get_data_collector_base_directory", return_value="/tmp")
+    @patch("utilities.pytest_utils.pytest.exit", side_effect=SystemExit(4))
+    def test_config_default_storage_class_not_in_matrix_raises_error(
+        self, mock_pytest_exit, mock_get_base_dir, mock_write_to_file
+    ):
+        """Test clean exit when --default-storage-class is not in --storage-class-matrix"""
+        mock_session = MagicMock()
+        mock_session.config.getoption.side_effect = lambda name: {
+            "default_storage_class": "sc-1",
+            "storage_class_matrix": "sc-2",
+        }.get(name)
+
+        with pytest.raises(SystemExit):
+            config_default_storage_class(mock_session)
+
+        mock_pytest_exit.assert_called_once()
+        assert mock_pytest_exit.call_args[1]["returncode"] == 4
+        assert "sc-1" in mock_pytest_exit.call_args[1]["reason"]
+        mock_write_to_file.assert_called_once()
+
+    @patch(
+        "utilities.pytest_utils.py_config",
+        {
+            "default_storage_class": "original-sc",
+            "system_storage_class_matrix": [
+                {"sc-1": {"volume_mode": "Filesystem", "access_mode": "ReadWriteOnce"}},
+                {"sc-2": {"volume_mode": "Block", "access_mode": "ReadWriteMany"}},
+            ],
+        },
+    )
+    def test_config_default_storage_class_both_options_valid(self):
+        """Test correct update when both --default-storage-class and --storage-class-matrix are valid"""
+        mock_session = MagicMock()
+        mock_session.config.getoption.side_effect = lambda name: {
+            "default_storage_class": "sc-1",
+            "storage_class_matrix": "sc-1,sc-2",
+        }.get(name)
+
+        config_default_storage_class(mock_session)
+
+        assert pytest_utils_module.py_config["default_storage_class"] == "sc-1"
+        assert pytest_utils_module.py_config["default_volume_mode"] == "Filesystem"
+        assert pytest_utils_module.py_config["default_access_mode"] == "ReadWriteOnce"
+
+    @patch(
+        "utilities.pytest_utils.py_config",
+        {
+            "default_storage_class": "original-sc",
+            "system_storage_class_matrix": [
+                {"original-sc": {"volume_mode": "Block", "access_mode": "ReadWriteMany"}},
+            ],
+        },
+    )
+    def test_config_default_storage_class_same_as_global(self):
+        """Test no update when --default-storage-class matches global default"""
+        mock_session = MagicMock()
+        mock_session.config.getoption.side_effect = lambda name: {
+            "default_storage_class": "original-sc",
+            "storage_class_matrix": None,
+        }.get(name)
+
+        config_default_storage_class(mock_session)
+
+        assert pytest_utils_module.py_config["default_storage_class"] == "original-sc"
+
+
+class TestValidateStorageClassOptions:
+    """Test cases for _validate_storage_class_options function"""
+
+    @patch(
+        "utilities.pytest_utils.py_config",
+        {"system_storage_class_matrix": [{"sc-1": {}}, {"sc-2": {}}, {"sc-3": {}}]},
+    )
+    def test_valid_matrix_and_default(self):
+        """Test no error when all values are valid"""
+        _validate_storage_class_options(
+            cmd_default_storage_class="sc-1",
+            cmdline_storage_class_matrix=["sc-1", "sc-2"],
+        )
+
+    @patch(
+        "utilities.pytest_utils.py_config",
+        {"system_storage_class_matrix": [{"sc-1": {}}, {"sc-2": {}}]},
+    )
+    def test_valid_matrix_no_default(self):
+        """Test no error when matrix is valid and no default is specified"""
+        _validate_storage_class_options(
+            cmd_default_storage_class=None,
+            cmdline_storage_class_matrix=["sc-1", "sc-2"],
+        )
+
+    @patch(
+        "utilities.pytest_utils.py_config",
+        {"system_storage_class_matrix": [{"sc-1": {}}]},
+    )
+    def test_no_options(self):
+        """Test no error when no options are specified"""
+        _validate_storage_class_options(
+            cmd_default_storage_class=None,
+            cmdline_storage_class_matrix=None,
+        )
+
+    @patch(
+        "utilities.pytest_utils.py_config",
+        {"system_storage_class_matrix": [{"sc-1": {}}, {"sc-2": {}}]},
+    )
+    def test_invalid_matrix_value(self):
+        """Test ValueError for invalid storage class in matrix"""
+        with pytest.raises(ValueError, match=r"from --storage-class-matrix not found"):
+            _validate_storage_class_options(
+                cmd_default_storage_class=None,
+                cmdline_storage_class_matrix=["bad-sc"],
+            )
+
+    @patch(
+        "utilities.pytest_utils.py_config",
+        {"system_storage_class_matrix": [{"sc-1": {}}, {"sc-2": {}}]},
+    )
+    def test_invalid_default_sc(self):
+        """Test ValueError for default SC not in system matrix"""
+        with pytest.raises(ValueError, match=r"Default storage class 'bad-sc' not found"):
+            _validate_storage_class_options(
+                cmd_default_storage_class="bad-sc",
+                cmdline_storage_class_matrix=None,
+            )
+
+    @patch(
+        "utilities.pytest_utils.py_config",
+        {"system_storage_class_matrix": [{"sc-1": {}}, {"sc-2": {}}]},
+    )
+    def test_valid_default_no_matrix(self):
+        """Test no error when default SC is valid and no matrix is specified"""
+        _validate_storage_class_options(
+            cmd_default_storage_class="sc-1",
+            cmdline_storage_class_matrix=None,
+        )
+
+    @patch(
+        "utilities.pytest_utils.py_config",
+        {"system_storage_class_matrix": [{"sc-1": {}}]},
+    )
+    def test_multiple_invalid_matrix_values(self):
+        """Test all invalid storage class names are reported"""
+        with pytest.raises(ValueError, match=r"\['bad-sc-1', 'bad-sc-2'\]"):
+            _validate_storage_class_options(
+                cmd_default_storage_class=None,
+                cmdline_storage_class_matrix=["bad-sc-1", "bad-sc-2"],
+            )
+
+    @patch(
+        "utilities.pytest_utils.py_config",
+        {"system_storage_class_matrix": [{"sc-1": {}}]},
+    )
+    def test_invalid_matrix_checked_before_default_not_in_matrix(self):
+        """Test matrix validation runs before default-in-matrix check"""
+        with pytest.raises(ValueError, match=r"from --storage-class-matrix not found"):
+            _validate_storage_class_options(
+                cmd_default_storage_class="sc-1",
+                cmdline_storage_class_matrix=["bad-sc"],
+            )
+
+    @patch(
+        "utilities.pytest_utils.py_config",
+        {"system_storage_class_matrix": [{"sc-1": {}}, {"sc-2": {}}, {"sc-3": {}}]},
+    )
+    def test_default_sc_not_in_matrix(self):
+        """Test ValueError when default SC exists on system but not in the provided matrix"""
+        with pytest.raises(ValueError, match=r"not in --storage-class-matrix"):
+            _validate_storage_class_options(
+                cmd_default_storage_class="sc-1",
+                cmdline_storage_class_matrix=["sc-2", "sc-3"],
+            )
+
+    @patch(
+        "utilities.pytest_utils.py_config",
+        {"system_storage_class_matrix": [{"sc-1": {}}, {"sc-2": {}}]},
+    )
+    def test_valid_matrix_skips_system_check_for_default(self):
+        """Test that when matrix is valid, default SC is only checked against matrix not system"""
+        _validate_storage_class_options(
+            cmd_default_storage_class="sc-1",
+            cmdline_storage_class_matrix=["sc-1"],
+        )
 
 
 class TestSeparator:
@@ -439,6 +832,56 @@ class TestReorderEarlyFixtures:
 
         # autouse_fixtures should be at position 0 (first position in use_early_fixture_names)
         assert mock_metafunc.fixturenames == ["autouse_fixtures", "fixture1", "fixture2", "fixture3"]
+
+
+class TestMarkNmstateDependentTests:
+    """Test cases for mark_nmstate_dependent_tests function."""
+
+    def test_adds_nmstate_marker_when_fixture_present(self):
+        """Items that request nmstate_dependent_placeholder get the nmstate marker."""
+        item_with_nmstate = MagicMock()
+        item_with_nmstate.fixturenames = ["some_fixture", "nmstate_dependent_placeholder"]
+        item_without = MagicMock()
+        item_without.fixturenames = ["other_fixture"]
+        items = [item_with_nmstate, item_without]
+
+        result = mark_nmstate_dependent_tests(items=items)
+
+        assert result is items
+        item_with_nmstate.add_marker.assert_called_once_with(marker=pytest.mark.nmstate)
+        item_without.add_marker.assert_not_called()
+
+    def test_no_marker_when_placeholder_absent(self):
+        """Items that do not request the placeholder are unchanged."""
+        item = MagicMock()
+        item.fixturenames = ["other_fixture"]
+        items = [item]
+
+        result = mark_nmstate_dependent_tests(items=items)
+
+        assert result is items
+        item.add_marker.assert_not_called()
+
+    def test_empty_fixturenames_unchanged(self):
+        """Items with empty fixturenames are not marked."""
+        item = MagicMock()
+        item.fixturenames = []
+        items = [item]
+
+        result = mark_nmstate_dependent_tests(items=items)
+
+        assert result is items
+        item.add_marker.assert_not_called()
+
+    def test_item_missing_fixturenames_unchanged(self):
+        """Items without a fixturenames attribute use getattr default and are not marked."""
+        item = MagicMock(spec=["add_marker"])
+        items = [item]
+
+        result = mark_nmstate_dependent_tests(items=items)
+
+        assert result is items
+        item.add_marker.assert_not_called()
 
 
 class TestStopIfRunInProgress:
@@ -660,6 +1103,15 @@ class TestSkipIfPytestFlagsExists:
 
         assert result is False
 
+    def test_skip_if_pytest_flags_exists_collect_tests_markers(self):
+        """Test skip when --collect-tests-markers flag is set"""
+        mock_config = MagicMock()
+        mock_config.getoption.side_effect = lambda flag: flag == "--collect-tests-markers"
+
+        result = skip_if_pytest_flags_exists(mock_config)
+
+        assert result is True
+
 
 class TestGetArtifactoryServerUrl:
     """Test cases for get_artifactory_server_url function"""
@@ -788,6 +1240,16 @@ class TestGetCnvVersionExplorerUrl:
         mock_config.getoption.side_effect = lambda option: option == "install"
 
         result = get_cnv_version_explorer_url(mock_config)
+        assert result == "https://version-explorer.com"
+
+    @patch("utilities.pytest_utils.os.environ", {"CNV_VERSION_EXPLORER_URL": "https://version-explorer.com"})
+    @patch("utilities.pytest_utils.LOGGER")
+    def test_get_cnv_version_explorer_url_cnv_upgrade(self, mock_logger):
+        """Test getting CNV version explorer URL with CNV upgrade"""
+        mock_config = MagicMock()
+        mock_config.getoption.side_effect = lambda option: {"install": False, "upgrade": "cnv"}.get(option, False)
+
+        result = get_cnv_version_explorer_url(mock_config)
 
         assert result == "https://version-explorer.com"
 
@@ -797,6 +1259,36 @@ class TestGetCnvVersionExplorerUrl:
         """Test getting CNV version explorer URL with EUS upgrade"""
         mock_config = MagicMock()
         mock_config.getoption.side_effect = lambda option: {"install": False, "upgrade": "eus"}.get(option, False)
+
+        result = get_cnv_version_explorer_url(mock_config)
+
+        assert result == "https://version-explorer.com"
+
+    @patch("utilities.pytest_utils.os.environ", {"CNV_VERSION_EXPLORER_URL": "https://version-explorer.com"})
+    @patch("utilities.pytest_utils.LOGGER")
+    def test_get_cnv_version_explorer_url_upgrade_custom_cnv(self, mock_logger):
+        """Test getting CNV version explorer URL with upgrade_custom=cnv"""
+        mock_config = MagicMock()
+        mock_config.getoption.side_effect = lambda option: {
+            "install": False,
+            "upgrade": None,
+            "upgrade_custom": "cnv",
+        }.get(option, False)
+
+        result = get_cnv_version_explorer_url(mock_config)
+
+        assert result == "https://version-explorer.com"
+
+    @patch("utilities.pytest_utils.os.environ", {"CNV_VERSION_EXPLORER_URL": "https://version-explorer.com"})
+    @patch("utilities.pytest_utils.LOGGER")
+    def test_get_cnv_version_explorer_url_upgrade_custom_eus(self, mock_logger):
+        """Test getting CNV version explorer URL with upgrade_custom=eus"""
+        mock_config = MagicMock()
+        mock_config.getoption.side_effect = lambda option: {
+            "install": False,
+            "upgrade": None,
+            "upgrade_custom": "eus",
+        }.get(option, False)
 
         result = get_cnv_version_explorer_url(mock_config)
 
@@ -881,9 +1373,9 @@ class TestGetTestsClusterMarkers:
         with patch("builtins.open", mock_open(read_data=pytest_ini_content)):
             get_tests_cluster_markers(items)
 
-        # Should log empty list
+        # Should log empty dict
         call_args = str(mock_logger.info.call_args_list)
-        assert "[]" in call_args
+        assert "{}" in call_args, f"Expected empty dict in logged output, got: {call_args}"
 
     @patch("utilities.pytest_utils.json.dumps")
     @patch("utilities.pytest_utils.LOGGER")
@@ -1178,3 +1670,1736 @@ class TestGetMatrixParamsAdditionalCoverage:
             # Should return empty list and log warning (lines 94-96)
             assert result == []
             mock_logger.warning.assert_called_with("test_matrix is missing in config file")
+
+
+class TestGenerateCommonTemplateMatrixDicts:
+    """Test cases for generate_common_template_matrix_dicts function"""
+
+    @pytest.fixture
+    def sample_rhel_matrix(self):
+        """Sample RHEL OS matrix for testing"""
+        return [
+            {
+                "rhel-9-6": {
+                    "os_version": "9.6",
+                    "image_name": "rhel-9.6.qcow2",
+                    "latest_released": True,
+                }
+            }
+        ]
+
+    @pytest.fixture
+    def sample_fedora_matrix(self):
+        """Sample Fedora OS matrix for testing"""
+        return [
+            {
+                "fedora-43": {
+                    "os_version": "43",
+                    "image_name": "fedora-43.qcow2",
+                    "latest_released": True,
+                }
+            }
+        ]
+
+    @patch("utilities.pytest_utils.generate_latest_os_dict")
+    @patch("utilities.pytest_utils.generate_os_matrix_dict")
+    @patch("utilities.pytest_utils.py_config", new_callable=dict)
+    def test_generate_rhel_os_matrix(
+        self,
+        mock_py_config,
+        mock_generate_os_matrix,
+        mock_generate_latest,
+        sample_rhel_matrix,
+    ):
+        """Test generating RHEL OS matrix from rhel_os_list"""
+        mock_generate_os_matrix.return_value = sample_rhel_matrix
+        mock_generate_latest.return_value = sample_rhel_matrix[0]["rhel-9-6"]
+
+        os_dict = {"rhel_os_list": ["rhel-9-6"]}
+        generate_common_template_matrix_dicts(os_dict=os_dict)
+
+        mock_generate_os_matrix.assert_called_once_with(
+            os_name="rhel", supported_operating_systems=["rhel-9-6"], arch=None
+        )
+        mock_generate_latest.assert_called_once()
+        assert mock_py_config["rhel_os_matrix"] == sample_rhel_matrix
+
+    @patch("utilities.pytest_utils.generate_latest_os_dict")
+    @patch("utilities.pytest_utils.generate_os_matrix_dict")
+    @patch("utilities.pytest_utils.py_config", new_callable=dict)
+    def test_generate_fedora_os_matrix(
+        self,
+        mock_py_config,
+        mock_generate_os_matrix,
+        mock_generate_latest,
+        sample_fedora_matrix,
+    ):
+        """Test generating Fedora OS matrix from fedora_os_list"""
+        mock_generate_os_matrix.return_value = sample_fedora_matrix
+        mock_generate_latest.return_value = sample_fedora_matrix[0]["fedora-43"]
+
+        os_dict = {"fedora_os_list": ["fedora-43"]}
+        generate_common_template_matrix_dicts(os_dict=os_dict)
+
+        mock_generate_os_matrix.assert_called_once_with(
+            os_name="fedora", supported_operating_systems=["fedora-43"], arch=None
+        )
+        assert mock_py_config["fedora_os_matrix"] == sample_fedora_matrix
+
+    @patch("utilities.pytest_utils.generate_latest_os_dict")
+    @patch("utilities.pytest_utils.generate_os_matrix_dict")
+    @patch("utilities.pytest_utils.py_config", new_callable=dict)
+    def test_generate_centos_os_matrix(
+        self,
+        mock_py_config,
+        mock_generate_os_matrix,
+        mock_generate_latest,
+    ):
+        """Test generating CentOS OS matrix from centos_os_list"""
+        sample_centos_matrix = [{"centos-stream-9": {"os_version": "9", "latest_released": True}}]
+        mock_generate_os_matrix.return_value = sample_centos_matrix
+        mock_generate_latest.return_value = sample_centos_matrix[0]["centos-stream-9"]
+
+        os_dict = {"centos_os_list": ["centos-stream-9"]}
+        generate_common_template_matrix_dicts(os_dict=os_dict)
+
+        mock_generate_os_matrix.assert_called_once_with(
+            os_name="centos", supported_operating_systems=["centos-stream-9"], arch=None
+        )
+        assert mock_py_config["centos_os_matrix"] == sample_centos_matrix
+
+    @patch("utilities.pytest_utils.generate_latest_os_dict")
+    @patch("utilities.pytest_utils.generate_os_matrix_dict")
+    @patch("utilities.pytest_utils.py_config", new_callable=dict)
+    def test_generate_windows_os_matrix(
+        self,
+        mock_py_config,
+        mock_generate_os_matrix,
+        mock_generate_latest,
+    ):
+        """Test generating Windows OS matrix from windows_os_list"""
+        sample_windows_matrix = [{"win-11": {"os_version": "11", "latest_released": True}}]
+        mock_generate_os_matrix.return_value = sample_windows_matrix
+        mock_generate_latest.return_value = sample_windows_matrix[0]["win-11"]
+
+        os_dict = {"windows_os_list": ["win-11"]}
+        generate_common_template_matrix_dicts(os_dict=os_dict)
+
+        mock_generate_os_matrix.assert_called_once_with(
+            os_name="windows", supported_operating_systems=["win-11"], arch=None
+        )
+        assert mock_py_config["windows_os_matrix"] == sample_windows_matrix
+
+    @patch("utilities.pytest_utils.generate_latest_os_dict")
+    @patch("utilities.pytest_utils.generate_os_matrix_dict")
+    @patch("utilities.pytest_utils.py_config", new_callable=dict)
+    def test_empty_os_dict_does_nothing(
+        self,
+        mock_py_config,
+        mock_generate_os_matrix,
+        mock_generate_latest,
+    ):
+        """Test that empty os_dict doesn't call any generation functions"""
+        os_dict = {}
+        generate_common_template_matrix_dicts(os_dict=os_dict)
+
+        mock_generate_os_matrix.assert_not_called()
+        mock_generate_latest.assert_not_called()
+        assert mock_py_config == {}
+
+    @patch("utilities.pytest_utils.generate_latest_os_dict")
+    @patch("utilities.pytest_utils.generate_os_matrix_dict")
+    @patch("utilities.pytest_utils.py_config", new_callable=dict)
+    def test_generate_multiple_os_matrices(
+        self,
+        mock_py_config,
+        mock_generate_os_matrix,
+        mock_generate_latest,
+        sample_rhel_matrix,
+        sample_fedora_matrix,
+    ):
+        """Test generating multiple OS matrices in a single call"""
+        mock_generate_os_matrix.side_effect = [sample_rhel_matrix, sample_fedora_matrix]
+        mock_generate_latest.side_effect = [
+            sample_rhel_matrix[0]["rhel-9-6"],
+            sample_fedora_matrix[0]["fedora-43"],
+        ]
+
+        os_dict = {
+            "rhel_os_list": ["rhel-9-6"],
+            "fedora_os_list": ["fedora-43"],
+        }
+        generate_common_template_matrix_dicts(os_dict=os_dict)
+
+        assert mock_generate_os_matrix.call_count == 2
+        assert mock_py_config["rhel_os_matrix"] == sample_rhel_matrix
+        assert mock_py_config["fedora_os_matrix"] == sample_fedora_matrix
+
+    @patch("utilities.pytest_utils.generate_latest_os_dict")
+    @patch("utilities.pytest_utils.generate_os_matrix_dict")
+    @patch("utilities.pytest_utils.py_config", new_callable=dict)
+    def test_sets_latest_rhel_os_dict(
+        self,
+        mock_py_config,
+        mock_generate_os_matrix,
+        mock_generate_latest,
+        sample_rhel_matrix,
+    ):
+        """Test that latest_rhel_os_dict is populated correctly"""
+        mock_generate_os_matrix.return_value = sample_rhel_matrix
+        expected_latest = {"os_version": "9.6", "image_name": "rhel-9.6.qcow2", "latest_released": True}
+        mock_generate_latest.return_value = expected_latest
+
+        os_dict = {"rhel_os_list": ["rhel-9-6"]}
+        generate_common_template_matrix_dicts(os_dict=os_dict)
+
+        assert mock_py_config["latest_rhel_os_dict"] == expected_latest
+
+    @patch("utilities.pytest_utils.generate_latest_os_dict")
+    @patch("utilities.pytest_utils.generate_os_matrix_dict")
+    @patch("utilities.pytest_utils.py_config", new_callable=dict)
+    def test_generate_with_cpu_arch(
+        self,
+        mock_py_config,
+        mock_generate_os_matrix,
+        mock_generate_latest,
+        sample_rhel_matrix,
+    ):
+        """Test generating OS matrix with cpu_arch parameter"""
+        mock_generate_os_matrix.return_value = sample_rhel_matrix
+        mock_generate_latest.return_value = sample_rhel_matrix[0]["rhel-9-6"]
+
+        os_dict = {"rhel_os_list": ["rhel-9-6"]}
+        generate_common_template_matrix_dicts(os_dict=os_dict, cpu_arch="arm64")
+
+        mock_generate_os_matrix.assert_called_once_with(
+            os_name="rhel", supported_operating_systems=["rhel-9-6"], arch="arm64"
+        )
+
+
+class TestGenerateInstanceTypeMatrixDicts:
+    """Test cases for generate_instance_type_matrix_dicts function"""
+
+    @pytest.fixture
+    def sample_instance_type_matrix(self):
+        """Sample instance type OS matrix for testing"""
+        return [
+            {
+                RHEL9_PREFERENCE: {
+                    "preference": RHEL9_PREFERENCE,
+                    "latest_released": True,
+                }
+            }
+        ]
+
+    @pytest.mark.parametrize(
+        ("cpu_arch", "expected_add_preference_arch_suffix"),
+        [
+            (None, True),
+            (ARM_64, True),
+            (S390X, True),
+            (AMD_64, False),
+        ],
+        ids=["no_arch", "arm64", "s390x", "amd64"],
+    )
+    @patch("utilities.pytest_utils.generate_linux_instance_type_os_matrix")
+    @patch("utilities.pytest_utils.generate_latest_os_dict")
+    @patch("utilities.pytest_utils.py_config", new_callable=dict)
+    def test_generate_instance_type_rhel_matrix(
+        self,
+        mock_py_config,
+        mock_generate_latest,
+        mock_generate_instance_type,
+        sample_instance_type_matrix,
+        cpu_arch,
+        expected_add_preference_arch_suffix,
+    ):
+        """Test RHEL matrix generation across architecture variants."""
+        mock_py_config["cluster_type"] = AMD_64
+        mock_generate_instance_type.return_value = sample_instance_type_matrix
+        mock_generate_latest.return_value = sample_instance_type_matrix[0][RHEL9_PREFERENCE]
+
+        os_dict = {"instance_type_rhel_os_list": [RHEL9_PREFERENCE]}
+        generate_instance_type_matrix_dicts(os_dict=os_dict, cpu_arch=cpu_arch)
+
+        mock_generate_instance_type.assert_called_once_with(
+            os_name="rhel",
+            preferences=[RHEL9_PREFERENCE],
+            arch_suffix=cpu_arch,
+            add_preference_arch_suffix=expected_add_preference_arch_suffix,
+            add_data_source_arch_suffix=False,
+        )
+        assert mock_py_config["instance_type_rhel_os_matrix"] == sample_instance_type_matrix
+        assert mock_py_config["latest_instance_type_rhel_os_dict"] == sample_instance_type_matrix[0][RHEL9_PREFERENCE]
+
+    @pytest.mark.parametrize(
+        ("os_dict", "cpu_arch", "expected_call", "config_key", "matrix_value"),
+        [
+            (
+                {"instance_type_fedora_os_list": [OS_FLAVOR_FEDORA]},
+                None,
+                {
+                    "os_name": OS_FLAVOR_FEDORA,
+                    "preferences": [OS_FLAVOR_FEDORA],
+                    "arch_suffix": None,
+                    "add_preference_arch_suffix": True,
+                    "add_data_source_arch_suffix": False,
+                },
+                "instance_type_fedora_os_matrix",
+                [{OS_FLAVOR_FEDORA: {"preference": OS_FLAVOR_FEDORA}}],
+            ),
+            (
+                {"instance_type_fedora_os_list": [OS_FLAVOR_FEDORA]},
+                AMD_64,
+                {
+                    "os_name": OS_FLAVOR_FEDORA,
+                    "preferences": [OS_FLAVOR_FEDORA],
+                    "arch_suffix": AMD_64,
+                    "add_preference_arch_suffix": False,
+                    "add_data_source_arch_suffix": False,
+                },
+                "instance_type_fedora_os_matrix",
+                [{OS_FLAVOR_FEDORA: {"preference": OS_FLAVOR_FEDORA}}],
+            ),
+            (
+                {"instance_type_centos_os_list": [CENTOS_STREAM9_PREFERENCE]},
+                None,
+                {
+                    "os_name": "centos.stream",
+                    "preferences": [CENTOS_STREAM9_PREFERENCE],
+                    "arch_suffix": None,
+                    "add_preference_arch_suffix": False,
+                    "add_data_source_arch_suffix": False,
+                },
+                "instance_type_centos_os_matrix",
+                [{CENTOS_STREAM9_PREFERENCE: {"preference": CENTOS_STREAM9_PREFERENCE}}],
+            ),
+            (
+                {"instance_type_centos_os_list": [CENTOS_STREAM9_PREFERENCE]},
+                S390X,
+                {
+                    "os_name": "centos.stream",
+                    "preferences": [CENTOS_STREAM9_PREFERENCE],
+                    "arch_suffix": S390X,
+                    "add_preference_arch_suffix": False,
+                    "add_data_source_arch_suffix": False,
+                },
+                "instance_type_centos_os_matrix",
+                [{CENTOS_STREAM9_PREFERENCE: {"preference": CENTOS_STREAM9_PREFERENCE}}],
+            ),
+            (
+                {"instance_type_centos_os_list": [CENTOS_STREAM9_PREFERENCE]},
+                ARM_64,
+                {
+                    "os_name": "centos.stream",
+                    "preferences": [CENTOS_STREAM9_PREFERENCE],
+                    "arch_suffix": ARM_64,
+                    "add_preference_arch_suffix": False,
+                    "add_data_source_arch_suffix": False,
+                },
+                "instance_type_centos_os_matrix",
+                [{CENTOS_STREAM9_PREFERENCE: {"preference": CENTOS_STREAM9_PREFERENCE}}],
+            ),
+        ],
+        ids=["fedora_default", "fedora_amd64", "centos_default", "centos_s390x", "centos_arm64"],
+    )
+    @patch("utilities.pytest_utils.generate_linux_instance_type_os_matrix")
+    @patch("utilities.pytest_utils.py_config", new_callable=dict)
+    def test_generate_instance_type_non_rhel_matrix(
+        self,
+        mock_py_config,
+        mock_generate_instance_type,
+        os_dict,
+        cpu_arch,
+        expected_call,
+        config_key,
+        matrix_value,
+    ):
+        """Test Fedora and CentOS matrix generation call signatures."""
+        mock_py_config["cluster_type"] = AMD_64
+        mock_generate_instance_type.return_value = matrix_value
+
+        generate_instance_type_matrix_dicts(os_dict=os_dict, cpu_arch=cpu_arch)
+
+        mock_generate_instance_type.assert_called_once_with(**expected_call)
+        assert mock_py_config[config_key] == matrix_value
+
+    @patch("utilities.pytest_utils.generate_linux_instance_type_os_matrix")
+    @patch("utilities.pytest_utils.generate_latest_os_dict")
+    @patch("utilities.pytest_utils.py_config", new_callable=dict)
+    def test_sets_latest_instance_type_rhel_os_dict(
+        self,
+        mock_py_config,
+        mock_generate_latest,
+        mock_generate_instance_type,
+        sample_instance_type_matrix,
+    ):
+        """Test that latest_instance_type_rhel_os_dict is populated correctly"""
+        mock_py_config["cluster_type"] = AMD_64
+        mock_generate_instance_type.return_value = sample_instance_type_matrix
+        expected_latest = {"preference": RHEL9_PREFERENCE, "latest_released": True}
+        mock_generate_latest.return_value = expected_latest
+
+        os_dict = {"instance_type_rhel_os_list": [RHEL9_PREFERENCE]}
+        generate_instance_type_matrix_dicts(os_dict=os_dict)
+
+        assert mock_py_config["latest_instance_type_rhel_os_dict"] == expected_latest
+
+    @patch("utilities.pytest_utils.generate_linux_instance_type_os_matrix")
+    @patch("utilities.pytest_utils.py_config", new_callable=dict)
+    def test_empty_os_dict_does_nothing(
+        self,
+        mock_py_config,
+        mock_generate_instance_type,
+    ):
+        """Test that empty os_dict doesn't call any generation functions"""
+        mock_py_config["cluster_type"] = AMD_64
+        os_dict = {}
+        generate_instance_type_matrix_dicts(os_dict=os_dict)
+
+        mock_generate_instance_type.assert_not_called()
+        assert mock_py_config == {"cluster_type": AMD_64}
+
+    @pytest.mark.parametrize(
+        ("cpu_arch", "expected_add_preference_arch_suffix"),
+        [
+            (AMD_64, False),
+            (ARM_64, True),
+            (S390X, True),
+        ],
+        ids=["multiarch_amd64", "multiarch_arm64", "multiarch_s390x"],
+    )
+    @patch("utilities.pytest_utils.generate_linux_instance_type_os_matrix")
+    @patch("utilities.pytest_utils.generate_latest_os_dict")
+    @patch("utilities.pytest_utils.py_config", new_callable=dict)
+    def test_multiarch_sets_data_source_arch_suffix_for_all_arches(
+        self,
+        mock_py_config,
+        mock_generate_latest,
+        mock_generate_instance_type,
+        sample_instance_type_matrix,
+        cpu_arch,
+        expected_add_preference_arch_suffix,
+    ):
+        """On multiarch clusters add_data_source_arch_suffix is True for every architecture."""
+        mock_py_config["cluster_type"] = MULTIARCH
+        mock_generate_instance_type.return_value = sample_instance_type_matrix
+        mock_generate_latest.return_value = sample_instance_type_matrix[0][RHEL9_PREFERENCE]
+
+        os_dict = {"instance_type_rhel_os_list": [RHEL9_PREFERENCE]}
+        generate_instance_type_matrix_dicts(os_dict=os_dict, cpu_arch=cpu_arch)
+
+        mock_generate_instance_type.assert_called_once_with(
+            os_name="rhel",
+            preferences=[RHEL9_PREFERENCE],
+            arch_suffix=cpu_arch,
+            add_preference_arch_suffix=expected_add_preference_arch_suffix,
+            add_data_source_arch_suffix=True,
+        )
+
+
+class TestUpdateLatestOsConfig:
+    """Test cases for update_latest_os_config function"""
+
+    @patch("utilities.pytest_utils.py_config", new_callable=dict)
+    def test_saves_system_windows_os_matrix(self, mock_py_config):
+        """Test that windows_os_matrix is saved to system_windows_os_matrix"""
+        mock_session_config = MagicMock()
+        mock_session_config.getoption.return_value = False
+        windows_matrix = [{"win-11": {"os_version": "11"}}]
+        mock_py_config["windows_os_matrix"] = windows_matrix
+
+        update_latest_os_config(session_config=mock_session_config)
+
+        assert mock_py_config["system_windows_os_matrix"] == windows_matrix
+
+    @patch("utilities.pytest_utils.py_config", new_callable=dict)
+    def test_saves_system_rhel_os_matrix(self, mock_py_config):
+        """Test that rhel_os_matrix is saved to system_rhel_os_matrix"""
+        mock_session_config = MagicMock()
+        mock_session_config.getoption.return_value = False
+        rhel_matrix = [{"rhel-9-6": {"os_version": "9.6"}}]
+        mock_py_config["rhel_os_matrix"] = rhel_matrix
+
+        update_latest_os_config(session_config=mock_session_config)
+
+        assert mock_py_config["system_rhel_os_matrix"] == rhel_matrix
+
+    @patch("utilities.pytest_utils.py_config", new_callable=dict)
+    def test_updates_rhel_matrix_with_latest_rhel_option(self, mock_py_config):
+        """Test updating rhel_os_matrix when latest_rhel option is set"""
+        mock_session_config = MagicMock()
+        mock_session_config.getoption.side_effect = lambda opt: opt == "latest_rhel"
+        mock_py_config["rhel_os_matrix"] = [
+            {"rhel-8-10": {"os_version": "8.10"}},
+            {"rhel-9-6": {"os_version": "9.6", "latest_released": True}},
+        ]
+        mock_py_config["latest_rhel_os_dict"] = {"os_version": "9.6", "latest_released": True}
+        mock_py_config["latest_instance_type_rhel_os_dict"] = {"preference": "rhel.9", "latest_released": True}
+
+        update_latest_os_config(session_config=mock_session_config)
+
+        assert mock_py_config["rhel_os_matrix"] == [{"rhel.9.6": {"os_version": "9.6", "latest_released": True}}]
+        assert mock_py_config["instance_type_rhel_os_matrix"] == [
+            {"rhel.9": {"preference": "rhel.9", "latest_released": True}}
+        ]
+
+    @patch("utilities.pytest_utils.py_config", new_callable=dict)
+    def test_updates_windows_matrix_with_latest_windows_option(self, mock_py_config):
+        """Test updating windows_os_matrix when latest_windows option is set"""
+        mock_session_config = MagicMock()
+        mock_session_config.getoption.side_effect = lambda opt: opt == "latest_windows"
+        mock_py_config["windows_os_matrix"] = [
+            {"win-11": {"os_version": "11"}},
+            {"win-2025": {"os_version": "2025", "latest_released": True}},
+        ]
+        mock_py_config["latest_windows_os_dict"] = {"os_version": "2025", "latest_released": True}
+
+        update_latest_os_config(session_config=mock_session_config)
+
+        assert mock_py_config["windows_os_matrix"] == [
+            {"windows.2025": {"os_version": "2025", "latest_released": True}}
+        ]
+
+    @patch("utilities.pytest_utils.py_config", new_callable=dict)
+    def test_updates_centos_matrix_with_latest_centos_option(self, mock_py_config):
+        """Test updating centos_os_matrix when latest_centos option is set"""
+        mock_session_config = MagicMock()
+        mock_session_config.getoption.side_effect = lambda opt: opt == "latest_centos"
+        mock_py_config["centos_os_matrix"] = [{"centos-stream-9": {"os_version": "9", "latest_released": True}}]
+        mock_py_config["latest_centos_os_dict"] = {"os_version": "9", "latest_released": True}
+
+        update_latest_os_config(session_config=mock_session_config)
+
+        assert mock_py_config["centos_os_matrix"] == [{"centos-stream.9": {"os_version": "9", "latest_released": True}}]
+
+    @patch("utilities.pytest_utils.py_config", new_callable=dict)
+    def test_updates_fedora_matrix_with_latest_fedora_option(self, mock_py_config):
+        """Test updating fedora_os_matrix when latest_fedora option is set"""
+        mock_session_config = MagicMock()
+        mock_session_config.getoption.side_effect = lambda opt: opt == "latest_fedora"
+        mock_py_config["fedora_os_matrix"] = [{"fedora-43": {"os_version": "43", "latest_released": True}}]
+        mock_py_config["latest_fedora_os_dict"] = {"os_version": "43", "latest_released": True}
+
+        update_latest_os_config(session_config=mock_session_config)
+
+        assert mock_py_config["fedora_os_matrix"] == [{"fedora": {"os_version": "43", "latest_released": True}}]
+
+    @patch("utilities.pytest_utils.py_config", new_callable=dict)
+    def test_no_update_without_latest_option(self, mock_py_config):
+        """Test that matrices are not updated when latest_* options are not set"""
+        mock_session_config = MagicMock()
+        mock_session_config.getoption.return_value = False
+        original_rhel_matrix = [{"rhel-8-10": {"os_version": "8.10"}}, {"rhel-9-6": {"os_version": "9.6"}}]
+        mock_py_config["rhel_os_matrix"] = original_rhel_matrix.copy()
+
+        update_latest_os_config(session_config=mock_session_config)
+
+        assert mock_py_config["rhel_os_matrix"] == original_rhel_matrix
+
+    @patch("utilities.pytest_utils.py_config", new_callable=dict)
+    def test_latest_rhel_with_missing_latest_dict_uses_defaults(self, mock_py_config):
+        """Test fallback to default values when latest_rhel_os_dict is missing"""
+        mock_session_config = MagicMock()
+        mock_session_config.getoption.side_effect = lambda opt: opt == "latest_rhel"
+        mock_py_config["rhel_os_matrix"] = [{"rhel-9-6": {"os_version": "9.6"}}]
+
+        update_latest_os_config(session_config=mock_session_config)
+
+        assert mock_py_config["rhel_os_matrix"] == [{"rhel.latest": {}}]
+        assert mock_py_config["instance_type_rhel_os_matrix"] == [{"rhel.latest": {}}]
+
+    @patch("utilities.pytest_utils.py_config", new_callable=dict)
+    def test_latest_windows_with_missing_latest_dict_uses_defaults(self, mock_py_config):
+        """Test fallback to default values when latest_windows_os_dict is missing"""
+        mock_session_config = MagicMock()
+        mock_session_config.getoption.side_effect = lambda opt: opt == "latest_windows"
+        mock_py_config["windows_os_matrix"] = [{"win-11": {"os_version": "11"}}]
+
+        update_latest_os_config(session_config=mock_session_config)
+
+        assert mock_py_config["windows_os_matrix"] == [{"windows.latest": {}}]
+
+    @patch("utilities.pytest_utils.py_config", new_callable=dict)
+    def test_no_update_when_matrix_is_missing(self, mock_py_config):
+        """Test that latest_* options are ignored when corresponding matrix is missing"""
+        mock_session_config = MagicMock()
+        mock_session_config.getoption.side_effect = lambda opt: opt == "latest_rhel"
+
+        update_latest_os_config(session_config=mock_session_config)
+
+        assert "rhel_os_matrix" not in mock_py_config
+
+    @patch("utilities.pytest_utils.py_config", new_callable=dict)
+    def test_multiple_latest_options(self, mock_py_config):
+        """Test handling multiple latest_* options simultaneously"""
+        mock_session_config = MagicMock()
+        mock_session_config.getoption.side_effect = lambda opt: opt in ("latest_rhel", "latest_windows")
+        mock_py_config["rhel_os_matrix"] = [{"rhel-9-6": {"os_version": "9.6"}}]
+        mock_py_config["latest_rhel_os_dict"] = {"os_version": "9.6"}
+        mock_py_config["latest_instance_type_rhel_os_dict"] = {"preference": "rhel.9"}
+        mock_py_config["windows_os_matrix"] = [{"win-2025": {"os_version": "2025"}}]
+        mock_py_config["latest_windows_os_dict"] = {"os_version": "2025"}
+
+        update_latest_os_config(session_config=mock_session_config)
+
+        assert mock_py_config["rhel_os_matrix"] == [{"rhel.9.6": {"os_version": "9.6"}}]
+        assert mock_py_config["windows_os_matrix"] == [{"windows.2025": {"os_version": "2025"}}]
+
+
+class TestUpdateCpuArchRelatedConfig:
+    """Test cases for update_cpu_arch_related_config function"""
+
+    @patch("utilities.pytest_utils.generate_instance_type_matrix_dicts")
+    @patch("utilities.pytest_utils.generate_common_template_matrix_dicts")
+    @patch("utilities.pytest_utils.get_cluster_architecture", return_value={"amd64"})
+    @patch("utilities.pytest_utils.validate_cpu_arch_params")
+    @patch("utilities.pytest_utils.py_config", {"cluster_type": "amd64"})
+    @patch("utilities.pytest_utils.LOGGER")
+    def test_multi_arch_option_logs_warning(
+        self,
+        mock_logger,
+        mock_validate,
+        mock_get_cluster_arch,
+        mock_generate_common,
+        mock_generate_instance,
+    ):
+        """Test that multi-arch option logs warning and skips OS matrix generation"""
+        with patch("utilities.pytest_utils.py_config", {"cluster_type": "multiarch"}) as mock_py_config:
+            update_cpu_arch_related_config(cpu_arch_option="amd64,arm64")
+
+            mock_validate.assert_called_once_with(cpu_arch_option="amd64,arm64")
+            mock_logger.warning.assert_called_once_with("OS matrix generation is not supported for multi-arch runs!")
+            mock_generate_common.assert_not_called()
+            mock_generate_instance.assert_not_called()
+            assert "cpu_arch" not in mock_py_config
+
+    @patch("utilities.pytest_utils.generate_instance_type_matrix_dicts")
+    @patch("utilities.pytest_utils.generate_common_template_matrix_dicts")
+    @patch("utilities.pytest_utils.get_cluster_architecture", return_value={"amd64"})
+    @patch("utilities.pytest_utils.validate_cpu_arch_params")
+    @patch("utilities.pytest_utils.LOGGER")
+    def test_single_arch_option_sets_cpu_arch(
+        self,
+        mock_logger,
+        mock_validate,
+        mock_get_cluster_arch,
+        mock_generate_common,
+        mock_generate_instance,
+    ):
+        """Test that single arch option sets cpu_arch in py_config"""
+        mock_py_config = {"cluster_type": "amd64"}
+        with (
+            patch("utilities.pytest_utils.py_config", mock_py_config),
+            patch("utilities.constants.images.ArchImages") as mock_arch_images,
+            patch("utilities.constants.Images"),
+        ):
+            mock_arch_images.AMD64 = MagicMock()
+            update_cpu_arch_related_config(cpu_arch_option="amd64")
+
+            assert mock_py_config["cpu_arch"] == "amd64"
+            assert utilities.constants.Images is mock_arch_images.AMD64
+            mock_generate_common.assert_called_once_with(os_dict=mock_py_config)
+            mock_generate_instance.assert_called_once_with(os_dict=mock_py_config)
+
+    @patch("utilities.pytest_utils.generate_instance_type_matrix_dicts")
+    @patch("utilities.pytest_utils.generate_common_template_matrix_dicts")
+    @patch("utilities.pytest_utils.get_cluster_architecture", return_value={"arm64"})
+    @patch("utilities.pytest_utils.validate_cpu_arch_params")
+    @patch("utilities.pytest_utils.LOGGER")
+    def test_empty_option_uses_cluster_architecture(
+        self,
+        mock_logger,
+        mock_validate,
+        mock_get_cluster_arch,
+        mock_generate_common,
+        mock_generate_instance,
+    ):
+        """Test that empty cpu_arch_option uses cluster architecture"""
+        mock_py_config = {"cluster_type": "arm64"}
+        with (
+            patch("utilities.pytest_utils.py_config", mock_py_config),
+            patch("utilities.constants.images.ArchImages") as mock_arch_images,
+            patch("utilities.constants.Images"),
+        ):
+            mock_arch_images.ARM64 = MagicMock()
+            update_cpu_arch_related_config(cpu_arch_option="")
+
+            mock_get_cluster_arch.assert_called_once()
+            assert mock_py_config["cpu_arch"] == "arm64"
+            assert utilities.constants.Images is mock_arch_images.ARM64
+            mock_generate_common.assert_called_once_with(os_dict=mock_py_config)
+            mock_generate_instance.assert_called_once_with(os_dict=mock_py_config, cpu_arch="arm64")
+
+    @patch("utilities.pytest_utils.generate_instance_type_matrix_dicts")
+    @patch("utilities.pytest_utils.generate_common_template_matrix_dicts")
+    @patch("utilities.pytest_utils.get_cluster_architecture", return_value={"amd64", "arm64"})
+    @patch("utilities.pytest_utils.validate_cpu_arch_params")
+    @patch("utilities.pytest_utils.MULTIARCH", "multiarch")
+    @patch("utilities.pytest_utils.LOGGER")
+    def test_multiarch_cluster_uses_os_matrix_arch(
+        self,
+        mock_logger,
+        mock_validate,
+        mock_get_cluster_arch,
+        mock_generate_common,
+        mock_generate_instance,
+    ):
+        """Test that MULTIARCH cluster type uses os_matrix[arch] for OS matrix generation"""
+        dic_matrix = [{"rhel10-amd64": {"instance_type": "u1.medium", "preference": "rhel.10"}}]
+        auto_update_matrix = [{"centos-stream9-amd64": {"template_os": "centos-stream9"}}]
+        os_matrix_amd64 = {
+            "rhel_os_list": ["rhel-9-6"],
+            "data_import_cron_matrix": dic_matrix,
+            "auto_update_data_source_matrix": auto_update_matrix,
+        }
+        mock_py_config = {
+            "cluster_type": "multiarch",
+            "os_matrix": {"amd64": os_matrix_amd64, "arm64": {"rhel_os_list": ["rhel-9-5"]}},
+        }
+        with (
+            patch("utilities.pytest_utils.py_config", mock_py_config),
+            patch("utilities.constants.images.ArchImages") as mock_arch_images,
+            patch("utilities.constants.Images"),
+        ):
+            mock_arch_images.AMD64 = MagicMock()
+            update_cpu_arch_related_config(cpu_arch_option="amd64")
+
+            assert mock_py_config["cpu_arch"] == "amd64"
+            assert utilities.constants.Images is mock_arch_images.AMD64
+            mock_generate_common.assert_called_once_with(os_dict=os_matrix_amd64, cpu_arch="amd64")
+            mock_generate_instance.assert_called_once_with(os_dict=os_matrix_amd64, cpu_arch="amd64")
+            assert mock_py_config["data_import_cron_matrix"] == dic_matrix
+            assert mock_py_config["auto_update_data_source_matrix"] == auto_update_matrix
+
+    @patch("utilities.pytest_utils.generate_instance_type_matrix_dicts")
+    @patch("utilities.pytest_utils.generate_common_template_matrix_dicts")
+    @patch("utilities.pytest_utils.get_cluster_architecture", return_value={"s390x"})
+    @patch("utilities.pytest_utils.validate_cpu_arch_params")
+    @patch("utilities.pytest_utils.LOGGER")
+    def test_s390x_architecture_sets_images(
+        self,
+        mock_logger,
+        mock_validate,
+        mock_get_cluster_arch,
+        mock_generate_common,
+        mock_generate_instance,
+    ):
+        """Test that s390x architecture sets Images constant correctly"""
+        mock_py_config = {"cluster_type": "s390x"}
+        with (
+            patch("utilities.pytest_utils.py_config", mock_py_config),
+            patch("utilities.constants.images.ArchImages") as mock_arch_images,
+            patch("utilities.constants.Images"),
+        ):
+            mock_s390x_images = MagicMock()
+            mock_arch_images.S390X = mock_s390x_images
+
+            update_cpu_arch_related_config(cpu_arch_option="")
+
+            assert mock_py_config["cpu_arch"] == "s390x"
+            assert utilities.constants.Images is mock_s390x_images
+            mock_generate_common.assert_called_once_with(os_dict=mock_py_config)
+            mock_generate_instance.assert_called_once_with(os_dict=mock_py_config, cpu_arch="s390x")
+
+    @patch("utilities.pytest_utils.generate_instance_type_matrix_dicts")
+    @patch("utilities.pytest_utils.generate_common_template_matrix_dicts")
+    @patch("utilities.pytest_utils.get_cluster_architecture", return_value={"amd64"})
+    @patch("utilities.pytest_utils.validate_cpu_arch_params")
+    @patch("utilities.pytest_utils.LOGGER")
+    def test_arm64_option_sets_images(
+        self,
+        mock_logger,
+        mock_validate,
+        mock_get_cluster_arch,
+        mock_generate_common,
+        mock_generate_instance,
+    ):
+        """Test that arm64 option sets Images constant correctly"""
+        mock_py_config = {"cluster_type": "amd64"}
+        with (
+            patch("utilities.pytest_utils.py_config", mock_py_config),
+            patch("utilities.constants.images.ArchImages") as mock_arch_images,
+            patch("utilities.constants.Images"),
+        ):
+            mock_arm64_images = MagicMock()
+            mock_arch_images.ARM64 = mock_arm64_images
+
+            update_cpu_arch_related_config(cpu_arch_option="arm64")
+
+            assert mock_py_config["cpu_arch"] == "arm64"
+            assert utilities.constants.Images is mock_arm64_images
+
+    @patch("utilities.pytest_utils.generate_instance_type_matrix_dicts")
+    @patch("utilities.pytest_utils.generate_common_template_matrix_dicts")
+    @patch("utilities.pytest_utils.get_cluster_architecture", return_value={"amd64"})
+    @patch("utilities.pytest_utils.validate_cpu_arch_params")
+    @patch("utilities.pytest_utils.LOGGER")
+    def test_non_multiarch_amd64_cluster_uses_py_config_no_cpu_arch(
+        self,
+        mock_logger,
+        mock_validate,
+        mock_get_cluster_arch,
+        mock_generate_common,
+        mock_generate_instance,
+    ):
+        """Test that AMD64 cluster uses py_config without cpu_arch for instance type"""
+        mock_py_config = {"cluster_type": "amd64", "rhel_os_list": ["rhel-9-6"]}
+        with (
+            patch("utilities.pytest_utils.py_config", mock_py_config),
+            patch("utilities.constants.images.ArchImages") as mock_arch_images,
+            patch("utilities.constants.Images"),
+        ):
+            mock_arch_images.AMD64 = MagicMock()
+            update_cpu_arch_related_config(cpu_arch_option="")
+
+            assert utilities.constants.Images is mock_arch_images.AMD64
+            mock_generate_common.assert_called_once_with(os_dict=mock_py_config)
+            mock_generate_instance.assert_called_once_with(os_dict=mock_py_config)
+
+    @patch("utilities.pytest_utils.generate_instance_type_matrix_dicts")
+    @patch("utilities.pytest_utils.generate_common_template_matrix_dicts")
+    @patch("utilities.pytest_utils.get_cluster_architecture", return_value={"arm64"})
+    @patch("utilities.pytest_utils.validate_cpu_arch_params")
+    @patch("utilities.pytest_utils.LOGGER")
+    def test_non_amd64_cluster_uses_py_config_with_cpu_arch(
+        self,
+        mock_logger,
+        mock_validate,
+        mock_get_cluster_arch,
+        mock_generate_common,
+        mock_generate_instance,
+    ):
+        """Test that non-AMD64 cluster uses py_config with cpu_arch for instance type"""
+        mock_py_config = {"cluster_type": "arm64", "rhel_os_list": ["rhel-9-6"]}
+        with (
+            patch("utilities.pytest_utils.py_config", mock_py_config),
+            patch("utilities.constants.images.ArchImages") as mock_arch_images,
+            patch("utilities.constants.Images"),
+        ):
+            mock_arch_images.ARM64 = MagicMock()
+            update_cpu_arch_related_config(cpu_arch_option="")
+
+            assert utilities.constants.Images is mock_arch_images.ARM64
+            mock_generate_common.assert_called_once_with(os_dict=mock_py_config)
+            mock_generate_instance.assert_called_once_with(os_dict=mock_py_config, cpu_arch="arm64")
+
+    @patch("utilities.pytest_utils.generate_instance_type_matrix_dicts")
+    @patch("utilities.pytest_utils.generate_common_template_matrix_dicts")
+    @patch("utilities.pytest_utils.get_cluster_architecture", return_value={"amd64", "arm64", "s390x"})
+    @patch("utilities.pytest_utils.validate_cpu_arch_params")
+    @patch("utilities.pytest_utils.LOGGER")
+    def test_three_arch_option_logs_warning(
+        self,
+        mock_logger,
+        mock_validate,
+        mock_get_cluster_arch,
+        mock_generate_common,
+        mock_generate_instance,
+    ):
+        """Test that three-arch option logs warning"""
+        mock_py_config = {"cluster_type": "multiarch"}
+        with patch("utilities.pytest_utils.py_config", mock_py_config):
+            update_cpu_arch_related_config(cpu_arch_option="amd64,arm64,s390x")
+
+            mock_logger.warning.assert_called_once_with("OS matrix generation is not supported for multi-arch runs!")
+            mock_generate_common.assert_not_called()
+            mock_generate_instance.assert_not_called()
+            assert "cpu_arch" not in mock_py_config
+
+    @patch("utilities.pytest_utils.generate_instance_type_matrix_dicts")
+    @patch("utilities.pytest_utils.generate_common_template_matrix_dicts")
+    @patch("utilities.pytest_utils.get_cluster_architecture", return_value={"amd64", "arm64"})
+    @patch("utilities.pytest_utils.validate_cpu_arch_params")
+    @patch("utilities.pytest_utils.MULTIARCH", "multiarch")
+    @patch("utilities.pytest_utils.LOGGER")
+    def test_multiarch_cluster_arm64_uses_correct_os_matrix(
+        self,
+        mock_logger,
+        mock_validate,
+        mock_get_cluster_arch,
+        mock_generate_common,
+        mock_generate_instance,
+    ):
+        """Test that MULTIARCH cluster with arm64 option uses os_matrix[arm64]"""
+        dic_matrix = [{"rhel10-arm64": {"instance_type": "u1.medium", "preference": "rhel.10.arm64"}}]
+        auto_update_matrix = [{"fedora-arm64": {"template_os": "fedora"}}]
+        os_matrix_arm64 = {
+            "rhel_os_list": ["rhel-9-5"],
+            "data_import_cron_matrix": dic_matrix,
+            "auto_update_data_source_matrix": auto_update_matrix,
+        }
+        mock_py_config = {
+            "cluster_type": "multiarch",
+            "os_matrix": {"amd64": {"rhel_os_list": ["rhel-9-6"]}, "arm64": os_matrix_arm64},
+        }
+        with (
+            patch("utilities.pytest_utils.py_config", mock_py_config),
+            patch("utilities.constants.images.ArchImages") as mock_arch_images,
+            patch("utilities.constants.Images"),
+        ):
+            mock_arch_images.ARM64 = MagicMock()
+            update_cpu_arch_related_config(cpu_arch_option="arm64")
+
+            assert mock_py_config["cpu_arch"] == "arm64"
+            assert utilities.constants.Images is mock_arch_images.ARM64
+            mock_generate_common.assert_called_once_with(os_dict=os_matrix_arm64, cpu_arch="arm64")
+            mock_generate_instance.assert_called_once_with(os_dict=os_matrix_arm64, cpu_arch="arm64")
+            assert mock_py_config["data_import_cron_matrix"] == dic_matrix
+            assert mock_py_config["auto_update_data_source_matrix"] == auto_update_matrix
+
+    @patch("utilities.pytest_utils.generate_instance_type_matrix_dicts")
+    @patch("utilities.pytest_utils.generate_common_template_matrix_dicts")
+    @patch("utilities.pytest_utils.get_cluster_architecture", return_value={"amd64"})
+    @patch("utilities.pytest_utils.validate_cpu_arch_params")
+    @patch("utilities.pytest_utils.LOGGER")
+    def test_validate_cpu_arch_params_called_first(
+        self,
+        mock_logger,
+        mock_validate,
+        mock_get_cluster_arch,
+        mock_generate_common,
+        mock_generate_instance,
+    ):
+        """Test that validate_cpu_arch_params is called before any other processing"""
+        mock_validate.side_effect = Exception("Validation error")
+        mock_py_config = {"cluster_type": "amd64"}
+        with patch("utilities.pytest_utils.py_config", mock_py_config):
+            with pytest.raises(Exception, match="Validation error"):
+                update_cpu_arch_related_config(cpu_arch_option="invalid")
+
+            mock_validate.assert_called_once_with(cpu_arch_option="invalid")
+            mock_get_cluster_arch.assert_not_called()
+            mock_generate_common.assert_not_called()
+            mock_generate_instance.assert_not_called()
+
+
+class TestAssertIncrementalClassesFullyCollected:
+    """Test cases for assert_incremental_classes_fully_collected function."""
+
+    def test_all_tests_collected_no_error(self):
+        """No error when all tests in an incremental class are collected."""
+
+        class MyClass:
+            def test_one(self): ...
+
+            def test_two(self): ...
+
+        parent = self._make_class_parent(cls=MyClass)
+        items = [
+            self._make_function_item(test_name="test_one", parent=parent),
+            self._make_function_item(test_name="test_two", parent=parent),
+        ]
+
+        assert_incremental_classes_fully_collected(items=items)
+
+    def test_missing_test_raises_usage_error(self):
+        """UsageError raised when a test in an incremental class is not collected."""
+
+        class MyClass:
+            def test_one(self): ...
+
+            def test_two(self): ...
+
+            def test_three(self): ...
+
+        parent = self._make_class_parent(cls=MyClass)
+        items = [self._make_function_item(test_name="test_one", parent=parent)]
+
+        with pytest.raises(pytest.UsageError, match="test_two"):
+            assert_incremental_classes_fully_collected(items=items)
+
+    def test_no_incremental_items_no_error(self):
+        """No error when no items carry the incremental marker."""
+
+        class MyClass:
+            def test_one(self): ...
+
+        parent = self._make_class_parent(cls=MyClass)
+        items = [self._make_function_item(test_name="test_one", parent=parent, is_incremental=False)]
+
+        assert_incremental_classes_fully_collected(items=items)
+
+    def test_non_function_items_ignored(self):
+        """Non-Function items are ignored even with the incremental keyword."""
+        item = MagicMock()
+        item.keywords = {"incremental": True}
+
+        assert_incremental_classes_fully_collected(items=[item])
+
+    def test_non_class_parent_ignored(self):
+        """Function items whose parent is not pytest.Class are ignored."""
+        item = MagicMock()
+        item.__class__ = pytest.Function
+        item.keywords = {"incremental": True}
+        item.parent = MagicMock()
+
+        assert_incremental_classes_fully_collected(items=[item])
+
+    def test_multiple_classes_all_errors_reported(self):
+        """All partial-collection errors across multiple incremental classes are reported together."""
+
+        class ClassA:
+            def test_one(self): ...
+
+            def test_two(self): ...
+
+        class ClassB:
+            def test_alpha(self): ...
+
+            def test_beta(self): ...
+
+        parent_a = self._make_class_parent(cls=ClassA)
+        parent_b = self._make_class_parent(cls=ClassB)
+        items = [
+            self._make_function_item(test_name="test_one", parent=parent_a),
+            self._make_function_item(test_name="test_alpha", parent=parent_b),
+        ]
+
+        with pytest.raises(pytest.UsageError) as exc_info:
+            assert_incremental_classes_fully_collected(items=items)
+
+        error_message = str(exc_info.value)
+        assert "test_two" in error_message
+        assert "test_beta" in error_message
+
+    def test_std_placeholder_methods_excluded(self):
+        """Methods with __test__ = False are treated as STD placeholders and not flagged as missing."""
+
+        class MyClass:
+            def test_one(self): ...
+
+            def test_two(self): ...
+
+        MyClass.test_two.__test__ = False
+
+        parent = self._make_class_parent(cls=MyClass)
+        items = [self._make_function_item(test_name="test_one", parent=parent)]
+
+        assert_incremental_classes_fully_collected(items=items)
+
+    def test_xfail_no_run_methods_excluded(self):
+        """Methods marked xfail(run=False) are not flagged as missing."""
+
+        class MyClass:
+            def test_one(self): ...
+
+            def test_two(self): ...
+
+        MyClass.test_two.pytestmark = [pytest.mark.xfail(run=False)]
+
+        parent = self._make_class_parent(cls=MyClass)
+        items = [self._make_function_item(test_name="test_one", parent=parent)]
+
+        assert_incremental_classes_fully_collected(items=items)
+
+    def test_empty_items_no_error(self):
+        """No error when the items list is empty."""
+        assert_incremental_classes_fully_collected(items=[])
+
+    def _make_class_parent(self, cls):
+        parent = MagicMock()
+        parent.__class__ = pytest.Class
+        parent.cls = cls
+        return parent
+
+    def _make_function_item(self, test_name, parent, is_incremental=True):
+        item = MagicMock()
+        item.__class__ = pytest.Function
+        item.parent = parent
+        item.function.__name__ = test_name
+        item.keywords = {"incremental": True} if is_incremental else {}
+        return item
+
+
+class TestRemoveTestsFromList:
+    """Test cases for remove_tests_from_list function."""
+
+    def test_splits_items_by_keyword(self):
+        """Items with matching keyword are separated from those without."""
+        item_with_hpp = MagicMock()
+        item_with_hpp.keywords = {"hpp": True, "storage": True}
+        item_without_hpp = MagicMock()
+        item_without_hpp.keywords = {"storage": True}
+
+        discarded, kept = remove_tests_from_list(items=[item_with_hpp, item_without_hpp], filter_str="hpp")
+
+        assert discarded == [item_with_hpp]
+        assert kept == [item_without_hpp]
+
+    def test_all_items_match(self):
+        """All items discarded when all have the keyword."""
+        item_one = MagicMock()
+        item_one.keywords = {"hpp": True}
+        item_two = MagicMock()
+        item_two.keywords = {"hpp": True}
+
+        discarded, kept = remove_tests_from_list(items=[item_one, item_two], filter_str="hpp")
+
+        assert discarded == [item_one, item_two]
+        assert kept == []
+
+    def test_no_items_match(self):
+        """No items discarded when none have the keyword."""
+        item_one = MagicMock()
+        item_one.keywords = {"storage": True}
+        item_two = MagicMock()
+        item_two.keywords = {"network": True}
+
+        discarded, kept = remove_tests_from_list(items=[item_one, item_two], filter_str="hpp")
+
+        assert discarded == []
+        assert kept == [item_one, item_two]
+
+    def test_empty_items_list(self):
+        """Empty input returns two empty lists."""
+        discarded, kept = remove_tests_from_list(items=[], filter_str="hpp")
+
+        assert discarded == []
+        assert kept == []
+
+
+class TestFilterHppTests:
+    """Test cases for filter_hpp_tests function."""
+
+    def test_removes_hpp_tests_when_no_marker_expression(self):
+        """HPP tests are filtered out when no -m option is set."""
+        item_hpp = MagicMock()
+        item_hpp.keywords = {"hpp": True}
+        item_other = MagicMock()
+        item_other.keywords = {"storage": True}
+        config = MagicMock()
+        config.getoption.return_value = None
+
+        result = filter_hpp_tests(items=[item_hpp, item_other], config=config)
+
+        assert result == [item_other]
+        config.hook.pytest_deselected.assert_called_once_with(items=[item_hpp])
+
+    def test_removes_hpp_tests_when_marker_does_not_include_hpp(self):
+        """HPP tests are filtered out when -m is set but does not contain 'hpp'."""
+        item_hpp = MagicMock()
+        item_hpp.keywords = {"hpp": True}
+        item_other = MagicMock()
+        item_other.keywords = {"storage": True}
+        config = MagicMock()
+        config.getoption.return_value = "smoke"
+
+        result = filter_hpp_tests(items=[item_hpp, item_other], config=config)
+
+        assert result == [item_other]
+        config.hook.pytest_deselected.assert_called_once_with(items=[item_hpp])
+
+    def test_keeps_hpp_tests_when_marker_includes_hpp(self):
+        """All tests are kept when -m includes 'hpp'."""
+        item_hpp = MagicMock()
+        item_hpp.keywords = {"hpp": True}
+        item_other = MagicMock()
+        item_other.keywords = {"storage": True}
+        items = [item_hpp, item_other]
+        config = MagicMock()
+        config.getoption.return_value = "hpp"
+
+        result = filter_hpp_tests(items=items, config=config)
+
+        assert result == items
+        config.hook.pytest_deselected.assert_not_called()
+
+    def test_keeps_hpp_tests_when_marker_contains_hpp_in_expression(self):
+        """All tests are kept when -m contains 'hpp' as part of a larger expression."""
+        item_hpp = MagicMock()
+        item_hpp.keywords = {"hpp": True}
+        items = [item_hpp]
+        config = MagicMock()
+        config.getoption.return_value = "hpp and storage"
+
+        result = filter_hpp_tests(items=items, config=config)
+
+        assert result == items
+        config.hook.pytest_deselected.assert_not_called()
+
+    def test_empty_marker_expression_filters_hpp(self):
+        """HPP tests are filtered out when -m is an empty string."""
+        item_hpp = MagicMock()
+        item_hpp.keywords = {"hpp": True}
+        config = MagicMock()
+        config.getoption.return_value = ""
+
+        result = filter_hpp_tests(items=[item_hpp], config=config)
+
+        assert result == []
+        config.hook.pytest_deselected.assert_called_once_with(items=[item_hpp])
+
+
+class TestFilterPostTestAlertsTests:
+    """Test cases for filter_post_test_alerts_tests function."""
+
+    def test_filters_when_skip_post_test_alerts_flag_set(self):
+        """Post-test alert tests are filtered out when --skip-post-test-alerts flag is set."""
+        item_post_test_alerts = MagicMock()
+        item_post_test_alerts.keywords = {"post_test_alerts": True}
+        item_other = MagicMock()
+        item_other.keywords = {"other_test": True}
+        config = MagicMock()
+        config.getoption.side_effect = lambda flag: flag == "--skip-post-test-alerts"
+
+        result = filter_post_test_alerts_tests(items=[item_post_test_alerts, item_other], config=config)
+
+        assert result == [item_other]
+        config.hook.pytest_deselected.assert_called_once_with(items=[item_post_test_alerts])
+
+    def test_filters_when_install_flag_set(self):
+        """Post-test alert tests are filtered out when --install flag is set."""
+        item_post_test_alerts = MagicMock()
+        item_post_test_alerts.keywords = {"post_test_alerts": True}
+        item_other = MagicMock()
+        item_other.keywords = {"other_test": True}
+        config = MagicMock()
+        config.getoption.side_effect = lambda flag: flag == "--install"
+
+        result = filter_post_test_alerts_tests(items=[item_post_test_alerts, item_other], config=config)
+
+        assert result == [item_other]
+        config.hook.pytest_deselected.assert_called_once_with(items=[item_post_test_alerts])
+
+    def test_no_filtering_when_no_flags_set(self):
+        """All items are returned unchanged when no filtering flags are set."""
+        item_post_test_alerts = MagicMock()
+        item_post_test_alerts.keywords = {"post_test_alerts": True}
+        item_other = MagicMock()
+        item_other.keywords = {"other_test": True}
+        items = [item_post_test_alerts, item_other]
+        config = MagicMock()
+        config.getoption.return_value = False
+
+        result = filter_post_test_alerts_tests(items=items, config=config)
+        assert result == items
+        config.hook.pytest_deselected.assert_not_called()
+
+
+OCS_STORAGE_CLASS = "ocs-storagecluster-ceph-rbd-virtualization"
+
+
+class TestOcsStorageClassInMatrix:
+    """Test cases for ocs_storage_class_in_matrix function."""
+
+    @patch(target="utilities.pytest_utils.py_config", new={"storage_class_matrix": [{OCS_STORAGE_CLASS: {}}]})
+    def test_true_when_ocs_storage_class_in_matrix(self):
+        """Returns True when the OCS storage class is in the storage class matrix."""
+        assert ocs_storage_class_in_matrix() is True
+
+    @patch(target="utilities.pytest_utils.py_config", new={"storage_class_matrix": [{"some-other-sc": {}}]})
+    def test_false_when_ocs_storage_class_not_in_matrix(self):
+        """Returns False when the OCS storage class is not in the storage class matrix."""
+        assert ocs_storage_class_in_matrix() is False
+
+    @patch(target="utilities.pytest_utils.py_config", new={})
+    def test_false_when_matrix_missing(self):
+        """Returns False when the storage class matrix is not configured."""
+        assert ocs_storage_class_in_matrix() is False
+
+
+class TestFilterOcsTests:
+    """Test cases for filter_ocs_tests function."""
+
+    @patch(target="utilities.pytest_utils.py_config", new={})
+    def test_removes_ocs_tests_when_no_marker_expression(self):
+        """OCS tests are filtered out when no -m option is set and OCS storage class is absent."""
+        item_ocs = MagicMock()
+        item_ocs.keywords = {"ocs": True}
+        item_other = MagicMock()
+        item_other.keywords = {"storage": True}
+        config = MagicMock()
+        config.getoption.return_value = None
+
+        result = filter_ocs_tests(items=[item_ocs, item_other], config=config)
+
+        assert result == [item_other]
+        config.hook.pytest_deselected.assert_called_once_with(items=[item_ocs])
+
+    @patch(target="utilities.pytest_utils.py_config", new={})
+    def test_removes_ocs_tests_when_marker_does_not_include_ocs(self):
+        """OCS tests are filtered out when -m is set but does not contain 'ocs'."""
+        item_ocs = MagicMock()
+        item_ocs.keywords = {"ocs": True}
+        item_other = MagicMock()
+        item_other.keywords = {"storage": True}
+        config = MagicMock()
+        config.getoption.return_value = "smoke"
+
+        result = filter_ocs_tests(items=[item_ocs, item_other], config=config)
+
+        assert result == [item_other]
+        config.hook.pytest_deselected.assert_called_once_with(items=[item_ocs])
+
+    @patch(target="utilities.pytest_utils.py_config", new={})
+    def test_keeps_ocs_tests_when_marker_includes_ocs(self):
+        """All tests are kept when -m includes 'ocs'."""
+        item_ocs = MagicMock()
+        item_ocs.keywords = {"ocs": True}
+        item_other = MagicMock()
+        item_other.keywords = {"storage": True}
+        items = [item_ocs, item_other]
+        config = MagicMock()
+        config.getoption.return_value = "ocs"
+
+        result = filter_ocs_tests(items=items, config=config)
+
+        assert result == items
+        config.hook.pytest_deselected.assert_not_called()
+
+    @patch(target="utilities.pytest_utils.py_config", new={})
+    def test_keeps_ocs_tests_when_marker_contains_ocs_in_expression(self):
+        """All tests are kept when -m contains 'ocs' as part of a larger expression."""
+        item_ocs = MagicMock()
+        item_ocs.keywords = {"ocs": True}
+        items = [item_ocs]
+        config = MagicMock()
+        config.getoption.return_value = "ocs and storage"
+
+        result = filter_ocs_tests(items=items, config=config)
+
+        assert result == items
+        config.hook.pytest_deselected.assert_not_called()
+
+    @patch(target="utilities.pytest_utils.py_config", new={})
+    def test_empty_marker_expression_filters_ocs(self):
+        """OCS tests are filtered out when -m is an empty string and OCS storage class is absent."""
+        item_ocs = MagicMock()
+        item_ocs.keywords = {"ocs": True}
+        config = MagicMock()
+        config.getoption.return_value = ""
+
+        result = filter_ocs_tests(items=[item_ocs], config=config)
+
+        assert result == []
+        config.hook.pytest_deselected.assert_called_once_with(items=[item_ocs])
+
+    @patch(target="utilities.pytest_utils.py_config", new={"storage_class_matrix": [{OCS_STORAGE_CLASS: {}}]})
+    def test_keeps_ocs_tests_when_ocs_storage_class_in_matrix(self):
+        """All tests are kept when the OCS storage class is in the matrix, even without -m ocs."""
+        item_ocs = MagicMock()
+        item_ocs.keywords = {"ocs": True}
+        item_other = MagicMock()
+        item_other.keywords = {"storage": True}
+        items = [item_ocs, item_other]
+        config = MagicMock()
+        config.getoption.return_value = None
+
+        result = filter_ocs_tests(items=items, config=config)
+
+        assert result == items
+        config.hook.pytest_deselected.assert_not_called()
+
+
+class TestFilterMultiarchTests:
+    """Test cases for filter_multiarch_tests function."""
+
+    @patch("utilities.pytest_utils.py_config", {"cluster_type": MULTIARCH})
+    def test_returns_all_items_on_multiarch_cluster(self):
+        """All tests pass through on heterogeneous (multiarch) clusters."""
+        item_multiarch = MagicMock()
+        item_multiarch.keywords = {"multiarch": True}
+        item_other = MagicMock()
+        item_other.keywords = {"storage": True}
+        items = [item_multiarch, item_other]
+        config = MagicMock()
+
+        result = filter_multiarch_tests(items=items, config=config)
+
+        assert result == items
+        config.hook.pytest_deselected.assert_not_called()
+
+    @patch("utilities.pytest_utils.py_config", {"cluster_type": AMD_64})
+    def test_removes_multiarch_tests_on_homogeneous_cluster(self):
+        """Multiarch-marked tests are deselected on homogeneous clusters."""
+        item_multiarch = MagicMock()
+        item_multiarch.keywords = {"multiarch": True}
+        item_other = MagicMock()
+        item_other.keywords = {"storage": True}
+        config = MagicMock()
+
+        result = filter_multiarch_tests(items=[item_multiarch, item_other], config=config)
+
+        assert result == [item_other]
+        config.hook.pytest_deselected.assert_called_once_with(items=[item_multiarch])
+
+    @patch("utilities.pytest_utils.py_config", {"cluster_type": AMD_64})
+    def test_no_deselection_when_no_multiarch_tests(self):
+        """No deselection occurs when no tests have the multiarch marker."""
+        item_other = MagicMock()
+        item_other.keywords = {"storage": True}
+        config = MagicMock()
+
+        result = filter_multiarch_tests(items=[item_other], config=config)
+
+        assert result == [item_other]
+        config.hook.pytest_deselected.assert_not_called()
+
+
+class TestInjectFailureJunit:
+    """Test cases for _inject_failure_junit (private) and _failure_info mechanism"""
+
+    def setup_method(self):
+        pytest_utils_module._failure_info = None
+
+    def teardown_method(self):
+        pytest_utils_module._failure_info = None
+
+    @patch("utilities.pytest_utils.ElementTree")
+    def test_no_op_when_no_failure(self, mock_element_tree):
+        """Test _inject_failure_junit does nothing when no failure was recorded."""
+        mock_session = MagicMock()
+        mock_session.config.option.xmlpath = None
+        pytest_utils_module._inject_failure_junit(session=mock_session)
+        mock_element_tree.parse.assert_not_called()
+
+    @patch("utilities.pytest_utils.ElementTree")
+    def test_no_op_when_no_xmlpath(self, mock_element_tree):
+        """Test _inject_failure_junit does nothing when no junitxml path is configured."""
+        pytest_utils_module._failure_info = {
+            "message": "Test failure",
+            "log_message": "Detailed failure",
+            "return_code": 99,
+        }
+
+        mock_session = MagicMock()
+        mock_session.config.option.xmlpath = None
+
+        pytest_utils_module._inject_failure_junit(session=mock_session)
+        mock_element_tree.parse.assert_not_called()
+
+    def test_no_op_when_no_testsuite(self, tmp_path):
+        """Test _inject_failure_junit skips injection when XML has no testsuite element."""
+        pytest_utils_module._failure_info = {
+            "message": "Test failure",
+            "log_message": "Detailed failure",
+            "return_code": 99,
+        }
+
+        xml_path = tmp_path / "test-results.xml"
+        xml_path.write_text('<?xml version="1.0" encoding="utf-8"?><testsuites name="pytest tests" />')
+
+        mock_session = MagicMock()
+        mock_session.config.option.xmlpath = str(xml_path)
+
+        pytest_utils_module._inject_failure_junit(session=mock_session)
+
+        tree = ElementTree.parse(xml_path)
+        assert tree.getroot().find("testsuite") is None
+
+    def test_injects_synthetic_testcase(self, tmp_path):
+        """Test _inject_failure_junit creates synthetic error testcase in JUnit XML."""
+        pytest_utils_module._failure_info = {
+            "message": "Cluster sanity failed",
+            "log_message": "Detailed cluster sanity failure message",
+            "return_code": 99,
+        }
+
+        xml_path = tmp_path / "test-results.xml"
+        xml_path.write_text(
+            '<?xml version="1.0" encoding="utf-8"?>'
+            '<testsuites name="pytest tests">'
+            '<testsuite name="pytest" errors="0" failures="0" skipped="0" tests="0" '
+            'time="0.001" timestamp="2026-01-01T00:00:00" hostname="test" />'
+            "</testsuites>"
+        )
+
+        mock_session = MagicMock()
+        mock_session.config.option.xmlpath = str(xml_path)
+
+        pytest_utils_module._inject_failure_junit(session=mock_session)
+
+        tree = ElementTree.parse(xml_path)
+        root = tree.getroot()
+        testsuite = root.find("testsuite")
+        testcase = testsuite.find("testcase")
+        assert testcase is not None, "Synthetic testcase not found in XML"
+        assert testcase.get("classname") == "pytest_exit"
+        assert testcase.get("name") == "cluster_sanity_failed"
+        error_elem = testcase.find("error")
+        assert error_elem is not None, "Error element not found in testcase"
+        assert "exit code: 99" in error_elem.get("message")
+        assert "Detailed cluster sanity failure message" in error_elem.text
+        assert testsuite.get("errors") == "1"
+        assert testsuite.get("tests") == "1"
+
+    def test_injects_into_non_empty_suite(self, tmp_path):
+        """Test _inject_failure_junit appends synthetic testcase to suite with existing tests."""
+        pytest_utils_module._failure_info = {
+            "message": "Storage class failure",
+            "log_message": "Failed to set default storage class",
+            "return_code": 99,
+        }
+
+        xml_path = tmp_path / "test-results.xml"
+        xml_path.write_text(
+            '<?xml version="1.0" encoding="utf-8"?>'
+            '<testsuites name="pytest tests">'
+            '<testsuite name="pytest" errors="0" failures="1" skipped="0" tests="3" '
+            'time="10.5" timestamp="2026-01-01T00:00:00" hostname="test">'
+            '<testcase classname="tests.test_example" name="test_one" time="1.0" />'
+            '<testcase classname="tests.test_example" name="test_two" time="2.0">'
+            '<failure message="AssertionError">assert False</failure>'
+            "</testcase>"
+            '<testcase classname="tests.test_example" name="test_three" time="3.0" />'
+            "</testsuite>"
+            "</testsuites>"
+        )
+
+        mock_session = MagicMock()
+        mock_session.config.option.xmlpath = str(xml_path)
+
+        pytest_utils_module._inject_failure_junit(session=mock_session)
+
+        tree = ElementTree.parse(xml_path)
+        root = tree.getroot()
+        testsuite = root.find("testsuite")
+        testcases = testsuite.findall("testcase")
+        assert len(testcases) == 4, f"Expected 4 testcases, got {len(testcases)}"
+        synthetic = testcases[-1]
+        assert synthetic.get("classname") == "pytest_exit"
+        assert synthetic.get("name") == "storage_class_failure"
+        assert testsuite.get("errors") == "1"
+        assert testsuite.get("tests") == "4"
+        assert testsuite.get("failures") == "1"
+
+    @patch("utilities.pytest_utils.pytest.exit")
+    @patch("utilities.pytest_utils.get_data_collector_base_directory")
+    def test_exit_pytest_execution_stores_failure_info(self, mock_get_base_dir, mock_pytest_exit):
+        """Test exit_pytest_execution stores failure info for JUnit XML injection."""
+        mock_get_base_dir.return_value = "/tmp/test"
+        mock_admin_client = MagicMock()
+
+        exit_pytest_execution(
+            log_message="Storage check failed",
+            return_code=99,
+            message="Cluster sanity checks failed.",
+            admin_client=mock_admin_client,
+        )
+
+        assert pytest_utils_module._failure_info is not None
+        assert pytest_utils_module._failure_info["message"] == "Cluster sanity checks failed."
+        assert pytest_utils_module._failure_info["log_message"] == "Storage check failed"
+        assert pytest_utils_module._failure_info["return_code"] == 99
+        mock_pytest_exit.assert_called_once_with(reason="Storage check failed", returncode=99)
+
+    @patch("utilities.pytest_utils.pytest.exit")
+    @patch("utilities.pytest_utils.get_data_collector_base_directory")
+    def test_exit_pytest_execution_uses_log_message_when_no_message(self, mock_get_base_dir, mock_pytest_exit):
+        """Test exit_pytest_execution uses log_message as message when message is None."""
+        mock_get_base_dir.return_value = "/tmp/test"
+        mock_admin_client = MagicMock()
+
+        exit_pytest_execution(
+            log_message="Network sanity failed",
+            return_code=91,
+            admin_client=mock_admin_client,
+        )
+
+        assert pytest_utils_module._failure_info is not None
+        assert pytest_utils_module._failure_info["message"] == "Network sanity failed"
+        assert pytest_utils_module._failure_info["return_code"] == 91
+        mock_pytest_exit.assert_called_once_with(reason="Network sanity failed", returncode=91)
+
+    def test_sanitized_name_collapses_underscores(self, tmp_path):
+        """Test _inject_failure_junit collapses consecutive underscores in testcase name."""
+        pytest_utils_module._failure_info = {
+            "message": "Cluster: sanity -- failed!",
+            "log_message": "Detailed failure",
+            "return_code": 99,
+        }
+
+        xml_path = tmp_path / "test-results.xml"
+        xml_path.write_text(
+            '<?xml version="1.0" encoding="utf-8"?>'
+            '<testsuites name="pytest tests">'
+            '<testsuite name="pytest" errors="0" failures="0" skipped="0" tests="0" '
+            'time="0.001" timestamp="2026-01-01T00:00:00" hostname="test" />'
+            "</testsuites>"
+        )
+
+        mock_session = MagicMock()
+        mock_session.config.option.xmlpath = str(xml_path)
+
+        pytest_utils_module._inject_failure_junit(session=mock_session)
+
+        tree = ElementTree.parse(xml_path)
+        testsuite = tree.getroot().find("testsuite")
+        testcase = testsuite.find("testcase")
+        assert testcase.get("name") == "cluster_sanity_failed"
+
+    def test_sanitized_name_fallback(self, tmp_path):
+        """Test _inject_failure_junit uses 'execution_failure' for messages with only special chars."""
+        pytest_utils_module._failure_info = {
+            "message": "!@#$%^&*()",
+            "log_message": "Special chars only",
+            "return_code": 99,
+        }
+
+        xml_path = tmp_path / "test-results.xml"
+        xml_path.write_text(
+            '<?xml version="1.0" encoding="utf-8"?>'
+            '<testsuites name="pytest tests">'
+            '<testsuite name="pytest" errors="0" failures="0" skipped="0" tests="0" '
+            'time="0.001" timestamp="2026-01-01T00:00:00" hostname="test" />'
+            "</testsuites>"
+        )
+
+        mock_session = MagicMock()
+        mock_session.config.option.xmlpath = str(xml_path)
+
+        pytest_utils_module._inject_failure_junit(session=mock_session)
+
+        tree = ElementTree.parse(xml_path)
+        testsuite = tree.getroot().find("testsuite")
+        testcase = testsuite.find("testcase")
+        assert testcase.get("name") == "execution_failure"
+
+    def test_error_text_escapes_xml_chars(self, tmp_path):
+        """Test _inject_failure_junit escapes XML special characters in error text."""
+        pytest_utils_module._failure_info = {
+            "message": "XML test",
+            "log_message": 'Failed with <error> & "quotes"',
+            "return_code": 99,
+        }
+
+        xml_path = tmp_path / "test-results.xml"
+        xml_path.write_text(
+            '<?xml version="1.0" encoding="utf-8"?>'
+            '<testsuites name="pytest tests">'
+            '<testsuite name="pytest" errors="0" failures="0" skipped="0" tests="0" '
+            'time="0.001" timestamp="2026-01-01T00:00:00" hostname="test" />'
+            "</testsuites>"
+        )
+
+        mock_session = MagicMock()
+        mock_session.config.option.xmlpath = str(xml_path)
+
+        pytest_utils_module._inject_failure_junit(session=mock_session)
+
+        tree = ElementTree.parse(xml_path)
+        testsuite = tree.getroot().find("testsuite")
+        testcase = testsuite.find("testcase")
+        error_elem = testcase.find("error")
+        # ElementTree handles escaping on write and unescaping on parse,
+        # so .text contains the original unescaped characters.
+        assert "<error>" in error_elem.text
+        assert "&" in error_elem.text
+
+    def test_control_chars_sanitized(self, tmp_path):
+        """Test _inject_failure_junit strips XML-illegal control characters from error text."""
+        pytest_utils_module._failure_info = {
+            "message": "Control char test",
+            "log_message": "Failed\x07with\x08control\x00chars",
+            "return_code": 99,
+        }
+
+        xml_path = tmp_path / "test-results.xml"
+        xml_path.write_text(
+            '<?xml version="1.0" encoding="utf-8"?>'
+            '<testsuites name="pytest tests">'
+            '<testsuite name="pytest" errors="0" failures="0" skipped="0" tests="0" '
+            'time="0.001" timestamp="2026-01-01T00:00:00" hostname="test" />'
+            "</testsuites>"
+        )
+
+        mock_session = MagicMock()
+        mock_session.config.option.xmlpath = str(xml_path)
+
+        pytest_utils_module._inject_failure_junit(session=mock_session)
+
+        # Verify the XML is parseable (control chars would break parsing)
+        tree = ElementTree.parse(xml_path)
+        testsuite = tree.getroot().find("testsuite")
+        testcase = testsuite.find("testcase")
+        error_elem = testcase.find("error")
+        assert error_elem.text is not None
+        assert "Failed" in error_elem.text
+        assert "control" in error_elem.text
+        # Control chars replaced with Unicode replacement character
+        assert "\x07" not in error_elem.text
+        assert "\x08" not in error_elem.text
+        assert "\x00" not in error_elem.text
+
+    def test_injection_runs_despite_earlier_teardown_failure(self, tmp_path):
+        """Test _inject_failure_junit executes even when prior teardown raises.
+
+        Simulates the conftest.py finally-block pattern: earlier teardown code
+        raises an exception, but inject still runs and writes the synthetic testcase.
+        """
+        pytest_utils_module._failure_info = {
+            "message": "Cluster sanity failed",
+            "log_message": "Sanity check failure details",
+            "return_code": 99,
+        }
+
+        xml_path = tmp_path / "test-results.xml"
+        xml_path.write_text(
+            '<?xml version="1.0" encoding="utf-8"?>'
+            '<testsuites name="pytest tests">'
+            '<testsuite name="pytest" errors="0" failures="0" skipped="0" tests="0" '
+            'time="0.001" timestamp="2026-01-01T00:00:00" hostname="test" />'
+            "</testsuites>"
+        )
+
+        mock_session = MagicMock()
+        mock_session.config.option.xmlpath = str(xml_path)
+
+        # Simulate: earlier teardown raises, then finally block runs injection
+        with pytest.raises(RuntimeError, match="Earlier teardown failed"):
+            try:
+                raise RuntimeError("Earlier teardown failed")
+            finally:
+                pytest_utils_module._inject_failure_junit(session=mock_session)
+
+        tree = ElementTree.parse(xml_path)
+        testsuite = tree.getroot().find("testsuite")
+        testcase = testsuite.find("testcase")
+        assert testcase is not None, "Synthetic testcase must be injected despite earlier failure"
+        assert testcase.get("classname") == "pytest_exit"
+        assert testsuite.get("errors") == "1"
+
+    def test_atomic_write_preserves_original_on_failure(self, tmp_path):
+        """Test _inject_failure_junit preserves the original XML if write fails."""
+        pytest_utils_module._failure_info = {
+            "message": "Test failure",
+            "log_message": "Details",
+            "return_code": 99,
+        }
+
+        xml_path = tmp_path / "test-results.xml"
+        original_content = (
+            '<?xml version="1.0" encoding="utf-8"?>'
+            '<testsuites name="pytest tests">'
+            '<testsuite name="pytest" errors="0" failures="0" skipped="0" tests="0" '
+            'time="0.001" timestamp="2026-01-01T00:00:00" hostname="test" />'
+            "</testsuites>"
+        )
+        xml_path.write_text(original_content)
+
+        mock_session = MagicMock()
+        mock_session.config.option.xmlpath = str(xml_path)
+
+        # Make os.replace fail to simulate atomic write failure
+        with patch("utilities.pytest_utils.os.replace", side_effect=OSError("disk full")):
+            with pytest.raises(OSError, match="disk full"):
+                pytest_utils_module._inject_failure_junit(session=mock_session)
+
+        # Original file should be preserved
+        assert xml_path.exists()
+        content = xml_path.read_text()
+        assert "pytest_exit" not in content, "Original XML should not be modified on write failure"
+
+
+class TestPatchParamikoForFips:
+    def test_get_fingerprint_returns_fips_safe_md5(self, monkeypatch):
+        """patch_paramiko_for_fips patches get_fingerprint to call hashlib.md5 with usedforsecurity=False."""
+        monkeypatch.setattr(paramiko.pkey.PKey, "get_fingerprint", paramiko.pkey.PKey.get_fingerprint)
+        pytest_utils_module.patch_paramiko_for_fips()
+        key = paramiko.RSAKey.generate(bits=2048)
+
+        with patch("utilities.pytest_utils.hashlib.md5") as mock_md5:
+            mock_md5.return_value.digest.return_value = b"\x00" * 16
+            key.get_fingerprint()
+            mock_md5.assert_called_once_with(key.asbytes(), usedforsecurity=False)

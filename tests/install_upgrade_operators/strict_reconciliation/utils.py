@@ -1,24 +1,18 @@
 import logging
 
 from dictdiffer import diff
+from kubernetes.dynamic import DynamicClient
+from ocp_resources.resource import Resource
 from timeout_sampler import TimeoutExpiredError, TimeoutSampler
 
-from tests.install_upgrade_operators.constants import (
-    HCO_CR_CERT_CONFIG_CA_KEY,
-    HCO_CR_CERT_CONFIG_DURATION_KEY,
-    HCO_CR_CERT_CONFIG_RENEW_BEFORE_KEY,
-    HCO_CR_CERT_CONFIG_SERVER_KEY,
-)
-from tests.install_upgrade_operators.strict_reconciliation.constants import (
-    CERTC_DEFAULT_12H,
-    CERTC_DEFAULT_24H,
-    CERTC_DEFAULT_48H,
-)
 from tests.install_upgrade_operators.utils import (
     get_function_name,
     get_network_addon_config,
 )
-from utilities.constants import TIMEOUT_3MIN, TIMEOUT_5SEC
+from utilities.constants.timeouts import (
+    TIMEOUT_3MIN,
+    TIMEOUT_5SEC,
+)
 from utilities.hco import get_hco_spec
 from utilities.infra import get_hyperconverged_resource
 from utilities.storage import get_hyperconverged_cdi
@@ -106,19 +100,6 @@ def compare_expected_with_cr(expected, actual):
             list(diff(expected, actual)),
         )
     )
-
-
-def expected_certconfig_stanza():
-    return {
-        HCO_CR_CERT_CONFIG_CA_KEY: {
-            HCO_CR_CERT_CONFIG_DURATION_KEY: CERTC_DEFAULT_48H,
-            HCO_CR_CERT_CONFIG_RENEW_BEFORE_KEY: CERTC_DEFAULT_24H,
-        },
-        HCO_CR_CERT_CONFIG_SERVER_KEY: {
-            HCO_CR_CERT_CONFIG_DURATION_KEY: CERTC_DEFAULT_24H,
-            HCO_CR_CERT_CONFIG_RENEW_BEFORE_KEY: CERTC_DEFAULT_12H,
-        },
-    }
 
 
 def wait_for_fg_update(admin_client, hco_namespace, expected_fg, validate_func):
@@ -263,11 +244,13 @@ def wait_for_resource_version_update(resource, pre_update_resource_version):
         raise
 
 
-def get_resource_object(resource, resource_name, resource_namespace):
+def get_resource_object(
+    resource: type[Resource], resource_name: str, resource_namespace: str, admin_client: DynamicClient
+) -> Resource:
     if "NamespacedResource" in str(resource.__base__):
-        resource = resource(name=resource_name, namespace=resource_namespace)
+        resource = resource(name=resource_name, namespace=resource_namespace, client=admin_client)
     else:
-        resource = resource(name=resource_name)
+        resource = resource(name=resource_name, client=admin_client)
     assert resource.exists, f"Resource: {resource_name} not found."
     return resource
 

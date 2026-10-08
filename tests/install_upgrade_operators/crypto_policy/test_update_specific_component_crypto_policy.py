@@ -2,6 +2,7 @@ import logging
 from copy import deepcopy
 
 import pytest
+from kubernetes.dynamic import DynamicClient
 from ocp_resources.cdi import CDI
 from ocp_resources.kubevirt import KubeVirt
 from ocp_resources.network_addons_config import NetworkAddonsConfig
@@ -19,13 +20,15 @@ from tests.install_upgrade_operators.crypto_policy.constants import (
 from tests.install_upgrade_operators.crypto_policy.utils import (
     get_resources_crypto_policy_dict,
 )
-from utilities.constants import (
+from utilities.constants.hco import (
     DEFAULT_HCO_CONDITIONS,
-    TIMEOUT_5MIN,
-    TIMEOUT_10SEC,
     TLS_CUSTOM_POLICY,
     TLS_OLD_POLICY,
     TLS_SECURITY_PROFILE,
+)
+from utilities.constants.timeouts import (
+    TIMEOUT_5MIN,
+    TIMEOUT_10SEC,
 )
 from utilities.hco import (
     is_hco_tainted,
@@ -43,13 +46,16 @@ TLS_POLICIES_WITHOUT_CUSTOM_POLICY = {
 }
 
 
-def wait_for_resource_crypto_policy_update(resource, expected_crypto_policy, resources_dict):
+def wait_for_resource_crypto_policy_update(
+    resource: Resource, expected_crypto_policy: dict, resources_dict: dict, admin_client: DynamicClient
+) -> None:
     sampler = TimeoutSampler(
         wait_timeout=TIMEOUT_5MIN,
         sleep=TIMEOUT_10SEC,
         func=get_resources_crypto_policy_dict,
-        resources=[resource],
         resources_dict=resources_dict,
+        admin_client=admin_client,
+        resources=[resource],
     )
     sample = None
     try:
@@ -76,6 +82,7 @@ def updated_cr_with_custom_crypto_policy(
     value = request.param["value"]
     tls_policy = {**value, **TLS_POLICIES_WITHOUT_CUSTOM_POLICY}
     with update_hco_annotations(
+        admin_client=admin_client,
         resource=hyperconverged_resource_scope_function,
         path=request.param["key"],
         value=tls_policy,
@@ -87,7 +94,7 @@ def updated_cr_with_custom_crypto_policy(
             hco_namespace=hco_namespace,
             expected_conditions={
                 **DEFAULT_HCO_CONDITIONS,
-                **{"TaintedConfiguration": Resource.Condition.Status.TRUE},
+                "TaintedConfiguration": Resource.Condition.Status.TRUE,
             },
         )
         yield {"resource": resource, "tls_policy": value}
@@ -141,6 +148,7 @@ def updated_cr_with_custom_crypto_policy(
     indirect=["updated_cr_with_custom_crypto_policy"],
 )
 def test_update_specific_component_crypto_policy(
+    admin_client,
     resources_dict,
     updated_cr_with_custom_crypto_policy,
 ):
@@ -148,4 +156,5 @@ def test_update_specific_component_crypto_policy(
         resource=updated_cr_with_custom_crypto_policy["resource"],
         expected_crypto_policy=updated_cr_with_custom_crypto_policy["tls_policy"],
         resources_dict=resources_dict,
+        admin_client=admin_client,
     )

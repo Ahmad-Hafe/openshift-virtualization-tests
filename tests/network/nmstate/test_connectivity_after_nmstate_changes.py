@@ -5,24 +5,21 @@ import pytest
 from ocp_resources.resource import ResourceEditor
 from timeout_sampler import TimeoutSampler
 
-from tests.network.libs.ip import random_ipv4_address
+from libs.net.ip import random_ipv4_address
+from libs.net.vmspec import lookup_iface_status_ip
+from tests.network.nmstate.libnmstate import NMSTATE_HANDLER
 from tests.network.utils import (
     assert_nncp_successfully_configured,
     assert_ssh_alive,
     run_ssh_in_background,
 )
-from utilities.constants import (
-    LINUX_BRIDGE,
-    NMSTATE_HANDLER,
-    TIMEOUT_1MIN,
-    TIMEOUT_5SEC,
-)
+from utilities.constants.networking import LINUX_BRIDGE
+from utilities.constants.timeouts import TIMEOUT_1MIN, TIMEOUT_5SEC
 from utilities.data_utils import name_prefix
 from utilities.infra import get_node_selector_dict, get_pod_by_name_prefix
 from utilities.network import (
     assert_ping_successful,
     compose_cloud_init_data_dict,
-    get_vmi_ip_v4_by_name,
     is_destination_pingable_from_vm,
     network_device,
     network_nad,
@@ -36,7 +33,7 @@ BRIDGE_NAME = "br-nmstate"
 def restart_nmstate_handler(admin_client, nmstate_ds, nmstate_namespace):
     LOGGER.info("Delete NMstate PODs")
     for pod in get_pod_by_name_prefix(
-        dyn_client=admin_client,
+        client=admin_client,
         pod_prefix=NMSTATE_HANDLER,
         namespace=nmstate_namespace.name,
         get_all=True,
@@ -46,26 +43,30 @@ def restart_nmstate_handler(admin_client, nmstate_ds, nmstate_namespace):
 
 
 @pytest.fixture(scope="class")
-def nmstate_linux_bridge_device_worker_1(admin_client, nodes_available_nics, worker_node1):
+def nmstate_linux_bridge_device_worker_1(
+    nmstate_dependent_placeholder, admin_client, hosts_common_available_ports, worker_node1
+):
     with network_device(
         interface_type=LINUX_BRIDGE,
         nncp_name=f"restart-nmstate-{name_prefix(worker_node1.name)}",
         interface_name=BRIDGE_NAME,
         node_selector=get_node_selector_dict(node_selector=worker_node1.hostname),
-        ports=[nodes_available_nics[worker_node1.name][-1]],
+        ports=[hosts_common_available_ports[-1]],
         client=admin_client,
     ) as br_dev:
         yield br_dev
 
 
 @pytest.fixture(scope="class")
-def nmstate_linux_bridge_device_worker_2(admin_client, nodes_available_nics, worker_node2):
+def nmstate_linux_bridge_device_worker_2(
+    nmstate_dependent_placeholder, admin_client, hosts_common_available_ports, worker_node2
+):
     with network_device(
         interface_type=LINUX_BRIDGE,
         nncp_name=f"restart-nmstate-{name_prefix(worker_node2.name)}",
         interface_name=BRIDGE_NAME,
         node_selector=get_node_selector_dict(node_selector=worker_node2.hostname),
-        ports=[nodes_available_nics[worker_node2.name][-1]],
+        ports=[hosts_common_available_ports[-1]],
         client=admin_client,
     ) as br_dev:
         yield br_dev
@@ -100,7 +101,7 @@ def nmstate_linux_bridge_attached_vma(
     networks[nmstate_linux_nad.name] = nmstate_linux_nad.name
     network_data_data = {
         "ethernets": {
-            "eth1": {"addresses": [f"{random_ipv4_address(net_seed=0, host_address=1)}/24"]},
+            "eth1": {"addresses": [str(random_ipv4_address(net_seed=0, host_address=1))]},
         }
     }
 
@@ -134,7 +135,7 @@ def nmstate_linux_bridge_attached_vmb(
     networks[nmstate_linux_nad.name] = nmstate_linux_nad.name
     network_data_data = {
         "ethernets": {
-            "eth1": {"addresses": [f"{random_ipv4_address(net_seed=0, host_address=2)}/24"]},
+            "eth1": {"addresses": [str(random_ipv4_address(net_seed=0, host_address=2))]},
         }
     }
 
@@ -170,14 +171,19 @@ def nmstate_linux_bridge_attached_running_vmb(nmstate_linux_bridge_attached_vmb)
 
 @pytest.fixture(scope="class")
 def vma_src_ip(nmstate_linux_nad, nmstate_linux_bridge_attached_running_vma):
-    return str(get_vmi_ip_v4_by_name(vm=nmstate_linux_bridge_attached_running_vma, name=nmstate_linux_nad.name))
+    return str(
+        lookup_iface_status_ip(
+            vm=nmstate_linux_bridge_attached_running_vma, iface_name=nmstate_linux_nad.name, ip_family=4
+        )
+    )
 
 
 @pytest.fixture(scope="class")
 def vmb_dst_ip(nmstate_linux_nad, nmstate_linux_bridge_attached_running_vmb):
-    return get_vmi_ip_v4_by_name(
+    return lookup_iface_status_ip(
         vm=nmstate_linux_bridge_attached_running_vmb,
-        name=nmstate_linux_nad.name,
+        iface_name=nmstate_linux_nad.name,
+        ip_family=4,
     )
 
 
@@ -225,7 +231,7 @@ def nncp_ready(nmstate_linux_bridge_device_worker_1, nmstate_linux_bridge_device
 
 @pytest.fixture()
 def modified_nncp(
-    nodes_available_nics,
+    hosts_common_available_ports,
     worker_node1,
     worker_node2,
     nmstate_linux_bridge_device_worker_1,
@@ -234,9 +240,9 @@ def modified_nncp(
     nncps = [nmstate_linux_bridge_device_worker_1, nmstate_linux_bridge_device_worker_2]
     for nncp, worker_node in zip(nncps, [worker_node1, worker_node2]):
         interfaces = nncp.desired_state["interfaces"]
-        interfaces[0]["bridge"]["port"][0]["name"] = nodes_available_nics[worker_node.name][
+        interfaces[0]["bridge"]["port"][0]["name"] = hosts_common_available_ports[
             -2
-        ]  # NNCP was created with nodes_available_nics[-1]
+        ]  # NNCP was created with hosts_common_available_ports[-1]
         ResourceEditor(
             patches={
                 nncp: {
@@ -273,11 +279,9 @@ class TestConnectivityAfterNmstateChanged:
                 nmstate_ds=nmstate_ds,
             )
             LOGGER.info(
-                (
-                    f"Check connectivity from {nmstate_linux_bridge_attached_running_vma.name} "
-                    f"to {nmstate_linux_bridge_attached_running_vmb.name} "
-                    f"IP {vmb_dst_ip}. NMstate restart number: {idx + 1}"
-                )
+                f"Check connectivity from {nmstate_linux_bridge_attached_running_vma.name} "
+                f"to {nmstate_linux_bridge_attached_running_vmb.name} "
+                f"IP {vmb_dst_ip}. NMstate restart number: {idx + 1}"
             )
 
             assert_ping_successful(

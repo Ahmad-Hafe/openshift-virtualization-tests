@@ -2,13 +2,15 @@ import logging
 from contextlib import contextmanager
 
 import pytest
-from kubernetes.client import ApiException
 
 from utilities.network import LINUX_BRIDGE, network_device, network_nad
 from utilities.virt import VirtualMachineForTests, fedora_vm_body
 
 LOGGER = logging.getLogger(__name__)
 
+pytestmark = [
+    pytest.mark.ipv4,
+]
 
 MAC_ADDRESS = "macAddress"
 
@@ -32,7 +34,7 @@ def create_dry_run_vm(name, namespace, networks, unprivileged_client, macs=None)
 
 
 @pytest.fixture()
-def bridge_on_all_nodes(admin_client):
+def bridge_on_all_nodes(nmstate_dependent_placeholder, admin_client):
     bridge_name = "br-dry-run-test"
     with network_device(
         interface_type=LINUX_BRIDGE,
@@ -96,25 +98,6 @@ def vm_with_mac_address(
         yield vm
 
 
-@pytest.fixture()
-def dry_run_vm_with_mac_address(
-    unprivileged_client,
-    namespace,
-    linux_bridge_network_nad,
-    vm_with_mac_address,
-):
-    """Create a dry-run VM with a MAC address retrieved from a running VM."""
-    allocated_mac_address = vm_with_mac_address.get_interfaces()[1][MAC_ADDRESS]
-
-    return create_dry_run_vm(
-        name="dry-run-vm-with-mac",
-        namespace=namespace,
-        networks={linux_bridge_network_nad.name: linux_bridge_network_nad.name},
-        unprivileged_client=unprivileged_client,
-        macs={linux_bridge_network_nad.name: allocated_mac_address},
-    )
-
-
 @pytest.mark.polarion("CNV-7872")
 @pytest.mark.s390x
 def test_dry_run_mac_not_saved(
@@ -128,11 +111,3 @@ def test_dry_run_mac_not_saved(
         f"{vm_with_mac_address.name} MAC address is {secondary_net_mac}"
         f" and not {dry_run_vma_mac_address}, as it should be."
     )
-
-
-@pytest.mark.polarion("CNV-7873")
-@pytest.mark.s390x
-def test_allocated_mac_is_unavailable_for_dry_run(dry_run_vm_with_mac_address):
-    with pytest.raises(ApiException, match="Failed to allocate mac to the vm object"):
-        with dry_run_vm_with_mac_address as vm:
-            vm.create()

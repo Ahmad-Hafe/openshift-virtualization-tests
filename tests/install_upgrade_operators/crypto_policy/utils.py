@@ -1,10 +1,15 @@
 import logging
 from contextlib import contextmanager
+from typing import TYPE_CHECKING
 
 import deepdiff
 from benedict import benedict
+from kubernetes.client.exceptions import ApiException
+from kubernetes.dynamic import DynamicClient
 from ocp_resources.hyperconverged import HyperConverged
-from ocp_resources.resource import ResourceEditor
+from ocp_resources.node import Node
+from ocp_resources.resource import Resource, ResourceEditor
+from ocp_resources.service import Service
 from packaging.version import Version
 from timeout_sampler import TimeoutExpiredError, TimeoutSampler
 
@@ -17,25 +22,32 @@ from tests.install_upgrade_operators.crypto_policy.constants import (
     CRYPTO_POLICY_EXPECTED_DICT,
     MANAGED_CRS_LIST,
     MIN_TLS_VERSIONS,
+    OPENSSL_CONNECTION_SUCCESS_INDICATOR,
+    PQC_HANDSHAKE_FAILURE_INDICATOR,
     TLS_INTERMEDIATE_CIPHERS_IANA_OPENSSL_SYNTAX,
 )
 from tests.install_upgrade_operators.utils import (
     get_resource_by_name,
     get_resource_key_value,
 )
-from utilities.constants import (
-    CLUSTER,
+from utilities.constants.components import CLUSTER
+from utilities.constants.hco import TLS_SECURITY_PROFILE
+from utilities.constants.timeouts import (
     TIMEOUT_2MIN,
-    TLS_SECURITY_PROFILE,
+    TIMEOUT_60MIN,
 )
 from utilities.hco import ResourceEditorValidateHCOReconcile, wait_for_hco_conditions
 from utilities.infra import ExecCommandOnPod
 from utilities.operator import wait_for_cluster_operator_stabilize
 
+if TYPE_CHECKING:
+    from kubernetes.dynamic.resource import ResourceField
 LOGGER = logging.getLogger(__name__)
 
 
-def get_resource_crypto_policy(resource, name, key_name, namespace=None):
+def get_resource_crypto_policy(
+    resource: Resource, name: str, key_name: str, admin_client: DynamicClient, namespace: str | None = None
+) -> dict | None:
     """
     This function is used to get crypto policy settings associated with a resource
 
@@ -44,17 +56,22 @@ def get_resource_crypto_policy(resource, name, key_name, namespace=None):
         name (str): name of a resource
         key_name (str): full key path with separator
         namespace (str, optional): namespace for the resource
+        admin_client (DynamicClient): Dynamic client object
 
     Returns:
-        dict: crypto policy settings value associated with the resource
+        dict | None: crypto policy settings value associated with the resource
     """
     return get_resource_key_value(
         key_name=key_name,
-        resource=get_resource_by_name(resource_kind=resource, name=name, namespace=namespace),
+        resource=get_resource_by_name(
+            resource_kind=resource, name=name, admin_client=admin_client, namespace=namespace
+        ),
     )
 
 
-def get_resources_crypto_policy_dict(resources_dict, resources=MANAGED_CRS_LIST):
+def get_resources_crypto_policy_dict(
+    resources_dict: dict, admin_client: DynamicClient, resources: list[Resource] = MANAGED_CRS_LIST
+) -> dict:
     """
     This function collects crypto policy corresponding to each resources in the list
     'resources'
@@ -62,6 +79,7 @@ def get_resources_crypto_policy_dict(resources_dict, resources=MANAGED_CRS_LIST)
     Args:
         resources_dict (dict): Dict containing resource name, key_name, namespace
         resources (list): List of resource objects whose TLS policies are required
+        admin_client (DynamicClient): Dynamic client object
 
     Returns:
         dict: crypto policy settings value for each resource in 'resources'
@@ -71,46 +89,69 @@ def get_resources_crypto_policy_dict(resources_dict, resources=MANAGED_CRS_LIST)
             resource=resource,
             name=resources_dict[resource][RESOURCE_NAME_STR],
             key_name=resources_dict[resource][KEY_NAME_STR],
+            admin_client=admin_client,
             namespace=resources_dict[resource].get(RESOURCE_NAMESPACE_STR),
         )
         for resource in resources
     }
 
 
-def wait_for_crypto_policy_update(resource, resource_namespace, resource_name, key_name, expected_policy):
+def wait_for_crypto_policy_update(
+    resource: Resource,
+    resource_namespace: str,
+    resource_name: str,
+    key_name: str,
+    expected_policy: dict,
+    admin_client: DynamicClient,
+) -> str | None:
     sampler = TimeoutSampler(
         wait_timeout=TIMEOUT_2MIN,
         sleep=2,
         func=get_resource_crypto_policy,
         resource=resource,
-        namespace=resource_namespace,
         name=resource_name,
         key_name=key_name,
+        admin_client=admin_client,
+        namespace=resource_namespace,
     )
     sample = None
     try:
         for sample in sampler:
             # TODO: remove log message once the test and feature deemed to be stable
             LOGGER.info(f"{resource_name} actual: {sample}, expected: {expected_policy}")
-            if sample and not deepdiff.DeepDiff(
-                sample,
+            # Filter actual to only keys present in expected — OCP 4.22+ API adds empty
+            # profile-type keys (e.g. intermediate: {}, modern: {}) as CRD defaults.
+            filtered_sample = (
+                {
+                    policy_key: policy_value
+                    for policy_key, policy_value in sample.items()
+                    if policy_key in expected_policy
+                }
+                if sample
+                else sample
+            )
+            if filtered_sample and not deepdiff.DeepDiff(
+                filtered_sample,
                 expected_policy,
                 ignore_type_in_groups=[(benedict, dict)],
             ):
-                return
+                return None
     except TimeoutExpiredError:
         error_message = (
             f"For resource {resource} {resource_name}, expected policy {expected_policy}, did not match {sample} "
         )
         LOGGER.error(error_message)
         return error_message
+    return None
 
 
 def assert_crypto_policy_propagated_to_components(
-    crypto_policy,
-    resources_dict,
-    updated_resource_kind,
-):
+    crypto_policy: str,
+    resources_dict: dict,
+    updated_resource_kind: str,
+    admin_client: DynamicClient,
+    managed_crs_list: list[Resource] | None = None,
+) -> None:
     """
     This function is used to assert whether the updated crypto policy settings
     propagated to all CNV components - CDI, KubeVirt, CNAO & SSP
@@ -121,13 +162,15 @@ def assert_crypto_policy_propagated_to_components(
                                in dict
         updated_resource_kind (str): Resource kind of the updated resource
             ( HyperConverged or APIServer )
+        admin_client (DynamicClient): Dynamic client object
 
     Raises:
         AssertionError: When TLS crypto policy of HCO managed CRs(KubeVirt, SSP, CNAO
         & CDI) doesn't match with the expected 'crypto_policy'
     """
     conflicting_resources = []
-    for resource in MANAGED_CRS_LIST:
+    selected_managed_crs = managed_crs_list if managed_crs_list else MANAGED_CRS_LIST
+    for resource in selected_managed_crs:
         expected_value = CRYPTO_POLICY_EXPECTED_DICT[crypto_policy][resource]
         error_message = wait_for_crypto_policy_update(
             resource=resource,
@@ -135,6 +178,7 @@ def assert_crypto_policy_propagated_to_components(
             resource_name=resources_dict[resource][RESOURCE_NAME_STR],
             key_name=resources_dict[resource][KEY_NAME_STR],
             expected_policy=expected_value,
+            admin_client=admin_client,
         )
         if error_message:
             conflicting_resources.append(resource.kind)
@@ -144,11 +188,14 @@ def assert_crypto_policy_propagated_to_components(
     )
 
 
-def assert_no_crypto_policy_in_hco(crypto_policy, hco_namespace, hco_name):
+def assert_no_crypto_policy_in_hco(
+    crypto_policy: str, hco_namespace: str, hco_name: str, admin_client: DynamicClient
+) -> None:
     hco_crypto_policy = get_resource_crypto_policy(
         resource=HyperConverged,
         name=hco_name,
-        key_name=TLS_SECURITY_PROFILE,
+        key_name=f"security->{TLS_SECURITY_PROFILE}",
+        admin_client=admin_client,
         namespace=hco_namespace,
     )
     assert not hco_crypto_policy, (
@@ -194,7 +241,7 @@ def assert_tls_version_connection(utility_pods, node, services, minimal_version,
 def assert_tls_ciphers_blocked(utility_pods, node, services, tls_version, allowed_ciphers):
     failed_service = {}
     for service in services:
-        service_name = service.instance.metadata.name
+        service_name = service.name
         service_spec = service.instance.spec
         LOGGER.info(f"Checking service: {service_name}")
         for cipher_openssl in TLS_INTERMEDIATE_CIPHERS_IANA_OPENSSL_SYNTAX.values():
@@ -216,9 +263,10 @@ def assert_tls_ciphers_blocked(utility_pods, node, services, tls_version, allowe
 
 
 @contextmanager
-def set_hco_crypto_policy(hco_resource, tls_spec):
+def set_hco_crypto_policy(admin_client, hco_resource, tls_spec):
     with ResourceEditorValidateHCOReconcile(
-        patches={hco_resource: {"spec": {TLS_SECURITY_PROFILE: tls_spec}}},
+        admin_client=admin_client,
+        patches={hco_resource: {"spec": {"security": {TLS_SECURITY_PROFILE: tls_spec}}}},
         wait_for_reconcile_post_update=True,
         list_resource_reconcile=MANAGED_CRS_LIST,
     ):
@@ -236,9 +284,122 @@ def update_apiserver_crypto_policy(
         patches={apiserver: {"spec": {TLS_SECURITY_PROFILE: tls_spec}}},
     ):
         yield
-    wait_for_cluster_operator_stabilize(admin_client=admin_client)
+    wait_for_cluster_operator_stabilize(admin_client=admin_client, wait_timeout=TIMEOUT_60MIN)
     wait_for_hco_conditions(
         admin_client=admin_client,
         hco_namespace=hco_namespace,
         list_dependent_crs_to_check=MANAGED_CRS_LIST,
     )
+
+
+def check_service_accepts_tls_version(utility_pods: list, node: Node, service: Resource, tls_version: str) -> bool:
+    """Checks whether a service accepts a connection with the given TLS version.
+
+    Retries on transient API failures (e.g. node unavailability during TLS rollover).
+
+    Args:
+        utility_pods: List of utility pods for command execution.
+        node: Node resource to run the command from.
+        service: Service resource to connect to.
+        tls_version: TLS version string (e.g. "1.2", "1.3").
+
+    Returns:
+        bool: True if the service accepted the TLS connection.
+    """
+    command = compose_openssl_command(
+        service_spec=service.instance.spec,
+        version=tls_version,
+        extra_arguments="| grep 'Protocol version:'",
+    )
+    sampler = TimeoutSampler(
+        wait_timeout=TIMEOUT_2MIN,
+        sleep=10,
+        func=ExecCommandOnPod(utility_pods=utility_pods, node=node).exec,
+        exceptions_dict={ApiException: []},
+        command=command,
+        ignore_rc=True,
+    )
+    for output in sampler:
+        return tls_version in output
+    return False
+
+
+def get_node_available_tls_groups(utility_pods: list, node: Node) -> list[str]:
+    """Returns the list of TLS groups supported by OpenSSL on the given node.
+
+    Args:
+        utility_pods: List of utility pods for command execution.
+        node: Node resource to query.
+
+    Returns:
+        list[str]: TLS group names available on the node.
+    """
+    output = ExecCommandOnPod(utility_pods=utility_pods, node=node).exec(
+        command="openssl list -tls-groups",
+    )
+    return [group.strip() for group in output.strip().split(":") if group.strip()]
+
+
+def compose_openssl_pqc_command(service_spec: ResourceField, groups: str, connect_timeout: int = 10) -> str:
+    """Builds an openssl s_client command with PQC group negotiation.
+
+    Args:
+        service_spec: Service spec object with clusterIP and ports.
+        groups: Colon-separated TLS group names to offer (e.g. "SecP256r1MLKEM768:secp256r1").
+        connect_timeout: Timeout in seconds for the TLS connection attempt.
+
+    Returns:
+        str: The openssl command string.
+    """
+    return (
+        f"echo | timeout {connect_timeout}"
+        f" openssl s_client -connect {service_spec.clusterIP}:{service_spec.ports[0].port} -groups {groups} 2>&1"
+    )
+
+
+def get_services_pqc_status(
+    worker_exec: ExecCommandOnPod,
+    services: list[Service],
+    pqc_groups: list[str],
+) -> dict[str, bool | None]:
+    """Probes each service for PQC key exchange acceptance.
+
+    Tries each PQC group in order and accepts if any group negotiates successfully.
+
+    Args:
+        worker_exec: ExecCommandOnPod instance for running commands on a worker node.
+        services: List of Service resources to check.
+        pqc_groups: List of PQC group names to try (e.g. ["X25519MLKEM768", "SecP256r1MLKEM768"]).
+
+    Returns:
+        dict[str, bool | None]: Mapping of service name to PQC status:
+            True = accepted PQC, False = rejected PQC, None = unreachable.
+    """
+    results: dict[str, bool | None] = {}
+    for service in services:
+        service_name = service.name
+        LOGGER.info(f"Probing PQC on service: {service_name}")
+        accepted = False
+        unreachable = True
+        for group in pqc_groups:
+            command = compose_openssl_pqc_command(
+                service_spec=service.instance.spec,
+                groups=group,
+            )
+            output = worker_exec.exec(command=command, ignore_rc=True)
+            if OPENSSL_CONNECTION_SUCCESS_INDICATOR not in output and PQC_HANDSHAKE_FAILURE_INDICATOR not in output:
+                continue
+            unreachable = False
+            if PQC_HANDSHAKE_FAILURE_INDICATOR not in output:
+                LOGGER.info(f"Service {service_name} accepts PQC ({group})")
+                accepted = True
+                break
+        if unreachable:
+            LOGGER.warning(f"Service {service_name} is unreachable during PQC probe")
+            results[service_name] = None
+        elif accepted:
+            results[service_name] = True
+        else:
+            LOGGER.warning(f"Service {service_name} rejected all PQC groups: {pqc_groups}")
+            results[service_name] = False
+    return results

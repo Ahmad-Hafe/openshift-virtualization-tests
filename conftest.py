@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """
 Pytest conftest file for CNV tests
 """
@@ -21,45 +20,101 @@ from _pytest.nodes import Collector, Node
 from _pytest.reports import CollectReport, TestReport
 from _pytest.runner import CallInfo
 from kubernetes.dynamic.exceptions import ConflictError
+from ocp_resources.network_config_openshift_io import Network
+from packaging.version import Version
 from pyhelper_utils.shell import run_command
 from pytest import Item
 from pytest_testconfig import config as py_config
 
 import utilities.cluster
-import utilities.infra
+
+# TODO: Remove this import when utilities modules are refactored...
+import utilities.infra  # noqa
 from libs.storage.config import StorageClassConfig
 from utilities.bitwarden import get_cnv_tests_secret_by_name
-from utilities.constants import (
+from utilities.constants.architecture import AMD_64
+from utilities.constants.namespaces import NamespacesNames
+from utilities.constants.pytest import (
     QUARANTINED,
     SETUP_ERROR,
-    TIMEOUT_5MIN,
-    X86_64,
-    NamespacesNames,
 )
+from utilities.constants.timeouts import TIMEOUT_5MIN
 from utilities.data_collector import (
     collect_default_cnv_must_gather_with_vm_gather,
     get_data_collector_dir,
+    get_scope_identifier,
     set_data_collector_directory,
     set_data_collector_values,
 )
 from utilities.database import Database
 from utilities.exceptions import MissingEnvironmentVariableError, StorageSanityError
+from utilities.junit_ai_utils import enrich_junit_xml, setup_ai_analysis
 from utilities.logger import setup_logging
 from utilities.pytest_utils import (
+    _inject_failure_junit,
+    assert_incremental_classes_fully_collected,
     config_default_storage_class,
     deploy_run_in_progress_config_map,
     deploy_run_in_progress_namespace,
+    filter_hpp_tests,
+    filter_multiarch_tests,
+    filter_ocs_tests,
+    filter_post_test_alerts_tests,
     get_artifactory_server_url,
     get_base_matrix_name,
     get_cnv_version_explorer_url,
     get_matrix_params,
     get_tests_cluster_markers,
+    mark_nmstate_dependent_tests,
+    patch_paramiko_for_fips,
+    remove_tests_from_list,
     reorder_early_fixtures,
     run_in_progress_config_map,
     separator,
     skip_if_pytest_flags_exists,
     stop_if_run_in_progress,
+    update_cpu_arch_related_config,
+    update_latest_os_config,
+    validate_collected_tests_arch_params,
 )
+
+pytest_plugins = [
+    "tests.fixtures.cluster.auth",
+    "tests.fixtures.cluster.binaries",
+    "tests.fixtures.cluster.cpu",
+    "tests.fixtures.cluster.infrastructure",
+    "tests.fixtures.cluster.namespaces",
+    "tests.fixtures.cluster.nodes",
+    "tests.fixtures.cluster.sanity",
+    "tests.fixtures.cluster.utilities",
+    "tests.fixtures.network.l2_bridge",
+    "tests.fixtures.network.cluster",
+    "tests.fixtures.images.validation_os_images",
+    "tests.fixtures.network.multiarch",
+    "tests.fixtures.credentials.artifacts",
+    "tests.fixtures.credentials.rhsm",
+    "tests.fixtures.operator.aaq",
+    "tests.fixtures.operator.cdi",
+    "tests.fixtures.operator.csv",
+    "tests.fixtures.operator.hco",
+    "tests.fixtures.operator.kubevirt",
+    "tests.fixtures.operator.ssp",
+    "tests.fixtures.network.node_nics",
+    "tests.fixtures.network.mac_pool",
+    "tests.fixtures.network.nmstate",
+    "tests.fixtures.network.sriov",
+    "tests.fixtures.storage.storage_classes",
+    "tests.fixtures.images.golden_images",
+    "tests.fixtures.storage.data_volumes",
+    "tests.fixtures.observability.monitoring",
+    "tests.fixtures.virt.instance_types",
+    "tests.fixtures.virt.migration",
+    "tests.fixtures.virt.osinfo",
+    "tests.fixtures.virt.ssh",
+    "tests.fixtures.virt.templates",
+    "tests.fixtures.virt.virtual_machines",
+    "tests.fixtures.virt.vm_actions",
+]
 
 LOGGER = logging.getLogger(__name__)
 BASIC_LOGGER = logging.getLogger("basic")
@@ -74,27 +129,28 @@ EXCLUDE_MARKER_FROM_TIER2_MARKER = [
     "sap_hana",
     "scale",
     "longevity",
-    "ovs_brcnv",
     "node_remediation",
     "swap",
     "numa",
-    "bgp",
     "cclm",
+    "mtv",
+    "multiarch",
+    "mixed_os_nodes",
 ]
 
 TEAM_MARKERS = {
     "chaos": ["chaos", "deprecated_api"],
-    "virt": ["virt", "deprecated_api"],
-    "network": ["network", "deprecated_api"],
-    "storage": ["storage", "deprecated_api"],
-    "iuo": ["install_upgrade_operators", "deprecated_api"],
-    "observability": ["observability", "deprecated_api"],
-    "infrastructure": ["infrastructure", "deprecated_api"],
-    "data_protection": ["data_protection", "deprecated_api"],
+    "virt": ["virt", "deprecated_api", "post_test_alerts"],
+    "network": ["network", "deprecated_api", "post_test_alerts"],
+    "storage": ["storage", "deprecated_api", "post_test_alerts"],
+    "iuo": ["install_upgrade_operators", "deprecated_api", "post_test_alerts"],
+    "observability": ["observability", "deprecated_api", "post_test_alerts"],
+    "infrastructure": ["infrastructure", "deprecated_api", "post_test_alerts"],
+    "data_protection": ["data_protection", "deprecated_api", "post_test_alerts"],
 }
 NAMESPACE_COLLECTION = {
     "storage": [NamespacesNames.OPENSHIFT_STORAGE],
-    "network": [NamespacesNames.OPENSHIFT_NMSTATE],
+    "network": [],
     "virt": [],
 }
 MUST_GATHER_IGNORE_EXCEPTION_LIST = [
@@ -108,6 +164,7 @@ INSPECT_BASE_COMMAND = "oc adm inspect"
 def pytest_addoption(parser):
     matrix_group = parser.getgroup(name="Matrix")
     os_group = parser.getgroup(name="OS")
+    arch_group = parser.getgroup(name="Architecture")
     install_upgrade_group = parser.getgroup(name="Upgrade")
     storage_group = parser.getgroup(name="Storage")
     cluster_sanity_group = parser.getgroup(name="ClusterSanity")
@@ -116,9 +173,10 @@ def pytest_addoption(parser):
     leftovers_collector = parser.getgroup(name="LeftoversCollector")
     scale_group = parser.getgroup(name="Scale")
     session_group = parser.getgroup(name="Session")
-    csv_group = parser.getgroup(name="CSV")
     ci_group = parser.getgroup(name="CI")
-    csv_group.addoption("--update-csv", action="store_true")
+    component_sanity_group = parser.getgroup(name="ComponentSanity")
+    ai_insights_group = parser.getgroup(name="ai-job-insight")
+    post_test_alerts_group = parser.getgroup(name="PostTestAlerts")
 
     # Upgrade addoption
     install_upgrade_group.addoption(
@@ -159,7 +217,6 @@ def pytest_addoption(parser):
         "--eus-ocp-images",
         help="Comma-separated OCP images to use for EUS-to-EUS upgrade.",
     )
-    install_upgrade_group.addoption("--eus-cnv-target-version", help="target CNV version for eus upgrade")
     install_upgrade_group.addoption(
         "--upgrade-skip-default-sc-setup",
         help="Skip the fixture that changes the default sc in upgrade lane",
@@ -173,7 +230,6 @@ def pytest_addoption(parser):
     )
     # Matrix addoption
     matrix_group.addoption("--storage-class-matrix", help="Storage class matrix to use")
-    matrix_group.addoption("--bridge-device-matrix", help="Bridge device matrix to use")
     matrix_group.addoption("--rhel-os-matrix", help="RHEL OS matrix to use")
     matrix_group.addoption("--windows-os-matrix", help="Windows OS matrix to use")
     matrix_group.addoption("--fedora-os-matrix", help="Fedora OS matrix to use")
@@ -206,6 +262,15 @@ def pytest_addoption(parser):
         "--latest-centos",
         action="store_true",
         help="Run matrix tests with latest CentOS",
+    )
+
+    arch_group.addoption(
+        "--cpu-arch",
+        help="""
+             CPU architecture to use when running tests on heterogeneous clusters.
+             Single arch (e.g. amd64) or comma-separated combination (e.g. amd64,arm64).
+             Defines what OS matrix params to use and what CPU architecture to use for VMs.
+             """,
     )
 
     # Storage addoption
@@ -251,6 +316,16 @@ def pytest_addoption(parser):
         help="Skip cluster_sanity check",
         action="store_true",
     )
+    cluster_sanity_group.addoption(
+        "--cluster-sanity-skip-webhook-check",
+        help="Skip webhook health check in cluster_sanity fixture",
+        action="store_true",
+    )
+    cluster_sanity_group.addoption(
+        "--cluster-sanity-skip-hco-taint-check",
+        help="Skip HCO TaintedConfiguration check in cluster_sanity fixture",
+        action="store_true",
+    )
     # Log collector group
     data_collector_group.addoption(
         "--data-collector",
@@ -271,6 +346,13 @@ def pytest_addoption(parser):
     deprecate_api_test_group.addoption(
         "--skip-deprecated-api-test",
         help="By default test_deprecation_audit_logs will always run, pass this flag to skip it",
+        action="store_true",
+    )
+
+    # Post test alerts group
+    post_test_alerts_group.addoption(
+        "--skip-post-test-alerts",
+        help="Skip test_no_deprecated_api_alert_after_tests (also skipped with --install)",
         action="store_true",
     )
 
@@ -301,12 +383,7 @@ def pytest_addoption(parser):
         default=False,
         help="Skip artifactory environment variable checks. To be used for tests that does not need articatory access",
     )
-    session_group.addoption(
-        "--skip-virt-sanity-check",
-        action="store_true",
-        default=False,
-        help="Skip verification that cluster has all required capabilities for virt special_infra marked tests",
-    )
+
     session_group.addoption(
         "--remote_cluster_host",
         help="Host address of the remote cluster for cross-cluster tests",
@@ -318,6 +395,13 @@ def pytest_addoption(parser):
     session_group.addoption(
         "--remote_cluster_password",
         help="Password for the remote cluster for cross-cluster tests",
+    )
+    session_group.addoption(
+        "--network-for-live-migration",
+        help=(
+            "Network name for live migration in cross-cluster tests. "
+            "If not provided, HCO's liveMigrationConfig.network will not be set by the tests setup"
+        ),
     )
 
     # CI group
@@ -337,6 +421,27 @@ def pytest_addoption(parser):
         default=False,
     )
 
+    component_sanity_group.addoption(
+        "--skip-virt-sanity-check",
+        action="store_true",
+        default=False,
+        help="Skip virtualization infrastructure sanity checks",
+    )
+    component_sanity_group.addoption(
+        "--skip-infra-sanity-check",
+        action="store_true",
+        default=False,
+        help="Skip infrastructure prerequisite sanity checks",
+    )
+
+    # AI
+    ai_insights_group.addoption(
+        "--analyze-with-ai",
+        action="store_true",
+        default=False,
+        help="Enrich JUnit XML with AI-powered analysis from jenkins-job-insight. `JJI_SERVER_URL` env var is required",
+    )
+
 
 def pytest_cmdline_main(config):
     # TODO: Reduce cognitive complexity
@@ -347,18 +452,21 @@ def pytest_cmdline_main(config):
     if upgrade_option == "ocp" and not config.getoption("ocp_image"):
         raise ValueError("Running with --upgrade ocp: Missing --ocp-image")
 
-    if upgrade_option == "cnv":
+    if upgrade_option in ("cnv", "eus"):
         if not config.getoption("cnv_version"):
             raise ValueError("Missing --cnv-version")
         if not config.getoption("cnv_image"):
-            if config.getoption("cnv_source") != "production":
+            if upgrade_option == "eus" or config.getoption("cnv_source") != "production":
                 raise ValueError("Missing --cnv-image")
 
-    if upgrade_option == "eus":
+    if upgrade_option == "eus" and not config.option.collectonly:
+        cnv_version = config.getoption("cnv_version")
+        if Version(version=cnv_version).minor % 2:
+            raise ValueError(f"EUS target version {cnv_version} must have an even minor version")
         eus_ocp_images = config.getoption("eus_ocp_images")
         if not (eus_ocp_images and len(eus_ocp_images.split(",")) == 2):
             raise ValueError(
-                f"Two OCP images are needed to perform EUS-to-EUS upgrade with --eus-ocp-images."
+                f"Two OCP images are needed for EUS-to-EUS upgrade with --eus-ocp-images."
                 f" Provided images: {eus_ocp_images}"
             )
 
@@ -435,13 +543,15 @@ def filter_upgrade_tests(
     items: list[Item],
     config: Config,
 ) -> tuple[list[Item], list[Item]]:
-    upgrade_tests, non_upgrade_tests = [], []
+    upgrade_tests, non_upgrade_tests, always_keep = [], [], []
     upgrade_markers = {"upgrade", "upgrade_custom"}
     chosen_upgrade_markers = {marker for marker in upgrade_markers if config.getoption(f"--{marker}")}
     upgrade_markers_to_collect = chosen_upgrade_markers or upgrade_markers
 
     for item in items:
-        if upgrade_markers_to_collect.intersection(set(item.keywords)):
+        if "post_test_alerts" in item.keywords:
+            always_keep.append(item)
+        elif upgrade_markers_to_collect.intersection(set(item.keywords)):
             upgrade_tests.append(item)
         else:
             non_upgrade_tests.append(item)
@@ -452,10 +562,10 @@ def filter_upgrade_tests(
             cnv_source=config.getoption("--cnv-source"),
             upgrade_tests=upgrade_tests,
         )
-        return upgrade_tests, [*non_upgrade_tests, *discard]
+        return [*upgrade_tests, *always_keep], [*non_upgrade_tests, *discard]
 
     # If no upgrade marker in config, discard all upgrade tests.
-    return non_upgrade_tests, upgrade_tests
+    return [*non_upgrade_tests, *always_keep], upgrade_tests
 
 
 def remove_upgrade_tests_based_on_config(
@@ -511,23 +621,27 @@ def filter_sno_only_tests(items: list[Item], config: Config) -> list[Item]:
     return items
 
 
-def remove_tests_from_list(items: list[Item], filter_str: str) -> tuple[list[Item], list[Item]]:
-    discard_tests: list[Item] = []
-    items_to_return: list[Item] = []
-    for item in items:
-        if filter_str in item.keywords:
-            discard_tests.append(item)
-        else:
-            items_to_return.append(item)
-    return discard_tests, items_to_return
-
-
 def pytest_configure(config):
+    patch_paramiko_for_fips()
+
     # test_deprecation_audit_logs should always run regardless the path that passed to pytest.
     deprecation_tests_dir_path = "tests/deprecated_api"
     file_or_dir = config.option.file_or_dir
     if file_or_dir and deprecation_tests_dir_path not in file_or_dir and file_or_dir != ["tests"]:
         config.option.file_or_dir.append(deprecation_tests_dir_path)
+
+    # post_test_alerts tests should always run regardless the path that passed to pytest.
+    post_test_alerts_dir_path = "tests/post_test_alerts"
+    if file_or_dir and post_test_alerts_dir_path not in file_or_dir and file_or_dir != ["tests"]:
+        config.option.file_or_dir.append(post_test_alerts_dir_path)
+
+    # Bypass -m deselection for post_test_alerts on upgrade lanes (built-in filter runs after always_keep).
+    if (config.getoption("--upgrade") or config.getoption("--upgrade_custom")) and not config.getoption(
+        "--skip-post-test-alerts"
+    ):
+        markexpr = config.option.markexpr
+        if markexpr:
+            config.option.markexpr = f"({markexpr}) or post_test_alerts"
 
     if conformance_storage_class := config.getoption("conformance_storage_class"):
         py_config["storage_class_matrix"] = StorageClassConfig(
@@ -545,9 +659,11 @@ def pytest_collection_modifyitems(session, config, items):
     This function performs the following actions:
     1. Adds Polarion parameters to user properties.
     2. Adds test ID markers for Polarion and Jira.
-    3. Adds the tier2 marker for tests without an exclusion marker.
-    4. Marks tests by team.
+    3. Marks tests by team.
+    4. Adds the tier2 marker for tests without an exclusion marker.
     5. Filters upgrade tests based on the --upgrade option.
+    6. Dynamically mark NMState-dependent tests.
+    7. Auto-adds the quarantined marker for xfail-quarantined tests.
 
     Args:
         session (pytest.Session): The pytest session object.
@@ -572,20 +688,34 @@ def pytest_collection_modifyitems(session, config, items):
         add_test_id_markers(item=item, marker_name="polarion")
         add_test_id_markers(item=item, marker_name="jira")
 
+        # Must be called before add_tier2_marker; make sure team markers are added before tier2 tests collection
+        mark_tests_by_team(item=item)
+
         # Add tier2 marker for tests without an exclusion marker.
         add_tier2_marker(item=item)
 
-        mark_tests_by_team(item=item)
+        # Auto-add quarantined marker for xfail tests with QUARANTINED reason
+        for marker in item.iter_markers(name="xfail"):
+            reason = marker.kwargs.get("reason", "")
+            run = marker.kwargs.get("run", True)
+            if QUARANTINED in reason and not run:
+                item.add_marker(marker="quarantined")
+                break
 
-        # All tests are verified on X86_64 platforms, adding `x86_64` to all tests
-        item.add_marker(marker=X86_64)
+        # All tests are verified on amd64 platforms, adding `amd64` to all tests
+        item.add_marker(marker=AMD_64)
     #  Collect only 'upgrade_custom' tests when running pytest with --upgrade_custom
     keep, discard = filter_upgrade_tests(items=items, config=config)
     items[:] = keep
     if discard:
         config.hook.pytest_deselected(items=discard)
     items[:] = filter_deprecated_api_tests(items=items, config=config)
+    items[:] = filter_post_test_alerts_tests(items=items, config=config)
     items[:] = filter_sno_only_tests(items=items, config=config)
+    items[:] = filter_multiarch_tests(items=items, config=config)
+    items[:] = filter_hpp_tests(items=items, config=config)
+    items[:] = filter_ocs_tests(items=items, config=config)
+    items[:] = mark_nmstate_dependent_tests(items=items)
 
 
 def pytest_report_teststatus(report, config):
@@ -626,7 +756,10 @@ def pytest_runtest_makereport(item, call):
     """
     if call.excinfo is not None and "incremental" in item.keywords:
         parent = item.parent
-        parent._previousfailed = item
+        param_key = item.callspec.id if hasattr(item, "callspec") else ""
+        if not hasattr(parent, "_previousfailed"):
+            parent._previousfailed = {}
+        parent._previousfailed[param_key] = item
 
     outcome = yield
     report = outcome.get_result()
@@ -672,18 +805,20 @@ def pytest_runtest_setup(item):
         # before the setup work starts, insert current epoch time into the database
         try:
             db = Database(base_dir=item.config.getoption("--data-collector-output-dir"))
-            db.insert_test_start_time(
-                test_name=f"{item.fspath}::{item.name}",
-                start_time=int(datetime.datetime.now().strftime("%s")),
-            )
+            scope_marker = item.get_closest_marker(name="data_collector_scope")
+            scope_value = scope_marker.kwargs.get("scope") if scope_marker else None
+
+            name = get_scope_identifier(node=item, scope_value=scope_value)
+            db.insert_start_time(name=name, start_time=int(datetime.datetime.now().strftime("%s")))
         except Exception as db_exception:
-            LOGGER.error(f"Database error: {db_exception}. Must-gather collection may not be accurate")
+            LOGGER.error(f"[DATA_COLLECTOR] Database error: {db_exception}. Must-gather collection may not be accurate")
     BASIC_LOGGER.info(f"\n{separator(symbol_='-', val=item.name)}")
     BASIC_LOGGER.info(f"{separator(symbol_='-', val='SETUP')}")
     if "incremental" in item.keywords:
-        previousfailed = getattr(item.parent, "_previousfailed", None)
+        param_key = item.callspec.id if hasattr(item, "callspec") else ""
+        previousfailed = getattr(item.parent, "_previousfailed", {}).get(param_key)
         if previousfailed is not None:
-            pytest.xfail("previous test failed (%s)" % previousfailed.name)
+            pytest.xfail(f"previous test failed ({previousfailed.name})")
 
 
 def pytest_runtest_call(item):
@@ -724,34 +859,6 @@ def pytest_generate_tests(metafunc):
 
 
 def pytest_sessionstart(session):
-    # TODO: Reduce cognitive complexity
-    def _update_os_related_config():
-        # Save the default windows_os_matrix before it is updated
-        # with runtime windows_os_matrix value(s).
-        # Some tests extract a single OS from the matrix and may fail if running with
-        # passed values from cli
-        if windows_os_matrix := py_config.get("windows_os_matrix"):
-            py_config["system_windows_os_matrix"] = windows_os_matrix
-
-        if rhel_os_matrix := py_config.get("rhel_os_matrix"):
-            py_config["system_rhel_os_matrix"] = rhel_os_matrix
-
-        # Update OS matrix list with the latest OS if running with os_group
-        if session.config.getoption("latest_rhel") and rhel_os_matrix:
-            py_config["rhel_os_matrix"] = [utilities.infra.generate_latest_os_dict(os_list=rhel_os_matrix)]
-            py_config["instance_type_rhel_os_matrix"] = [
-                utilities.infra.generate_latest_os_dict(os_list=py_config["instance_type_rhel_os_matrix"])
-            ]
-
-        if session.config.getoption("latest_windows") and windows_os_matrix:
-            py_config["windows_os_matrix"] = [utilities.infra.generate_latest_os_dict(os_list=windows_os_matrix)]
-
-        if session.config.getoption("latest_centos") and (centos_os_matrix := py_config.get("centos_os_matrix")):
-            py_config["centos_os_matrix"] = [utilities.infra.generate_latest_os_dict(os_list=centos_os_matrix)]
-
-        if session.config.getoption("latest_fedora") and (fedora_os_matrix := py_config.get("fedora_os_matrix")):
-            py_config["fedora_os_matrix"] = [utilities.infra.generate_latest_os_dict(os_list=fedora_os_matrix)]
-
     data_collector_dict = set_data_collector_values(base_dir=session.config.getoption("data_collector_output_dir"))
     shutil.rmtree(
         data_collector_dict["data_collector_base_directory"],
@@ -771,7 +878,8 @@ def pytest_sessionstart(session):
     # with runtime storage_class_matrix value(s)
     py_config["system_storage_class_matrix"] = py_config.get("storage_class_matrix", [])
 
-    _update_os_related_config()
+    update_cpu_arch_related_config(cpu_arch_option=session.config.getoption("--cpu-arch") or "")
+    update_latest_os_config(session_config=session.config)
 
     matrix_addoptions = [matrix for matrix in session.config.invocation_params.args if "-matrix=" in matrix]
     for matrix_addoption in matrix_addoptions:
@@ -797,6 +905,9 @@ def pytest_sessionstart(session):
     if not skip_if_pytest_flags_exists(pytest_config=session.config):
         admin_client = utilities.cluster.cache_admin_client()
         py_config["version_explorer_url"] = get_cnv_version_explorer_url(pytest_config=session.config)
+        py_config["cluster_service_network"] = Network(
+            client=admin_client, name="cluster"
+        ).instance.status.serviceNetwork
         if not session.config.getoption("--skip-artifactory-check"):
             py_config["server_url"] = py_config["server_url"] or get_artifactory_server_url(
                 cluster_host_url=admin_client.configuration.host, session=session
@@ -811,36 +922,62 @@ def pytest_sessionstart(session):
         deploy_run_in_progress_namespace(client=admin_client)
         deploy_run_in_progress_config_map(client=admin_client, session=session)
 
+    # Set up AI analysis if --analyze-with-ai is passed.
+    # Source: https://github.com/myk-org/jenkins-job-insight/blob/main/examples/pytest-junitxml/conftest_junit_ai.py
+    if session.config.option.analyze_with_ai:
+        setup_ai_analysis(session=session)
+
 
 def pytest_collection_finish(session):
+    assert_incremental_classes_fully_collected(items=session.items)
+    validate_collected_tests_arch_params(session=session)
     if session.config.getoption("--collect-tests-markers"):
         get_tests_cluster_markers(items=session.items, filepath=session.config.getoption("--tests-markers-file"))
         pytest.exit(reason="Run with --collect-tests-markers. no tests are executed", returncode=0)
 
 
 def pytest_sessionfinish(session, exitstatus):
-    shutil.rmtree(path=session.config.option.basetemp, ignore_errors=True)
-    if not skip_if_pytest_flags_exists(pytest_config=session.config):
-        admin_client = utilities.cluster.cache_admin_client()
-        run_in_progress_config_map(client=admin_client).clean_up()
-        deploy_run_in_progress_namespace(client=admin_client).clean_up()
+    try:
+        shutil.rmtree(path=session.config.option.basetemp, ignore_errors=True)
+        if not skip_if_pytest_flags_exists(pytest_config=session.config):
+            admin_client = utilities.cluster.cache_admin_client()
+            run_in_progress_config_map(client=admin_client).clean_up()
+            deploy_run_in_progress_namespace(client=admin_client).clean_up()
 
-    reporter = session.config.pluginmanager.get_plugin("terminalreporter")
-    reporter.summary_stats()
-    if session.config.getoption("--data-collector"):
-        db = Database(base_dir=session.config.getoption("--data-collector-output-dir"))
-        file_path = db.database_file_path
-        LOGGER.info(f"Removing database file path {file_path}")
-        os.remove(file_path)
-    # clean up the empty folders
-    collector_directory = py_config["data_collector"]["data_collector_base_directory"]
-    if os.path.exists(collector_directory):
-        for root, dirs, files in os.walk(collector_directory, topdown=False):
-            for _dir in dirs:
-                dir_path = os.path.join(root, _dir)
-                if not os.listdir(dir_path):
-                    shutil.rmtree(dir_path, ignore_errors=True)
-    session.config.option.log_listener.stop()
+        reporter = session.config.pluginmanager.get_plugin("terminalreporter")
+        reporter.summary_stats()
+        if session.config.getoption("--data-collector"):
+            db = Database(base_dir=session.config.getoption("--data-collector-output-dir"))
+            file_path = db.database_file_path
+            LOGGER.info(f"Removing database file path {file_path}")
+            os.remove(file_path)
+        # clean up the empty folders
+        collector_directory = py_config["data_collector"]["data_collector_base_directory"]
+        if os.path.exists(collector_directory):
+            for root, dirs, files in os.walk(collector_directory, topdown=False):
+                for _dir in dirs:
+                    dir_path = os.path.join(root, _dir)
+                    if not os.listdir(dir_path):
+                        shutil.rmtree(dir_path, ignore_errors=True)
+
+        # Enrich JUnit XML with AI analysis after all tests complete.
+        # Source: https://github.com/myk-org/jenkins-job-insight/blob/main/examples/pytest-junitxml/conftest_junit_ai.py
+        if session.config.option.analyze_with_ai:
+            if exitstatus == 0:
+                LOGGER.info("No test failures (exit code %d), skipping AI analysis", exitstatus)
+
+            else:
+                try:
+                    enrich_junit_xml(session)
+                except Exception:
+                    LOGGER.exception("Failed to enrich JUnit XML, original preserved")
+    finally:
+        try:
+            _inject_failure_junit(session=session)
+        except Exception:
+            LOGGER.exception("Failed to inject failure into JUnit XML")
+
+        session.config.option.log_listener.stop()
 
 
 def get_all_node_markers(node: Node) -> list[str]:
@@ -853,27 +990,36 @@ def is_skip_must_gather(node: Node) -> bool:
 
 def get_inspect_command_namespace_string(node: Node, test_name: str) -> str:
     namespace_str = ""
-    components = [key for key in NAMESPACE_COLLECTION.keys() if f"tests/{key}/" in test_name]
+    components = [key for key in NAMESPACE_COLLECTION if f"tests/{key}/" in test_name]
     if not components:
         LOGGER.warning(f"{test_name} does not require special data collection on failure")
     else:
         component = components[0]
         namespaces_to_collect: list[str] = NAMESPACE_COLLECTION[component].copy()
+        all_markers = get_all_node_markers(node=node)
         if component == "virt":
-            all_markers = get_all_node_markers(node=node)
             if "gpu" in all_markers:
                 namespaces_to_collect.append(NamespacesNames.NVIDIA_GPU_OPERATOR)
             if "descheduler" in all_markers:
                 namespaces_to_collect.append(NamespacesNames.OPENSHIFT_KUBE_DESCHEDULER_OPERATOR)
+
+        if component == "network":
+            if "bgp" in all_markers:
+                namespaces_to_collect.extend([NamespacesNames.OPENSHIFT_FRR_K8S, NamespacesNames.CNV_TESTS_UTILITIES])
+            if "mtv" in all_markers:
+                namespaces_to_collect.append(NamespacesNames.OPENSHIFT_MTV)
+            if "nmstate" in all_markers:
+                namespaces_to_collect.append(NamespacesNames.OPENSHIFT_NMSTATE)
         namespace_str = " ".join([f"namespace/{namespace}" for namespace in namespaces_to_collect])
     return namespace_str
 
 
 def calculate_must_gather_timer(test_start_time):
     if test_start_time > 0:
-        return int(datetime.datetime.now().strftime("%s")) - test_start_time
+        # Add 5-minute (300s) buffer to work around must-gather timing issues
+        return int(datetime.datetime.now().strftime("%s")) - test_start_time + 300
     else:
-        LOGGER.warning(f"Could not get start time of test. Collecting must-gather for last {TIMEOUT_5MIN}s")
+        LOGGER.warning(f"[DATA_COLLECTOR] Could not get start time. Collecting must-gather for last {TIMEOUT_5MIN}s")
         return TIMEOUT_5MIN
 
 
@@ -881,18 +1027,16 @@ def pytest_exception_interact(node: Item | Collector, call: CallInfo[Any], repor
     BASIC_LOGGER.error(report.longreprtext)
     if node.config.getoption("--data-collector") and not is_skip_must_gather(node=node):
         test_name = f"{node.fspath}::{node.name}"
-        LOGGER.info(f"Must-gather collection is enabled for {test_name}.")
+        LOGGER.info(f"[DATA_COLLECTOR] Must-gather collection is enabled for {test_name}.")
         if call.excinfo and any([
             isinstance(call.excinfo.value, exception_type) for exception_type in MUST_GATHER_IGNORE_EXCEPTION_LIST
         ]):
-            LOGGER.warning(f"Must-gather collection would be skipped for exception: {call.excinfo.type}")
+            LOGGER.warning(
+                f"[DATA_COLLECTOR] Must-gather collection would be skipped for exception: {call.excinfo.type}"
+            )
         else:
-            try:
-                db = Database(base_dir=node.config.getoption("--data-collector-output-dir"))
-                test_start_time = db.get_test_start_time(test_name=test_name)
-            except Exception as db_exception:
-                test_start_time = 0
-                LOGGER.warning(f"Error: {db_exception} in accessing database.")
+            db = Database(base_dir=node.config.getoption("--data-collector-output-dir"))
+            test_start_time = db.get_start_time_for_collection(node=node)
 
             try:
                 collection_dir = os.path.join(get_data_collector_dir(), "pytest_exception_interact")

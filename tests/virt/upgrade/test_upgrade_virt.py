@@ -1,10 +1,12 @@
+from __future__ import annotations
+
 import logging
+from typing import TYPE_CHECKING
 
 import pytest
 from ocp_resources.virtual_machine_instance import VirtualMachineInstance
 
 from tests.upgrade_params import (
-    CDI_SCRATCH_PRESERVE_NODE_ID,
     HOTPLUG_VM_AFTER_UPGRADE_NODE_ID,
     IMAGE_UPDATE_AFTER_UPGRADE_NODE_ID,
     IUO_CNV_ALERT_ORDERING_NODE_ID,
@@ -18,28 +20,39 @@ from tests.virt.upgrade.utils import (
     mismatching_src_pvc_names,
     verify_run_strategy_vmi_status,
     verify_vms_ssh_connectivity,
-    verify_windows_boot_time,
 )
-from tests.virt.utils import assert_migration_post_copy_mode, verify_linux_boot_time
-from utilities.constants import DATA_SOURCE_NAME, DEPENDENCY_SCOPE_SESSION
+from tests.virt.utils import assert_migration_post_copy_mode, get_pci_addresses, verify_guest_boot_time
+from utilities.constants.hco import DATA_SOURCE_NAME
+from utilities.constants.pytest import DEPENDENCY_SCOPE_SESSION
 from utilities.exceptions import ResourceValueError
 from utilities.virt import migrate_vm_and_verify, vm_console_run_commands
 
+if TYPE_CHECKING:
+    from kubernetes.dynamic import DynamicClient
+
+    from utilities.virt import VirtualMachineForTests
+
 LOGGER = logging.getLogger(__name__)
-VIRT_VMS_RUNNING_AFTER_UPGRADE_TEST_NODE_ID = f"{VIRT_NODE_ID_PREFIX}::test_is_vm_running_after_upgrade"
 
 VMS_RUNNING_BEFORE_UPGRADE_TEST_NODE_ID = f"{VIRT_NODE_ID_PREFIX}::test_is_vm_running_before_upgrade"
+VMS_SSH_BEFORE_UPGRADE_TEST_NODE_ID = f"{VIRT_NODE_ID_PREFIX}::test_vm_ssh_before_upgrade"
+VMS_CONSOLE_BEFORE_UPGRADE_TEST_NODE_ID = f"{VIRT_NODE_ID_PREFIX}::test_vm_console_before_upgrade"
 
-MIGRATION_AFTER_UPGRADE_TEST_NODE_ID = f"{VIRT_NODE_ID_PREFIX}::test_migration_after_upgrade"
+WINDOWS_VM_BEFORE_UPGRADE_TEST_NODE_ID = f"{VIRT_NODE_ID_PREFIX}::test_windows_vm_before_upgrade"
 
 MIGRATION_BEFORE_UPGRADE_TEST_NODE_ID = f"{VIRT_NODE_ID_PREFIX}::test_migration_before_upgrade"
 MIGRATION_BEFORE_UPGRADE_TEST_ORDERING = [
     IUO_UPGRADE_TEST_ORDERING_NODE_ID,
     MIGRATION_BEFORE_UPGRADE_TEST_NODE_ID,
 ]
+
+VM_RUN_STRATEGY_BEFORE_UPGRADE_TEST_NODE_ID = f"{VIRT_NODE_ID_PREFIX}::test_vm_run_strategy_before_upgrade"
+
+VIRT_VMS_RUNNING_AFTER_UPGRADE_TEST_NODE_ID = f"{VIRT_NODE_ID_PREFIX}::test_is_vm_running_after_upgrade"
+MIGRATION_AFTER_UPGRADE_TEST_NODE_ID = f"{VIRT_NODE_ID_PREFIX}::test_migration_after_upgrade"
+
 AFTER_UPGRADE_STORAGE_ORDERING = [
     HOTPLUG_VM_AFTER_UPGRADE_NODE_ID,
-    CDI_SCRATCH_PRESERVE_NODE_ID,
     SNAPSHOT_RESTORE_CREATE_AFTER_UPGRADE,
     SNAPSHOT_RESTORE_CHECK_AFTER_UPGRADE_ID,
 ]
@@ -51,7 +64,11 @@ pytestmark = [
 ]
 
 
-@pytest.mark.usefixtures("base_templates")
+@pytest.mark.usefixtures(
+    "base_templates",
+    "parallel_live_migrations_increased",
+    "virt_launcher_images_from_csv_before_upgrade",
+)
 class TestUpgradeVirt:
     """Pre-upgrade tests"""
 
@@ -61,7 +78,8 @@ class TestUpgradeVirt:
     @pytest.mark.polarion("CNV-2974")
     @pytest.mark.order("first")
     @pytest.mark.dependency(name=VMS_RUNNING_BEFORE_UPGRADE_TEST_NODE_ID)
-    def test_is_vm_running_before_upgrade(self, vms_for_upgrade, linux_boot_time_before_upgrade):
+    @pytest.mark.usefixtures("linux_boot_time_before_upgrade", "pci_addresses_before_upgrade")
+    def test_is_vm_running_before_upgrade(self, vms_for_upgrade):
         for vm in vms_for_upgrade:
             assert vm.vmi.status == VirtualMachineInstance.Status.RUNNING
 
@@ -71,7 +89,7 @@ class TestUpgradeVirt:
     @pytest.mark.polarion("CNV-2987")
     @pytest.mark.order(before=MIGRATION_BEFORE_UPGRADE_TEST_ORDERING)
     @pytest.mark.dependency(
-        name=f"{VIRT_NODE_ID_PREFIX}::test_vm_console_before_upgrade",
+        name=VMS_CONSOLE_BEFORE_UPGRADE_TEST_NODE_ID,
         depends=[VMS_RUNNING_BEFORE_UPGRADE_TEST_NODE_ID],
         scope=DEPENDENCY_SCOPE_SESSION,
     )
@@ -85,7 +103,7 @@ class TestUpgradeVirt:
     @pytest.mark.polarion("CNV-4208")
     @pytest.mark.order(before=MIGRATION_BEFORE_UPGRADE_TEST_ORDERING)
     @pytest.mark.dependency(
-        name=f"{VIRT_NODE_ID_PREFIX}::test_vm_ssh_before_upgrade",
+        name=VMS_SSH_BEFORE_UPGRADE_TEST_NODE_ID,
         depends=[VMS_RUNNING_BEFORE_UPGRADE_TEST_NODE_ID],
         scope=DEPENDENCY_SCOPE_SESSION,
     )
@@ -93,22 +111,10 @@ class TestUpgradeVirt:
         verify_vms_ssh_connectivity(vms_list=vms_for_upgrade)
 
     @pytest.mark.ocp_upgrade
-    @pytest.mark.polarion("CNV-2975")
-    @pytest.mark.order(before=IUO_UPGRADE_TEST_ORDERING_NODE_ID)
-    @pytest.mark.dependency(
-        name=f"{VIRT_NODE_ID_PREFIX}::test_migration_before_upgrade",
-        depends=[VMS_RUNNING_BEFORE_UPGRADE_TEST_NODE_ID],
-        scope=DEPENDENCY_SCOPE_SESSION,
-    )
-    def test_migration_before_upgrade(self, virt_migratable_vms):
-        for vm in virt_migratable_vms:
-            migrate_vm_and_verify(vm=vm, wait_for_interfaces=False, check_ssh_connectivity=False)
-
-    @pytest.mark.ocp_upgrade
     @pytest.mark.sno
     @pytest.mark.polarion("CNV-6999")
-    @pytest.mark.order(before=IUO_UPGRADE_TEST_ORDERING_NODE_ID, after=MIGRATION_BEFORE_UPGRADE_TEST_NODE_ID)
-    @pytest.mark.dependency(name=f"{VIRT_NODE_ID_PREFIX}::test_vm_run_strategy_before_upgrade")
+    @pytest.mark.order(before=IUO_UPGRADE_TEST_ORDERING_NODE_ID)
+    @pytest.mark.dependency(name=VM_RUN_STRATEGY_BEFORE_UPGRADE_TEST_NODE_ID)
     def test_vm_run_strategy_before_upgrade(
         self,
         manual_run_strategy_vm,
@@ -121,9 +127,10 @@ class TestUpgradeVirt:
     @pytest.mark.ocp_upgrade
     @pytest.mark.sno
     @pytest.mark.high_resource_vm
+    @pytest.mark.windows
     @pytest.mark.polarion("CNV-7243")
-    @pytest.mark.order(before=IUO_UPGRADE_TEST_ORDERING_NODE_ID, after=MIGRATION_BEFORE_UPGRADE_TEST_NODE_ID)
-    @pytest.mark.dependency(name=f"{VIRT_NODE_ID_PREFIX}::test_windows_vm_before_upgrade")
+    @pytest.mark.order(before=MIGRATION_BEFORE_UPGRADE_TEST_ORDERING)
+    @pytest.mark.dependency(name=WINDOWS_VM_BEFORE_UPGRADE_TEST_NODE_ID)
     def test_windows_vm_before_upgrade(
         self,
         windows_vm,
@@ -133,15 +140,29 @@ class TestUpgradeVirt:
 
     @pytest.mark.ocp_upgrade
     @pytest.mark.polarion("CNV-12018")
-    @pytest.mark.order(before=IUO_UPGRADE_TEST_ORDERING_NODE_ID, after=MIGRATION_BEFORE_UPGRADE_TEST_NODE_ID)
+    @pytest.mark.order(before=MIGRATION_BEFORE_UPGRADE_TEST_ORDERING)
     @pytest.mark.dependency(name=f"{VIRT_NODE_ID_PREFIX}::test_vm_post_copy_migration_before_upgrade")
+    @pytest.mark.usefixtures("post_copy_migration_policy_for_upgrade")
     def test_vm_post_copy_migration_before_upgrade(
         self,
-        post_copy_migration_policy_for_upgrade,
-        vm_for_post_copy_upgrade,
+        admin_client: DynamicClient,
+        vm_for_post_copy_upgrade: VirtualMachineForTests,
     ):
-        migrate_vm_and_verify(vm=vm_for_post_copy_upgrade, check_ssh_connectivity=True)
+        migrate_vm_and_verify(vm=vm_for_post_copy_upgrade, client=admin_client, check_ssh_connectivity=True)
         assert_migration_post_copy_mode(vm=vm_for_post_copy_upgrade)
+
+    @pytest.mark.ocp_upgrade
+    @pytest.mark.polarion("CNV-2975")
+    @pytest.mark.order(before=IUO_UPGRADE_TEST_ORDERING_NODE_ID)
+    @pytest.mark.dependency(
+        name=MIGRATION_BEFORE_UPGRADE_TEST_NODE_ID,
+        scope=DEPENDENCY_SCOPE_SESSION,
+    )
+    def test_migration_before_upgrade(
+        self, admin_client: DynamicClient, virt_migratable_vms: list[VirtualMachineForTests]
+    ):
+        for vm in virt_migratable_vms:
+            migrate_vm_and_verify(vm=vm, client=admin_client, wait_for_interfaces=False, check_ssh_connectivity=False)
 
     """ Post-upgrade tests """
 
@@ -150,9 +171,7 @@ class TestUpgradeVirt:
     @pytest.mark.order(after=IUO_CNV_ALERT_ORDERING_NODE_ID, before=AFTER_UPGRADE_STORAGE_ORDERING)
     @pytest.mark.dependency(
         name=IMAGE_UPDATE_AFTER_UPGRADE_NODE_ID,
-        depends=[
-            IUO_UPGRADE_TEST_DEPENDENCY_NODE_ID,
-        ],
+        depends=[IUO_UPGRADE_TEST_DEPENDENCY_NODE_ID],
         scope=DEPENDENCY_SCOPE_SESSION,
     )
     def test_vmi_pod_image_updates_after_upgrade_optin(
@@ -171,16 +190,12 @@ class TestUpgradeVirt:
     @pytest.mark.order(after=[IMAGE_UPDATE_AFTER_UPGRADE_NODE_ID], before=AFTER_UPGRADE_STORAGE_ORDERING)
     @pytest.mark.dependency(
         name=VIRT_VMS_RUNNING_AFTER_UPGRADE_TEST_NODE_ID,
-        depends=[
-            IUO_UPGRADE_TEST_DEPENDENCY_NODE_ID,
-            VMS_RUNNING_BEFORE_UPGRADE_TEST_NODE_ID,
-        ],
+        depends=[IUO_UPGRADE_TEST_DEPENDENCY_NODE_ID, VMS_RUNNING_BEFORE_UPGRADE_TEST_NODE_ID],
         scope=DEPENDENCY_SCOPE_SESSION,
     )
-    def test_is_vm_running_after_upgrade(self, vms_for_upgrade, virt_migratable_vms, linux_boot_time_before_upgrade):
+    def test_is_vm_running_after_upgrade(self, vms_for_upgrade):
         for vm in vms_for_upgrade:
             vm.vmi.wait_until_running()
-        verify_linux_boot_time(vm_list=virt_migratable_vms, initial_boot_time=linux_boot_time_before_upgrade)
 
     @pytest.mark.gating
     @pytest.mark.ocp_upgrade
@@ -191,7 +206,7 @@ class TestUpgradeVirt:
         depends=[
             IUO_UPGRADE_TEST_DEPENDENCY_NODE_ID,
             VIRT_VMS_RUNNING_AFTER_UPGRADE_TEST_NODE_ID,
-            f"{VIRT_NODE_ID_PREFIX}::test_vm_console_before_upgrade",
+            VMS_CONSOLE_BEFORE_UPGRADE_TEST_NODE_ID,
         ],
         scope=DEPENDENCY_SCOPE_SESSION,
     )
@@ -208,7 +223,7 @@ class TestUpgradeVirt:
         depends=[
             IUO_UPGRADE_TEST_DEPENDENCY_NODE_ID,
             VIRT_VMS_RUNNING_AFTER_UPGRADE_TEST_NODE_ID,
-            f"{VIRT_NODE_ID_PREFIX}::test_vm_ssh_before_upgrade",
+            VMS_SSH_BEFORE_UPGRADE_TEST_NODE_ID,
         ],
         scope=DEPENDENCY_SCOPE_SESSION,
     )
@@ -223,10 +238,7 @@ class TestUpgradeVirt:
         before=AFTER_UPGRADE_STORAGE_ORDERING,
     )
     @pytest.mark.dependency(
-        depends=[
-            IUO_UPGRADE_TEST_DEPENDENCY_NODE_ID,
-            f"{VIRT_NODE_ID_PREFIX}::test_vm_run_strategy_before_upgrade",
-        ],
+        depends=[IUO_UPGRADE_TEST_DEPENDENCY_NODE_ID, VM_RUN_STRATEGY_BEFORE_UPGRADE_TEST_NODE_ID],
         scope=DEPENDENCY_SCOPE_SESSION,
     )
     def test_vm_run_strategy_after_upgrade(self, manual_run_strategy_vm, always_run_strategy_vm):
@@ -239,58 +251,84 @@ class TestUpgradeVirt:
     @pytest.mark.sno
     @pytest.mark.polarion("CNV-7244")
     @pytest.mark.order(
-        after=[
-            IMAGE_UPDATE_AFTER_UPGRADE_NODE_ID,
-            VIRT_VMS_RUNNING_AFTER_UPGRADE_TEST_NODE_ID,
-        ],
+        after=[IMAGE_UPDATE_AFTER_UPGRADE_NODE_ID, VIRT_VMS_RUNNING_AFTER_UPGRADE_TEST_NODE_ID],
         before=AFTER_UPGRADE_STORAGE_ORDERING,
     )
+    @pytest.mark.windows
     @pytest.mark.dependency(
-        depends=[
-            IUO_UPGRADE_TEST_DEPENDENCY_NODE_ID,
-            f"{VIRT_NODE_ID_PREFIX}::test_windows_vm_before_upgrade",
-        ],
+        depends=[IUO_UPGRADE_TEST_DEPENDENCY_NODE_ID, WINDOWS_VM_BEFORE_UPGRADE_TEST_NODE_ID],
         scope=DEPENDENCY_SCOPE_SESSION,
     )
     def test_windows_vm_after_upgrade(
         self,
         windows_vm,
         windows_boot_time_before_upgrade,
+        virt_migratable_vms_names,
     ):
         verify_vms_ssh_connectivity(vms_list=[windows_vm])
-        verify_windows_boot_time(windows_vm=windows_vm, initial_boot_time=windows_boot_time_before_upgrade)
+        if windows_vm.name in virt_migratable_vms_names:
+            verify_guest_boot_time(vm_list=[windows_vm], initial_boot_time=windows_boot_time_before_upgrade)
 
     @pytest.mark.ocp_upgrade
     @pytest.mark.polarion("CNV-2979")
     @pytest.mark.order(
-        after=[
-            IMAGE_UPDATE_AFTER_UPGRADE_NODE_ID,
-            IUO_CNV_ALERT_ORDERING_NODE_ID,
-            VIRT_VMS_RUNNING_AFTER_UPGRADE_TEST_NODE_ID,
-        ],
+        after=[IMAGE_UPDATE_AFTER_UPGRADE_NODE_ID, VIRT_VMS_RUNNING_AFTER_UPGRADE_TEST_NODE_ID],
+        before=AFTER_UPGRADE_STORAGE_ORDERING,
+    )
+    @pytest.mark.dependency(
+        depends=[IUO_UPGRADE_TEST_DEPENDENCY_NODE_ID, MIGRATION_BEFORE_UPGRADE_TEST_NODE_ID],
+        scope=DEPENDENCY_SCOPE_SESSION,
+    )
+    def test_migration_after_upgrade(
+        self, admin_client: DynamicClient, virt_migratable_vms: list[VirtualMachineForTests]
+    ):
+        for vm in virt_migratable_vms:
+            migrate_vm_and_verify(vm=vm, client=admin_client, wait_for_interfaces=False, check_ssh_connectivity=False)
+
+    @pytest.mark.ocp_upgrade
+    @pytest.mark.polarion("CNV-12571")
+    @pytest.mark.order(
+        after=[IMAGE_UPDATE_AFTER_UPGRADE_NODE_ID, VIRT_VMS_RUNNING_AFTER_UPGRADE_TEST_NODE_ID],
+        before=AFTER_UPGRADE_STORAGE_ORDERING,
+    )
+    @pytest.mark.dependency(
+        depends=[IUO_UPGRADE_TEST_DEPENDENCY_NODE_ID, MIGRATION_BEFORE_UPGRADE_TEST_NODE_ID],
+        scope=DEPENDENCY_SCOPE_SESSION,
+    )
+    def test_vms_boot_time_after_upgrade(
+        self, vms_for_upgrade, linux_boot_time_before_upgrade, virt_migratable_vms_names
+    ):
+        migratable_vms = [vm for vm in vms_for_upgrade if vm.name in virt_migratable_vms_names]
+        verify_guest_boot_time(vm_list=migratable_vms, initial_boot_time=linux_boot_time_before_upgrade)
+
+    @pytest.mark.ocp_upgrade
+    @pytest.mark.sno
+    @pytest.mark.polarion("CNV-16329")
+    @pytest.mark.order(
+        after=[IMAGE_UPDATE_AFTER_UPGRADE_NODE_ID, VIRT_VMS_RUNNING_AFTER_UPGRADE_TEST_NODE_ID],
         before=AFTER_UPGRADE_STORAGE_ORDERING,
     )
     @pytest.mark.dependency(
         depends=[
             IUO_UPGRADE_TEST_DEPENDENCY_NODE_ID,
-            f"{VIRT_NODE_ID_PREFIX}::test_migration_before_upgrade",
+            VIRT_VMS_RUNNING_AFTER_UPGRADE_TEST_NODE_ID,
         ],
         scope=DEPENDENCY_SCOPE_SESSION,
     )
-    def test_migration_after_upgrade(self, virt_migratable_vms):
-        for vm in virt_migratable_vms:
-            migrate_vm_and_verify(vm=vm)
-            vm_console_run_commands(vm=vm, commands=["ls"], timeout=1100)
+    def test_pci_topology_after_upgrade(self, vms_for_upgrade, pci_addresses_before_upgrade):
+        """STP: https://github.com/RedHatQE/openshift-virtualization-tests-design-docs/blob/main/stps/sig-virt/pci-topology-stability.md"""
+        failed_vms = {}
+        for vm in vms_for_upgrade:
+            current_addresses = get_pci_addresses(vm=vm)
+            if current_addresses != pci_addresses_before_upgrade[vm.name]:
+                failed_vms[vm.name] = {"before": pci_addresses_before_upgrade[vm.name], "after": current_addresses}
+        assert not failed_vms, f"PCI topology changed after upgrade: {failed_vms}"
 
     @pytest.mark.ocp_upgrade
     @pytest.mark.sno
     @pytest.mark.polarion("CNV-3682")
     @pytest.mark.order(
-        after=[
-            IMAGE_UPDATE_AFTER_UPGRADE_NODE_ID,
-            IUO_CNV_ALERT_ORDERING_NODE_ID,
-            VIRT_VMS_RUNNING_AFTER_UPGRADE_TEST_NODE_ID,
-        ],
+        after=[IMAGE_UPDATE_AFTER_UPGRADE_NODE_ID, VIRT_VMS_RUNNING_AFTER_UPGRADE_TEST_NODE_ID],
         before=AFTER_UPGRADE_STORAGE_ORDERING,
     )
     @pytest.mark.dependency(
@@ -308,11 +346,7 @@ class TestUpgradeVirt:
     @pytest.mark.sno
     @pytest.mark.polarion("CNV-5749")
     @pytest.mark.order(
-        after=[
-            IMAGE_UPDATE_AFTER_UPGRADE_NODE_ID,
-            IUO_CNV_ALERT_ORDERING_NODE_ID,
-            VIRT_VMS_RUNNING_AFTER_UPGRADE_TEST_NODE_ID,
-        ],
+        after=[IMAGE_UPDATE_AFTER_UPGRADE_NODE_ID, VIRT_VMS_RUNNING_AFTER_UPGRADE_TEST_NODE_ID],
         before=AFTER_UPGRADE_STORAGE_ORDERING,
     )
     @pytest.mark.dependency(
@@ -336,10 +370,7 @@ class TestUpgradeVirt:
     @pytest.mark.ocp_upgrade
     @pytest.mark.polarion("CNV-12019")
     @pytest.mark.order(
-        after=[
-            IMAGE_UPDATE_AFTER_UPGRADE_NODE_ID,
-            VIRT_VMS_RUNNING_AFTER_UPGRADE_TEST_NODE_ID,
-        ],
+        after=[IMAGE_UPDATE_AFTER_UPGRADE_NODE_ID, VIRT_VMS_RUNNING_AFTER_UPGRADE_TEST_NODE_ID],
         before=AFTER_UPGRADE_STORAGE_ORDERING,
     )
     @pytest.mark.dependency(
@@ -351,7 +382,8 @@ class TestUpgradeVirt:
     )
     def test_vm_post_copy_migration_after_upgrade(
         self,
-        vm_for_post_copy_upgrade,
+        admin_client: DynamicClient,
+        vm_for_post_copy_upgrade: VirtualMachineForTests,
     ):
-        migrate_vm_and_verify(vm=vm_for_post_copy_upgrade, check_ssh_connectivity=True)
+        migrate_vm_and_verify(vm=vm_for_post_copy_upgrade, client=admin_client, check_ssh_connectivity=True)
         assert_migration_post_copy_mode(vm=vm_for_post_copy_upgrade)

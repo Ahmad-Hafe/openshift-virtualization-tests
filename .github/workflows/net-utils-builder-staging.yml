@@ -8,23 +8,36 @@ on:
       - 'containers/utility/Dockerfile'
 
 jobs:
+  check-approval:
+    # Fetch author_association via REST API; webhook payload is unreliable
+    # for pull_request_target events.
+    permissions:
+      pull-requests: read
+    uses: ./.github/workflows/check-pr-approval.yml
+    secrets:
+      ORG_READ_TOKEN: ${{ secrets.ORG_READ_TOKEN }}
+
   build-and-push-staging:
+    needs: [check-approval]
+    if: "!cancelled() && (needs.check-approval.result == 'success' || needs.check-approval.result == 'skipped')"
     runs-on: ubuntu-latest
     permissions:
       contents: read
       pull-requests: write
 
-    # safe to use pull_request_target because we only run this for trusted collaborators
-    if: contains(fromJson('["OWNER","MEMBER","COLLABORATOR","CONTRIBUTOR"]'), github.event.pull_request.author_association)
+    # Org members run automatically; outside contributors need maintainer approval
+    environment: ${{ needs.check-approval.outputs.needs_approval == 'true' && 'external-pr-tests' || '' }}
     steps:
       - name: Check out repository
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
         with:
           ref: ${{ github.event.pull_request.head.sha }}
           fetch-depth: 0
+          allow-unsafe-pr-checkout: true
+          persist-credentials: false
 
       - name: Set up QEMU for multi-arch builds
-        uses: docker/setup-qemu-action@v3
+        uses: docker/setup-qemu-action@v4
 
       - name: Install podman
         run: |
@@ -50,7 +63,7 @@ jobs:
             containers/utility/
 
       - name: Log in to registry
-        uses: redhat-actions/podman-login@v1
+        uses: redhat-actions/podman-login@v2
         with:
           username: ${{ secrets.QUAY_USER }}
           password: ${{ secrets.QUAY_TOKEN }}
@@ -61,7 +74,7 @@ jobs:
           podman manifest push ${{ steps.image-tag.outputs.IMAGE_TAG }}
 
       - name: Comment on PR with image tag
-        uses: mshick/add-pr-comment@v2
+        uses: mshick/add-pr-comment@v3
         with:
           message: |
             Staging image built and pushed to: `${{ steps.image-tag.outputs.IMAGE_TAG }}`

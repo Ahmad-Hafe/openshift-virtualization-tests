@@ -1,45 +1,52 @@
 import json
+import shlex
 from collections.abc import Generator
 from contextlib import contextmanager
+from dataclasses import dataclass
 from typing import Final
 
 import ocp_resources.network_config_openshift_io as openshift_nc
 from kubernetes.dynamic import DynamicClient
 from kubernetes.dynamic.exceptions import ResourceNotFoundError
 from ocp_resources.bgp_session_state import BGPSessionState
-from ocp_resources.deployment import Deployment
+from ocp_resources.cluster_operator import ClusterOperator
 from ocp_resources.frr_configuration import FRRConfiguration
-from ocp_resources.namespace import Namespace
 from ocp_resources.pod import Pod
 from ocp_resources.resource import ResourceEditor
 from ocp_resources.route_advertisements import RouteAdvertisements
 from timeout_sampler import retry
 
-from utilities.constants import NET_UTIL_CONTAINER_IMAGE
-from utilities.infra import get_resources_by_name_prefix
+from libs.net.vmspec import IpNotFound
+from utilities.constants.hco import DEFAULT_RESOURCE_CONDITIONS
+from utilities.constants.namespaces import NamespacesNames
+from utilities.constants.networking import NET_UTIL_CONTAINER_IMAGE
+from utilities.infra import get_resources_by_name_prefix, wait_for_consistent_resource_conditions
 
-_CLUSTER_FRR_ASN: Final[int] = 64512
-_EXTERNAL_FRR_ASN: Final[int] = 64000
-_EXTERNAL_FRR_IMAGE: Final[str] = "quay.io/frrouting/frr:9.1.2"
-_FRR_DEPLOYMENT_NAME: Final[str] = "frr-k8s-webhook-server"
-_FRR_NS_NAME: Final[str] = "openshift-frr-k8s"
+_EXTERNAL_FRR_IMAGE: Final[str] = "quay.io/frrouting/frr:10.6.0"
+CLUSTER_FRR_ASN: Final[int] = 64512
+EXTERNAL_FRR_ASN: Final[int] = 64000
 POD_SECONDARY_IFACE_NAME: Final[str] = "net1"
+NET_TOOLS_CONTAINER_NAME: Final[str] = "net-tools"
+EXTERNAL_FRR_POD_LABEL: Final[dict] = {"role": "frr-external"}
+
+
+@dataclass
+class ExternalFrrPodInfo:
+    pod: Pod
+    ipv4: str
 
 
 @contextmanager
 def enable_route_advertisements_in_cluster(
     network_resource: openshift_nc.Network, client: DynamicClient
 ) -> Generator[None]:
-    """Enables route advertisements in the cluster network resource and deploys the FRR deployment.
+    """Enables route advertisements in the cluster network resource and deploys FRR.
 
     Within the context, the cluster network resource is patched to enable
     additional routing capabilities with FRR and to enable route advertisements for OVN-Kubernetes.
-    The FRR deployment is then created in the designated namespace and waits for its replicas to be ready.
+    Waits for the network ClusterOperator to stabilize before proceeding.
 
-    After the context is exited, the changes are reverted and the FRR namespace is cleaned up.
-    The cleanup is expected by the un-patching of the changes (ResourceEditor cleanup).
-    However, it has been observed that the NS is not removed
-    and therefore an explicit delete on the NS is performed.
+    After the context is exited, the changes are reverted.
 
     Args:
         network_resource (openshift_nc.Network): The cluster network resource to be patched.
@@ -58,21 +65,30 @@ def enable_route_advertisements_in_cluster(
     }
 
     with ResourceEditor(patches=patch):
-        deployment = Deployment(name=_FRR_DEPLOYMENT_NAME, namespace=_FRR_NS_NAME, client=client)
-        deployment.wait_for_replicas()
-
+        wait_for_consistent_resource_conditions(
+            dynamic_client=client,
+            resource_kind=ClusterOperator,
+            resource_name=network_resource.kind.lower(),
+            expected_conditions=DEFAULT_RESOURCE_CONDITIONS,
+        )
         yield
 
-    Namespace(name=_FRR_NS_NAME, client=client).clean_up()
 
-
-def create_cudn_route_advertisements(name: str, match_labels: dict, client: DynamicClient) -> RouteAdvertisements:
+def create_cudn_route_advertisements(
+    name: str,
+    match_labels: dict,
+    client: DynamicClient,
+    target_vrf: str | None = None,
+    frr_configuration_selector: dict | None = None,
+) -> RouteAdvertisements:
     """Creates a RouteAdvertisements object for a ClusterUserDefinedNetwork (CUDN) based on the provided labels.
 
     Args:
-        name (str): The name of the RouteAdvertisements object.
-        match_labels (dict): A dictionary of labels to match the CUDN.
-        client (DynamicClient): The Kubernetes dynamic client.
+        name: The name of the RouteAdvertisements object.
+        match_labels: A dictionary of labels to match the CUDN.
+        client: The Kubernetes dynamic client.
+        target_vrf: The VRF to advertise routes in.
+        frr_configuration_selector: Label selector for matching FRRConfiguration resources.
 
     Returns:
         RouteAdvertisements: The created RouteAdvertisements object.
@@ -89,7 +105,8 @@ def create_cudn_route_advertisements(name: str, match_labels: dict, client: Dyna
         advertisements=["PodNetwork"],
         network_selectors=network_selectors,
         node_selector={},
-        frr_configuration_selector={},
+        frr_configuration_selector=frr_configuration_selector or {},
+        target_vrf=target_vrf,
         client=client,
     )
 
@@ -111,11 +128,11 @@ def create_frr_configuration(
     bgp_config = {
         "routers": [
             {
-                "asn": _CLUSTER_FRR_ASN,
+                "asn": CLUSTER_FRR_ASN,
                 "neighbors": [
                     {
                         "address": frr_pod_ipv4,
-                        "asn": _EXTERNAL_FRR_ASN,
+                        "asn": EXTERNAL_FRR_ASN,
                         "disableMP": True,
                         "toReceive": {"allowed": {"mode": "filtered", "prefixes": [{"prefix": external_subnet_ipv4}]}},
                     }
@@ -124,7 +141,39 @@ def create_frr_configuration(
         ]
     }
 
-    return FRRConfiguration(name=name, namespace=_FRR_NS_NAME, bgp=bgp_config, client=client)
+    return FRRConfiguration(name=name, namespace=NamespacesNames.OPENSHIFT_FRR_K8S, bgp=bgp_config, client=client)
+
+
+def create_evpn_frr_configuration(
+    name: str, frr_pod_ipv4: str, client: DynamicClient, label: dict[str, str] | None = None
+) -> FRRConfiguration:
+    """Creates a FRRConfiguration for BGP EVPN setup.
+
+    Args:
+        name: The name of the FRRConfiguration object.
+        frr_pod_ipv4: The IPv4 address of the external FRR pod.
+        client: The Kubernetes dynamic client.
+        label: Labels for the FRRConfiguration.
+
+    Returns:
+        FRRConfiguration for EVPN peering.
+    """
+    bgp_config = {
+        "routers": [
+            {
+                "asn": CLUSTER_FRR_ASN,
+                "neighbors": [
+                    {
+                        "address": frr_pod_ipv4,
+                        "asn": EXTERNAL_FRR_ASN,
+                    }
+                ],
+            }
+        ]
+    }
+    return FRRConfiguration(
+        name=name, namespace=NamespacesNames.OPENSHIFT_FRR_K8S, bgp=bgp_config, label=label, client=client
+    )
 
 
 def generate_frr_conf(
@@ -143,30 +192,47 @@ def generate_frr_conf(
     if not nodes_ipv4_list:
         raise ValueError("nodes_ipv4_list cannot be empty")
 
+    evpn_route_map = "evpn-to-ocp"
+
+    # Route-map: preserve next-hop for EVPN re-advertisement
     lines = [
-        f"router bgp {_EXTERNAL_FRR_ASN}",
+        f"route-map {evpn_route_map} permit 10",
+        " set ip next-hop unchanged",
+        "exit",
+        "",
+    ]
+
+    # BGP router and neighbor definitions (eBGP: external AS)
+    lines.extend([
+        f"router bgp {EXTERNAL_FRR_ASN}",
         " no bgp ebgp-requires-policy",
         " no bgp default ipv4-unicast",
         " no bgp network import-check",
         "",
-    ]
-
-    lines.extend([f" neighbor {ip} remote-as {_CLUSTER_FRR_ASN}" for ip in nodes_ipv4_list])
+    ])
+    lines.extend([f" neighbor {ip} remote-as {CLUSTER_FRR_ASN}" for ip in nodes_ipv4_list])
     lines.append("")
 
+    # IPv4 unicast: advertise external subnet to nodes
     lines.extend([
         " address-family ipv4 unicast",
         f"  network {external_subnet_ipv4}",
     ])
-
     for ip in nodes_ipv4_list:
         lines.extend([
             f"  neighbor {ip} activate",
-            f"  neighbor {ip} next-hop-self",
-            f"  neighbor {ip} route-reflector-client",
+            f"  neighbor {ip} attribute-unchanged next-hop",
         ])
+    lines.extend([" exit-address-family", ""])
 
-    lines.append(" exit-address-family")
+    # EVPN: activate neighbors for L2VPN EVPN route exchange
+    lines.append(" address-family l2vpn evpn")
+    for ip in nodes_ipv4_list:
+        lines.extend([
+            f"  neighbor {ip} activate",
+            f"  neighbor {ip} route-map {evpn_route_map} out",
+        ])
+    lines.extend(["  advertise-all-vni", " exit-address-family"])
 
     return "\n".join(lines)
 
@@ -177,9 +243,8 @@ def deploy_external_frr_pod(
     node_name: str,
     nad_name: str,
     frr_configmap_name: str,
-    default_route: str,
     client: DynamicClient,
-) -> Generator[Pod]:
+) -> Generator[ExternalFrrPodInfo]:
     """Deploys an external FRR (Free Range Routing) pod in a specified namespace.
 
     On entering the context, this function creates a privileged pod with the FRR image,
@@ -195,17 +260,15 @@ def deploy_external_frr_pod(
         node_name (str): The name of the node where the pod will be scheduled.
         nad_name (str): The name of the NetworkAttachmentDefinition (NAD) to attach to the pod.
         frr_configmap_name (str): The name of the ConfigMap containing FRR configuration.
-        default_route (str): The default route to be used by the pod.
         client (DynamicClient): The Kubernetes dynamic client.
 
     Yields:
-        Pod: The deployed FRR pod object.
+        ExternalFrrPodInfo: The info about deployed external FRR pod, including its IPv4 address.
     """
     annotations = {
         f"{Pod.ApiGroup.K8S_V1_CNI_CNCF_IO}/networks": json.dumps([
-            {"name": nad_name, "interface": POD_SECONDARY_IFACE_NAME, "default-route": [default_route]}
+            {"name": nad_name, "interface": POD_SECONDARY_IFACE_NAME},
         ]),
-        f"{Pod.ApiGroup.K8S_V1_CNI_CNCF_IO}/default-network": "none",
     }
     containers = [
         {
@@ -215,8 +278,9 @@ def deploy_external_frr_pod(
             "volumeMounts": [{"name": frr_configmap_name, "mountPath": "/etc/frr"}],
         },
         {
-            "name": "iperf3",
+            "name": NET_TOOLS_CONTAINER_NAME,
             "image": NET_UTIL_CONTAINER_IMAGE,
+            "securityContext": {"privileged": True, "capabilities": {"add": ["NET_ADMIN"]}},
             "command": ["sleep", "infinity"],
         },
     ]
@@ -230,9 +294,26 @@ def deploy_external_frr_pod(
         containers=containers,
         volumes=volumes,
         client=client,
+        label=EXTERNAL_FRR_POD_LABEL,
     ) as pod:
         pod.wait_for_status(status=Pod.Status.RUNNING)
-        yield pod
+        ipv4 = _acquire_dhcp_ipv4(pod=pod, iface_name=POD_SECONDARY_IFACE_NAME)
+
+        yield ExternalFrrPodInfo(pod=pod, ipv4=ipv4)
+
+
+def _acquire_dhcp_ipv4(pod: Pod, iface_name: str) -> str:
+    pod.execute(command=shlex.split(f"dhclient {iface_name}"), container=NET_TOOLS_CONTAINER_NAME)
+
+    iface_info = json.loads(
+        pod.execute(command=shlex.split(f"ip -j -4 addr show {iface_name}"), container=NET_TOOLS_CONTAINER_NAME)
+    )
+    if iface_info and "addr_info" in iface_info[0]:
+        for addr in iface_info[0]["addr_info"]:
+            if addr["family"] == "inet":
+                return addr["local"]
+
+    raise IpNotFound(f"IP address not found for interface {iface_name}")
 
 
 def wait_for_bgp_connection_established(node_names: list) -> None:
@@ -249,15 +330,41 @@ def wait_for_bgp_connection_established(node_names: list) -> None:
 
 
 @retry(
+    wait_timeout=300,
+    sleep=10,
+    exceptions_dict={RuntimeError: []},
+)
+def wait_for_evpn_established(frr_pod: Pod, expected_neighbors: int) -> bool:
+    """Waits for all expected EVPN neighbors to have received at least one prefix.
+
+    Args:
+        frr_pod: The external FRR pod to query.
+        expected_neighbors: Number of neighbors expected to have received EVPN prefixes.
+    """
+    output = frr_pod.execute(
+        command=shlex.split('vtysh -c "show bgp l2vpn evpn summary json"'),
+        container="frr",
+    )
+    summary = json.loads(output)
+    peers = summary.get("peers", {})
+    active_count = sum(1 for peer_info in peers.values() if peer_info.get("pfxRcd", 0) > 0)
+    if active_count < expected_neighbors:
+        raise RuntimeError(f"EVPN not fully established: {active_count}/{expected_neighbors} neighbors active")
+    return True
+
+
+@retry(
     wait_timeout=60,
     sleep=5,
     exceptions_dict={ResourceNotFoundError: []},
 )
 def _get_bgp_session_state(node_name: str) -> BGPSessionState:
     bgp_session_state = get_resources_by_name_prefix(
-        prefix=node_name, namespace=_FRR_NS_NAME, api_resource_name=BGPSessionState
+        prefix=node_name, namespace=NamespacesNames.OPENSHIFT_FRR_K8S, api_resource_name=BGPSessionState
     )  # type: ignore[no-untyped-call]
     if bgp_session_state:
         return bgp_session_state[0]
 
-    raise ResourceNotFoundError(f"BGPSessionState for node '{node_name}' not found in namespace '{_FRR_NS_NAME}'")
+    raise ResourceNotFoundError(
+        f"BGPSessionState for node '{node_name}' not found in namespace '{NamespacesNames.OPENSHIFT_FRR_K8S}'"
+    )

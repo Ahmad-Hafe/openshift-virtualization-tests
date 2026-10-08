@@ -18,19 +18,19 @@ from tests.chaos.utils import (
     terminate_process,
 )
 from utilities.artifactory import get_artifactory_config_map, get_artifactory_secret
-from utilities.constants import (
-    KUBEMACPOOL_MAC_CONTROLLER_MANAGER,
-    OS_FLAVOR_RHEL,
-    PORT_80,
+from utilities.constants import Images
+from utilities.constants.components import KUBEMACPOOL_MAC_CONTROLLER_MANAGER
+from utilities.constants.images import OS_FLAVOR_RHEL
+from utilities.constants.instance_types import U1_SMALL
+from utilities.constants.namespaces import NamespacesNames
+from utilities.constants.networking import PORT_80
+from utilities.constants.timeouts import (
     TIMEOUT_2MIN,
     TIMEOUT_3MIN,
     TIMEOUT_5SEC,
     TIMEOUT_10MIN,
     TIMEOUT_10SEC,
     TIMEOUT_15MIN,
-    U1_SMALL,
-    Images,
-    NamespacesNames,
 )
 from utilities.infra import (
     ExecCommandOnPod,
@@ -43,6 +43,7 @@ from utilities.infra import (
     utility_daemonset_for_custom_tests,
     wait_for_node_status,
 )
+from utilities.storage import construct_datavolume_source_dict
 from utilities.virt import VirtualMachineForTests, running_vm
 
 LOGGER = logging.getLogger(__name__)
@@ -93,16 +94,18 @@ def chaos_dv_rhel9(
     artifactory_config_map_chaos_namespace_scope_module,
 ):
     yield DataVolume(
-        source="http",
+        source_dict=construct_datavolume_source_dict(
+            source="http",
+            url=rhel9_http_image_url,
+            secret_name=artifactory_secret_chaos_namespace_scope_module.name,
+            cert_configmap_name=artifactory_config_map_chaos_namespace_scope_module.name,
+        ),
         name="chaos-dv",
         api_name="storage",
         namespace=chaos_namespace.name,
-        url=rhel9_http_image_url,
         size=Images.Rhel.DEFAULT_DV_SIZE,
         storage_class=request.param["storage_class"],
         client=admin_client,
-        secret=artifactory_secret_chaos_namespace_scope_module,
-        cert_configmap=artifactory_config_map_chaos_namespace_scope_module.name,
     )
 
 
@@ -141,6 +144,7 @@ def downscaled_storage_provisioner_deployment(request, admin_client):
         deployment_name=deployment.name,
         namespace=deployment.namespace,
         replica_count=0,
+        client=admin_client,
     ):
         yield {"deployment": deployment, "initial_replicas": initial_replicas}
 
@@ -150,7 +154,7 @@ def kmp_manager_nodes(admin_client):
     yield [
         pod.node
         for pod in get_pod_by_name_prefix(
-            dyn_client=admin_client,
+            client=admin_client,
             pod_prefix=KUBEMACPOOL_MAC_CONTROLLER_MANAGER,
             namespace=py_config["hco_namespace"],
             get_all=True,
@@ -189,7 +193,7 @@ def pod_deleting_process(request, admin_client):
     pod_prefix = request.param["pod_prefix"]
     namespace_name = request.param["namespace_name"]
     process = create_pod_deleting_process(
-        dyn_client=admin_client,
+        client=admin_client,
         pod_prefix=pod_prefix,
         namespace_name=namespace_name,
         ratio=request.param["ratio"],
@@ -315,6 +319,7 @@ def label_migration_target_node_for_chaos(workers, vm_with_nginx_service):
 def utility_daemonset_for_chaos_tests(
     generated_pulled_secret,
     cnv_tests_utilities_service_account,
+    admin_client,
 ):
     """
     Deploy utility daemonset into the cnv-tests-utilities namespace.
@@ -325,6 +330,7 @@ def utility_daemonset_for_chaos_tests(
         generated_pulled_secret=generated_pulled_secret,
         cnv_tests_utilities_service_account=cnv_tests_utilities_service_account,
         label=CHAOS_LABEL_KEY,
+        client=admin_client,
         node_selector_label=CHAOS_LABEL,
         delete_pod_resources_limit=True,
     )
@@ -366,7 +372,7 @@ def artifactory_config_map_chaos_namespace_scope_module(chaos_namespace):
 
 @pytest.fixture(scope="class")
 def chaos_vms_instancetype_list(request, admin_client, chaos_namespace):
-    required_instancetype = get_instance_type(name=U1_SMALL)
+    required_instancetype = get_instance_type(name=U1_SMALL, client=admin_client)
 
     vms_list = []
     for idx in range(request.param["number_of_vms"]):
@@ -390,7 +396,7 @@ def deleted_pod_by_name_prefix(admin_client, cnv_pod_deletion_test_matrix__class
     pod_deletion_config = cnv_pod_deletion_test_matrix__class__[pod_matrix_key]
 
     deleted_pod_by_name_prefix = create_pod_deleting_process(
-        dyn_client=admin_client,
+        client=admin_client,
         pod_prefix=pod_deletion_config["pod_prefix"],
         namespace_name=pod_deletion_config["namespace_name"],
         ratio=pod_deletion_config["ratio"],

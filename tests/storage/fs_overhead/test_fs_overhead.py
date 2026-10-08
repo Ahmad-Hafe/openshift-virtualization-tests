@@ -35,13 +35,18 @@ def assert_fs_overhead_added(actual_size: bitmath.Bitmath, requested_size: bitma
 
 
 @pytest.fixture(scope="module")
-def updated_fs_overhead_20_with_hco(storage_class_with_filesystem_volume_mode, hyperconverged_resource_scope_module):
+def updated_fs_overhead_20_with_hco(
+    admin_client, storage_class_with_filesystem_volume_mode, hyperconverged_resource_scope_module
+):
     with ResourceEditorValidateHCOReconcile(
+        admin_client=admin_client,
         patches={
             hyperconverged_resource_scope_module: {
                 "spec": {
-                    "filesystemOverhead": {
-                        "storageClass": {storage_class_with_filesystem_volume_mode: str(FS_OVERHEAD_20)}
+                    "storage": {
+                        "filesystemOverhead": {
+                            "storageClass": {storage_class_with_filesystem_volume_mode: str(FS_OVERHEAD_20)}
+                        }
                     }
                 }
             }
@@ -74,6 +79,7 @@ def uploaded_cirros_dv(
 ):
     dv_name = "uploaded-dv"
     with virtctl_upload_dv(
+        client=namespace.client,
         namespace=namespace.name,
         name=dv_name,
         size=Images.Cirros.DEFAULT_DV_SIZE,
@@ -82,15 +88,15 @@ def uploaded_cirros_dv(
         volume_mode=DataVolume.VolumeMode.FILE,
         insecure=True,
     ):
-        yield DataVolume(name=dv_name, namespace=namespace.name)
+        yield DataVolume(name=dv_name, namespace=namespace.name, client=namespace.client)
 
 
 @pytest.mark.polarion("CNV-8635")
-def test_import_vm_with_specify_fs_overhead(updated_fs_overhead_20_with_hco, vm_for_fs_overhead_test):
+def test_import_vm_with_specify_fs_overhead(admin_client, updated_fs_overhead_20_with_hco, vm_for_fs_overhead_test):
     vm_metadata = vm_for_fs_overhead_test.data_volume_template["metadata"]
     assert_fs_overhead_added(
         actual_size=get_pvc_size_gib(
-            pvc=PersistentVolumeClaim(name=vm_metadata["name"], namespace=vm_metadata["namespace"])
+            pvc=PersistentVolumeClaim(name=vm_metadata["name"], namespace=vm_metadata["namespace"], client=admin_client)
         ),
         requested_size=bitmath.GiB(
             int(

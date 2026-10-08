@@ -1,16 +1,27 @@
+from __future__ import annotations
+
 import logging
+from typing import TYPE_CHECKING
 
 import pytest
 
 from tests.os_params import (
     FEDORA_LATEST,
     FEDORA_LATEST_LABELS,
-    WINDOWS_10_TEMPLATE_LABELS,
+    WINDOWS_11_TEMPLATE_LABELS,
 )
-from tests.virt.constants import STRESS_CPU_MEM_IO_COMMAND, WINDOWS_10_WSL
-from tests.virt.utils import get_stress_ng_pid, start_stress_on_vm, verify_stress_ng_pid_not_changed
-from utilities.constants import TIMEOUT_20MIN, Images
+from tests.utils import start_stress_on_vm
+from tests.virt.constants import WINDOWS_11_WSL
+from tests.virt.utils import get_stress_ng_pid, verify_stress_ng_pid_not_changed
+from utilities.constants import Images
+from utilities.constants.timeouts import TIMEOUT_20MIN
+from utilities.constants.virt import STRESS_CPU_MEM_IO_COMMAND
 from utilities.virt import migrate_vm_and_verify
+
+if TYPE_CHECKING:
+    from kubernetes.dynamic import DynamicClient
+
+    from utilities.virt import VirtualMachineForTests
 
 LOGGER = logging.getLogger(__name__)
 
@@ -36,8 +47,13 @@ def stress_pid_before_migration(vm_with_memory_load, cpu_mem_io_stress_started):
 
 
 @pytest.fixture()
-def migrate_vm_with_memory_load(vm_with_memory_load):
-    migrate_vm_and_verify(vm=vm_with_memory_load, check_ssh_connectivity=True, timeout=TIMEOUT_20MIN)
+def migrate_vm_with_memory_load(
+    admin_client: DynamicClient, vm_with_memory_load: VirtualMachineForTests
+) -> VirtualMachineForTests:
+    migrate_vm_and_verify(
+        vm=vm_with_memory_load, client=admin_client, check_ssh_connectivity=True, timeout=TIMEOUT_20MIN
+    )
+    return vm_with_memory_load
 
 
 @pytest.mark.usefixtures("migration_policy_with_allow_auto_converge")
@@ -58,6 +74,7 @@ class TestMigrationVMWithMemoryLoad:
         ],
         indirect=True,
     )
+    @pytest.mark.s390x
     def test_fedora_vm_migrate_with_memory_load(
         self,
         vm_with_memory_load,
@@ -71,10 +88,10 @@ class TestMigrationVMWithMemoryLoad:
         "golden_image_data_source_for_test_scope_function, vm_with_memory_load",
         [
             pytest.param(
-                {"os_dict": WINDOWS_10_WSL},
+                {"os_dict": WINDOWS_11_WSL},
                 {
                     "vm_name": "windows-vm-with-memory-load",
-                    "template_labels": WINDOWS_10_TEMPLATE_LABELS,
+                    "template_labels": WINDOWS_11_TEMPLATE_LABELS,
                     "memory_guest": Images.Windows.DEFAULT_MEMORY_SIZE_WSL,
                     "cpu_cores": 16,
                     "cpu_threads": 1,
@@ -84,6 +101,7 @@ class TestMigrationVMWithMemoryLoad:
         ],
         indirect=True,
     )
+    @pytest.mark.windows
     @pytest.mark.polarion("CNV-9844")
     def test_windows_vm_migrate_with_memory_load(
         self,

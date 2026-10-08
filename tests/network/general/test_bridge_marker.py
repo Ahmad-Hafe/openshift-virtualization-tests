@@ -1,11 +1,10 @@
-# -*- coding: utf-8 -*-
-
 from contextlib import contextmanager
 
 import pytest
 from timeout_sampler import TimeoutExpiredError
 
-from utilities.constants import LINUX_BRIDGE, TIMEOUT_2MIN, TIMEOUT_30SEC
+from utilities.constants.networking import LINUX_BRIDGE
+from utilities.constants.timeouts import TIMEOUT_2MIN, TIMEOUT_30SEC
 from utilities.infra import get_node_selector_dict
 from utilities.network import network_device, network_nad
 from utilities.virt import VirtualMachineForTests, fedora_vm_body
@@ -20,7 +19,7 @@ BRIDGEMARKER3 = "bridgemarker3"
 
 
 @contextmanager
-def create_bridge_attached_vm_for_bridge_marker(namespace, bridge_marker_bridge_network):
+def create_bridge_attached_vm_for_bridge_marker(unprivileged_client, namespace, bridge_marker_bridge_network):
     networks = {bridge_marker_bridge_network.name: bridge_marker_bridge_network.name}
     name = _get_name(suffix="bridge-vm")
     with VirtualMachineForTests(
@@ -29,6 +28,7 @@ def create_bridge_attached_vm_for_bridge_marker(namespace, bridge_marker_bridge_
         networks=networks,
         interfaces=sorted(networks.keys()),
         body=fedora_vm_body(name=name),
+        client=unprivileged_client,
     ) as vm:
         yield vm
 
@@ -69,18 +69,22 @@ def bridge_networks(admin_client, namespace):
 
 
 @pytest.fixture()
-def bridge_attached_vmi_for_bridge_marker_no_device(namespace, bridge_marker_bridge_network):
+def bridge_attached_vmi_for_bridge_marker_no_device(unprivileged_client, namespace, bridge_marker_bridge_network):
     with create_bridge_attached_vm_for_bridge_marker(
-        namespace=namespace, bridge_marker_bridge_network=bridge_marker_bridge_network
+        unprivileged_client=unprivileged_client,
+        namespace=namespace,
+        bridge_marker_bridge_network=bridge_marker_bridge_network,
     ) as vm:
         vm.start()
         yield vm.vmi
 
 
 @pytest.fixture()
-def bridge_attached_vmi_for_bridge_marker_device_exists(namespace, bridge_marker_bridge_network):
+def bridge_attached_vmi_for_bridge_marker_device_exists(unprivileged_client, namespace, bridge_marker_bridge_network):
     with create_bridge_attached_vm_for_bridge_marker(
-        namespace=namespace, bridge_marker_bridge_network=bridge_marker_bridge_network
+        unprivileged_client=unprivileged_client,
+        namespace=namespace,
+        bridge_marker_bridge_network=bridge_marker_bridge_network,
     ) as vm:
         vm.start(wait=True)
         vm.wait_for_agent_connected()
@@ -104,7 +108,7 @@ def multi_bridge_attached_vmi(namespace, bridge_networks, unprivileged_client):
 
 
 @pytest.fixture()
-def bridge_device_on_all_nodes(admin_client):
+def bridge_device_on_all_nodes(nmstate_dependent_placeholder, admin_client):
     with network_device(
         interface_type=LINUX_BRIDGE,
         nncp_name="bridge-marker1",
@@ -115,7 +119,7 @@ def bridge_device_on_all_nodes(admin_client):
 
 
 @pytest.fixture()
-def non_homogenous_bridges(admin_client, worker_node1, worker_node2):
+def non_homogenous_bridges(nmstate_dependent_placeholder, admin_client, worker_node1, worker_node2):
     with network_device(
         interface_type=LINUX_BRIDGE,
         nncp_name="bridge-marker2",

@@ -2,7 +2,7 @@ from copy import deepcopy
 
 import bitmath
 
-from tests.os_params import WINDOWS_10, WINDOWS_11
+from tests.os_params import WINDOWS_11
 from utilities.constants import Images
 
 VIRT_PROCESS_MEMORY_LIMITS = {
@@ -19,9 +19,7 @@ STRESS_CPU_MEM_IO_COMMAND = (
 )
 
 
-WINDOWS_10_WSL = deepcopy(WINDOWS_10)
 WINDOWS_11_WSL = deepcopy(WINDOWS_11)
-WINDOWS_10_WSL["image_path"] = f"{Images.Windows.UEFI_WIN_DIR}/{Images.Windows.WIN10_WSL2_IMG}"
 WINDOWS_11_WSL["image_path"] = f"{Images.Windows.DIR}/{Images.Windows.WIN11_WSL2_IMG}"
 
 
@@ -31,7 +29,7 @@ ACRQ_NAMESPACE_LABEL = {ACRQ_TEST: ""}
 
 
 # MigrationPolicy labels
-VM_LABEL = {"post-copy-vm": "true"}
+WORKLOAD_DISRUPTION_VM_LABEL = {"workload-disruption-vm": "true"}
 
 
 # BASH
@@ -43,7 +41,11 @@ class MachineTypesNames:
     pc_q35_rhel7_6 = f"{pc_q35}-rhel7.6.0"
     pc_q35_rhel8_1 = f"{pc_q35}-rhel8.1.0"
     pc_q35_rhel9_4 = f"{pc_q35}-rhel9.4.0"
-    pc_q35_rhel9_6 = f"{pc_q35}-rhel9.6.0"
+    pc_q35_rhel9_8 = f"{pc_q35}-rhel9.8.0"
     pc_q35_rhel7_4 = f"{pc_q35}-rhel7.4.0"
     pc_i440fx = "pc-i440fx"
     pc_i440fx_rhel7_6 = f"{pc_i440fx}-rhel7.6.0"
+    s390_ccw_virtio = "s390-ccw-virtio"
+    s390_ccw_virtio_rhel9_6 = f"{s390_ccw_virtio}-rhel9.6.0"
+    s390_ccw_virtio_rhel8_6 = f"{s390_ccw_virtio}-rhel8.6.0"
+    s390_ccw_virtio_rhel7_6 = f"{s390_ccw_virtio}-rhel7.6.0"

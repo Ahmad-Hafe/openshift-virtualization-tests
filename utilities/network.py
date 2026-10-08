@@ -7,49 +7,42 @@ import re
 import shlex
 
 import netaddr
-from ocp_resources.network_addons_config import NetworkAddonsConfig
 from ocp_resources.network_attachment_definition import (
     LinuxBridgeNetworkAttachmentDefinition,
     OVNOverlayNetworkAttachmentDefinition,
-    OvsBridgeNetworkAttachmentDefinition,
 )
 from ocp_resources.network_config_openshift_io import Network
 from ocp_resources.node import Node
 from ocp_resources.node_network_configuration_policy import (
-    NNCPConfigurationFailed,
     NodeNetworkConfigurationPolicy,
 )
 from ocp_resources.node_network_state import NodeNetworkState
-from ocp_resources.pod import Pod
 from ocp_resources.sriov_network import SriovNetwork
 from ocp_resources.sriov_network_node_policy import SriovNetworkNodePolicy
 from pytest_testconfig import config as py_config
 from timeout_sampler import TimeoutExpiredError, TimeoutSampler
 
 import utilities.infra
-import utilities.virt
-from utilities.constants import (
+from libs.net.ip import ICMP_HEADER_SIZE, ip_header_size
+from libs.net.vmspec import IpNotFound, VMInterfaceStatusNotFoundError, lookup_iface_status_ip
+from utilities.constants.cluster import WORKERS_TYPE
+from utilities.constants.networking import (
     ACTIVE_BACKUP,
     FLAT_OVERLAY_STR,
     IPV4_STR,
     IPV6_STR,
     LINUX_BRIDGE,
-    MTU_9000,
-    OVS_BRIDGE,
     SRIOV,
-    TIMEOUT_2MIN,
+)
+from utilities.constants.timeouts import (
     TIMEOUT_3MIN,
     TIMEOUT_8MIN,
     TIMEOUT_90SEC,
-    WORKERS_TYPE,
 )
-from utilities.hco import ResourceEditorValidateHCOReconcile
 
 LOGGER = logging.getLogger(__name__)
 IFACE_UP_STATE = NodeNetworkConfigurationPolicy.Interface.State.UP
 IFACE_ABSENT_STATE = NodeNetworkConfigurationPolicy.Interface.State.ABSENT
-OVS_DS_NAME = "ovs-cni-amd64"
-DEPLOY_OVS = "deployOVS"
 BOND = "bond"
 INPROGRESS = "InProgress"
 
@@ -58,45 +51,43 @@ class SriovIfaceNotFound(Exception):
     pass
 
 
-class BridgeNodeNetworkConfigurationPolicy(NodeNetworkConfigurationPolicy):
+class LinuxBridgeNodeNetworkConfigurationPolicy(NodeNetworkConfigurationPolicy):
     def __init__(
         self,
         name,
         bridge_name,
-        bridge_type,
-        stp_config,
         client,
+        stp_config=False,
         ports=None,
         mtu=None,
         node_selector=None,
         node_selector_labels=None,
         ipv4_enable=False,
         ipv4_dhcp=False,
+        ipv6_enable=False,
         teardown=True,
         teardown_absent_ifaces=True,
-        ipv6_enable=False,
-        max_unavailable=None,
         set_ipv4=True,
         set_ipv6=True,
+        max_unavailable=None,
         dry_run=None,
         capture=None,
+        bridge_state=IFACE_UP_STATE,
         routes=None,
         dns_resolver=None,
-        bridge_state=IFACE_UP_STATE,
     ):
         """
-        Create bridge on nodes (according node_selector, all if no selector presents)
+        Create a Linux bridge on nodes (according to node_selector, all if no selector).
 
         Args:
             name (str): Policy name.
-            bridge_name (str): Bridge name.
-            bridge_type (str): Bridge type (Linux Bridge, OVS)
-            stp_config (bool): Spanning Tree enabled/disabled.
+            bridge_name (str): Bridge interface name.
             client (DynamicClient): Dynamic client used to interact with the cluster.
+            stp_config (bool): Spanning Tree enabled/disabled.
             ports (list): The bridge's port(s).
-            mtu (int): MTU size
-            ipv4_dhcp: determines if ipv4_dhcp should be used
-            dry_run (str, default=None): If "All", the bridge will be created using the dry_run flag
+            mtu (int): MTU size.
+            ipv4_dhcp (bool): Whether to use DHCP for IPv4.
+            dry_run (str): If "All", the bridge will be created using the dry_run flag.
         """
         super().__init__(
             name=name,
@@ -119,10 +110,8 @@ class BridgeNodeNetworkConfigurationPolicy(NodeNetworkConfigurationPolicy):
             state=bridge_state,
             client=client,
         )
-        self.ovs_bridge_type = OVS_BRIDGE
-        self.linux_bridge_type = LINUX_BRIDGE
         self.bridge_name = bridge_name
-        self.bridge_type = bridge_type
+        self.bridge_type = LINUX_BRIDGE
         self.stp_config = stp_config
 
     @staticmethod
@@ -139,20 +128,18 @@ class BridgeNodeNetworkConfigurationPolicy(NodeNetworkConfigurationPolicy):
 
     def to_dict(self):
         bridge_ports = [{"name": port} for port in self.ports]
-        stp = self.stp_config if self.bridge_type == self.ovs_bridge_type else {"enabled": self.stp_config}
         self.iface = {
             "name": self.bridge_name,
-            "type": self.bridge_type,
+            "type": LINUX_BRIDGE,
             "state": self.state,
             "bridge": {
-                "options": {"stp": stp},
+                "options": {"stp": {"enabled": self.stp_config}},
                 "port": bridge_ports,
             },
         }
 
         for port in bridge_ports:
-            # OVS MTU handled in OvsBridgeNodeNetworkConfigurationPolicy
-            if self.mtu and self.bridge_type != self.ovs_bridge_type:
+            if self.mtu:
                 nns = NodeNetworkState(
                     name=utilities.infra.get_node_selector_name(node_selector=self.node_selector)
                     if self.node_selector
@@ -173,168 +160,6 @@ class BridgeNodeNetworkConfigurationPolicy(NodeNetworkConfigurationPolicy):
                 self.set_interface(interface=_port)
 
         super().to_dict()
-
-
-class LinuxBridgeNodeNetworkConfigurationPolicy(BridgeNodeNetworkConfigurationPolicy):
-    def __init__(
-        self,
-        name,
-        bridge_name,
-        client,
-        stp_config=False,
-        ports=None,
-        mtu=None,
-        node_selector=None,
-        node_selector_labels=None,
-        ipv4_enable=False,
-        ipv4_dhcp=False,
-        teardown=True,
-        teardown_absent_ifaces=True,
-        set_ipv4=True,
-        set_ipv6=True,
-        max_unavailable=None,
-        dry_run=None,
-        capture=None,
-        bridge_state=IFACE_UP_STATE,
-        routes=None,
-        dns_resolver=None,
-    ):
-        super().__init__(
-            name=name,
-            bridge_name=bridge_name,
-            bridge_type=LINUX_BRIDGE,
-            stp_config=stp_config,
-            client=client,
-            ports=ports,
-            set_ipv4=set_ipv4,
-            set_ipv6=set_ipv6,
-            mtu=mtu,
-            node_selector=node_selector,
-            node_selector_labels=node_selector_labels,
-            ipv4_enable=ipv4_enable,
-            ipv4_dhcp=ipv4_dhcp,
-            teardown=teardown,
-            teardown_absent_ifaces=teardown_absent_ifaces,
-            max_unavailable=max_unavailable,
-            dry_run=dry_run,
-            capture=capture,
-            routes=routes,
-            dns_resolver=dns_resolver,
-            bridge_state=bridge_state,
-        )
-
-
-class OvsBridgeNodeNetworkConfigurationPolicy(BridgeNodeNetworkConfigurationPolicy):
-    def __init__(
-        self,
-        name,
-        bridge_name,
-        ports,
-        client,
-        stp_config=False,
-        mtu=None,
-        node_selector=None,
-        ipv4_enable=False,
-        ipv4_dhcp=False,
-        teardown=True,
-        set_dummy_ovs_iface=False,
-        set_port_mac=False,
-        dry_run=None,
-        node_selector_labels=None,
-    ):
-        super().__init__(
-            name=name,
-            bridge_name=bridge_name,
-            bridge_type=OVS_BRIDGE,
-            stp_config=stp_config,
-            client=client,
-            ports=ports,
-            mtu=mtu,
-            node_selector=node_selector,
-            ipv4_enable=ipv4_enable,
-            ipv4_dhcp=ipv4_dhcp,
-            teardown=teardown,
-            set_ipv4=False,
-            set_ipv6=False,
-            dry_run=dry_run,
-            node_selector_labels=node_selector_labels,
-        )
-        self.set_dummy_ovs_iface = set_dummy_ovs_iface
-        self.set_port_mac = set_port_mac
-
-    @property
-    def _nns_node(self):
-        if self.node_selector:
-            return list(
-                Node.get(
-                    dyn_client=self.client,
-                    name=utilities.infra.get_node_selector_name(node_selector=self.node_selector),
-                )
-            )[0]
-        else:
-            return list(Node.get(dyn_client=self.client))[0]
-
-    def to_dict(self):
-        super().to_dict()
-        if self.set_dummy_ovs_iface or self.mtu:
-            desired_state_interface = self.res["spec"]["desiredState"]["interfaces"]
-            for idx, iface in enumerate(desired_state_interface):
-                if iface["type"] == self.ovs_bridge_type:
-                    ovs_dummy_interface_name = f"ovs-dummy{idx}"
-                    port_name = iface["bridge"]["port"][0]["name"]
-
-                    if self.mtu:
-                        nns = NodeNetworkState(name=self._nns_node.name, client=self.client)
-                        if BridgeNodeNetworkConfigurationPolicy._does_port_match_type(
-                            nns=nns, port_name=port_name, port_type=BOND
-                        ):
-                            continue
-
-                        port_iface = {
-                            "name": port_name,
-                            "type": "ethernet",
-                            "state": IFACE_UP_STATE,
-                            "ipv4": {"enabled": False},
-                            "mtu": self.mtu,
-                        }
-                        desired_state_interface.append(port_iface)
-
-                    if self.set_dummy_ovs_iface:
-                        iface["bridge"]["port"].append({"name": ovs_dummy_interface_name})
-                        ovs_iface = {
-                            "name": ovs_dummy_interface_name,
-                            "type": "ovs-interface",
-                            "state": IFACE_UP_STATE,
-                            "ipv4": {
-                                "enabled": self.ipv4_enable,
-                                "dhcp": self.ipv4_dhcp,
-                            },
-                            "mtu": self.mtu,
-                        }
-                        if self.set_port_mac:
-                            if not self.node_selector:
-                                raise ValueError("node_selector is required for set_port_mac")
-
-                            nns = NodeNetworkState(
-                                name=utilities.infra.get_node_selector_name(node_selector=self.node_selector),
-                                client=self.client,
-                            )
-                            port_mac = [iface["mac-address"] for iface in nns.interfaces if iface["name"] == port_name]
-                            ovs_iface["mac-address"] = port_mac[0]
-
-                        desired_state_interface.append(ovs_iface)
-
-            self.res["spec"]["desiredState"]["interfaces"] = desired_state_interface
-
-    def deploy(self, wait=False):
-        try:
-            return super().deploy(wait=wait)
-        except NNCPConfigurationFailed as exp:
-            if "failed to communicating with Open vSwitch database" in str(exp):
-                LOGGER.warning("W/A for ovs-bridge when OVS DB is locked")
-                self.res = self.to_dict()
-                return super().deploy(wait=wait)
-            raise
 
 
 class VLANInterfaceNodeNetworkConfigurationPolicy(NodeNetworkConfigurationPolicy):
@@ -476,59 +301,13 @@ class BondNodeNetworkConfigurationPolicy(NodeNetworkConfigurationPolicy):
 
 NETWORK_DEVICE_TYPE = {
     LINUX_BRIDGE: LinuxBridgeNodeNetworkConfigurationPolicy,
-    OVS_BRIDGE: OvsBridgeNodeNetworkConfigurationPolicy,
     SRIOV: SriovNetworkNodePolicy,
 }
 NAD_TYPE = {
     LINUX_BRIDGE: LinuxBridgeNetworkAttachmentDefinition,
-    OVS_BRIDGE: OvsBridgeNetworkAttachmentDefinition,
     SRIOV: SriovNetwork,
     FLAT_OVERLAY_STR: OVNOverlayNetworkAttachmentDefinition,
 }
-
-
-def get_vmi_ip_v4_by_name(vm, name):
-    vmi = vm.vmi
-
-    def _get_iface_by_name(vmi_interfaces):
-        iface = [_iface for _iface in vmi_interfaces if _iface.name == name]
-        if not iface:
-            raise IfaceNotFound(name=name)
-        return iface[0]
-
-    def _extract_interface_ips():
-        vmi_interfaces = vm.vmi.interfaces
-        iface_ips = _get_iface_by_name(vmi_interfaces=vmi_interfaces).ipAddresses
-        if iface_ips:
-            return iface_ips
-        return []
-
-    def _get_interface_ips():
-        vmi_ips = _extract_interface_ips()
-        if vmi_ips:
-            return vmi_ips
-
-        utilities.virt.wait_for_vm_interfaces(vmi=vmi)
-        return _extract_interface_ips()
-
-    sampler = TimeoutSampler(wait_timeout=TIMEOUT_2MIN, sleep=1, func=_get_interface_ips)
-    try:
-        for ip_addresses in sampler:
-            for ip_address in ip_addresses:
-                ip = ipaddress.ip_interface(address=ip_address)
-                if ip.version == 4:
-                    return ip.ip
-
-    except TimeoutExpiredError:
-        raise IpNotFound(name)
-
-
-class IpNotFound(Exception):
-    def __init__(self, name):
-        self.name = name
-
-    def __str__(self):
-        return f"IP address not found for interface {self.name}"
 
 
 @contextlib.contextmanager
@@ -570,10 +349,6 @@ def network_nad(
         kwargs["resource_name"] = sriov_resource_name
         kwargs["ipam"] = ipam
         kwargs["macspoofchk"] = macspoofchk
-
-    if nad_type == OVS_BRIDGE:
-        kwargs["bridge_name"] = interface_name
-        kwargs["mtu"] = mtu
 
     if nad_type == FLAT_OVERLAY_STR:
         kwargs["network_name"] = network_name
@@ -698,19 +473,11 @@ class MacPool:
         return self.mac_to_int(mac) in self.pool
 
 
-class IfaceNotFound(Exception):
-    def __init__(self, name: str) -> None:
-        self.name = name
-
-    def __str__(self) -> str:
-        return f"Interface not found for NAD {self.name}"
-
-
 def get_vmi_mac_address_by_iface_name(vmi, iface_name):
     for iface in vmi.interfaces:
         if iface.name == iface_name:
             return iface.mac
-    raise IfaceNotFound(name=iface_name)
+    raise VMInterfaceStatusNotFoundError(f"Interface {iface_name} not found in VMI {vmi.name} status")
 
 
 def cloud_init_network_data(data):
@@ -777,9 +544,7 @@ def assert_ping_successful(
 ):
     if packet_size and packet_size > 1500:
         # ICMP packet reductions:
-        icmp_header = 8
-        ip_header = 20
-        packet_size = packet_size - ip_header - icmp_header
+        packet_size = packet_size - ip_header_size(ipaddress.ip_address(dst_ip)) - ICMP_HEADER_SIZE
     assert (
         ping(
             src_vm=src_vm,
@@ -808,10 +573,15 @@ def get_ip_from_vm_or_virt_handler_pod(family, vm=None, virt_handler_pod=None):
         raise ValueError("must send VM or virt-handler pod")
 
     if vm:
-        addr_list = vm.vmi.interfaces[0]["ipAddresses"]
-    else:
-        addr_list = [ip_addr["ip"] for ip_addr in virt_handler_pod.instance.status.podIPs]
+        iface_name = vm.vmi.interfaces[0]["name"]
+        ip_family = 4 if family == IPV4_STR else 6
+        try:
+            ip = lookup_iface_status_ip(vm=vm, iface_name=iface_name, ip_family=ip_family)
+        except IpNotFound:
+            return None
+        return str(ip) if ip else None
 
+    addr_list = [ip_addr["ip"] for ip_addr in virt_handler_pod.instance.status.podIPs]
     ip_list = [ip for ip in addr_list if get_valid_ip_address(dst_ip=ip, family=family)]
     return ip_list[0] if ip_list else None
 
@@ -832,23 +602,6 @@ def get_valid_ip_address(dst_ip, family):
         return
 
 
-def ip_version_data_from_matrix(request):
-    """
-    Check if fixture ip_stack_version_matrix__<scope>__ is used in the flow, to indicate whether
-    it's a dual-stack test or not.
-
-    Args:
-        request (fixtures.SubRequest): Test's parameterized request.
-
-    Returns:
-        str: The IP family (IPv4 or IPv6) if the matrix fixture is used, else None.
-    """
-    ip_stack_matrix_fixture = [fix_name for fix_name in request.fixturenames if "ip_stack_version_matrix__" in fix_name]
-    if not ip_stack_matrix_fixture:
-        return
-    return request.getfixturevalue(ip_stack_matrix_fixture[0])
-
-
 def compose_cloud_init_data_dict(network_data=None, ipv6_network_data=None):
     init_data = {}
     interfaces_data = {"ethernets": {}}
@@ -859,116 +612,6 @@ def compose_cloud_init_data_dict(network_data=None, ipv6_network_data=None):
     if interfaces_data["ethernets"]:
         init_data.update(cloud_init_network_data(data=interfaces_data))
     return init_data
-
-
-def ovs_pods(admin_client, hco_namespace):
-    pods = utilities.infra.get_pod_by_name_prefix(
-        dyn_client=admin_client,
-        pod_prefix=OVS_DS_NAME,
-        namespace=hco_namespace,
-        get_all=True,
-    )
-    return [pod for pod in pods or [] if pod.instance.status.phase == Pod.Status.RUNNING]
-
-
-def wait_for_ovs_pods(admin_client, hco_namespace, count=0):
-    LOGGER.info(f"Wait for number of OVS pods to be: {count}")
-    samples = TimeoutSampler(
-        wait_timeout=150,
-        sleep=1,
-        func=ovs_pods,
-        admin_client=admin_client,
-        hco_namespace=hco_namespace,
-    )
-    num_of_pods = None
-    try:
-        for sample in samples:
-            num_of_pods = len(sample)
-            if num_of_pods == count:
-                return True
-
-    except TimeoutExpiredError:
-        LOGGER.error(f"Found {num_of_pods} OVS PODs, expected: {count}")
-        raise
-
-
-def wait_for_ovs_status(network_addons_config, status=True):
-    opt_log = "opt-in" if status else "opt-out"
-    resource_log = f"{network_addons_config.kind} {network_addons_config.name}"
-    LOGGER.info(f"Wait for {resource_log} OVS to be {opt_log}")
-    samples = TimeoutSampler(
-        wait_timeout=60,
-        sleep=1,
-        func=lambda: network_addons_config.instance.spec.ovs,
-    )
-
-    try:
-        for sample in samples:
-            # sample is {} when opt-out
-            if bool(sample) == status:
-                return True
-
-    except TimeoutExpiredError:
-        LOGGER.error(f"{resource_log} OVS should be {opt_log}")
-        raise
-
-
-def verify_ovs_installed_with_annotations(
-    admin_client,
-    ovs_daemonset,
-    hyperconverged_ovs_annotations_fetched,
-    network_addons_config,
-):
-    # Verify OVS
-    wait_for_ovs_status(network_addons_config=network_addons_config)
-    assert ovs_daemonset.exists, f"{OVS_DS_NAME} not found."
-    ovs_daemonset.wait_until_deployed()
-    # Verify annotations
-    assert hyperconverged_ovs_annotations_fetched, "No ovs annotations found."
-    # Verify pods
-    wait_for_ovs_pods(
-        admin_client=admin_client,
-        hco_namespace=ovs_daemonset.namespace,
-        count=ovs_daemonset.instance.status.desiredNumberScheduled,
-    )
-
-
-def get_ovs_daemonset(admin_client, hco_namespace):
-    return utilities.infra.get_daemonset_by_name(
-        admin_client=admin_client,
-        daemonset_name=OVS_DS_NAME,
-        namespace_name=hco_namespace.name,
-    )
-
-
-def wait_for_ovs_daemonset_deleted(ovs_daemonset):
-    samples = TimeoutSampler(wait_timeout=90, sleep=1, func=lambda: ovs_daemonset.exists)
-    try:
-        for sample in samples:
-            if not sample:
-                return True
-
-    except TimeoutExpiredError:
-        LOGGER.error("OVS daemonset exists after opt-out")
-        raise
-
-
-def wait_for_ovs_daemonset_resource(admin_client, hco_namespace):
-    samples = TimeoutSampler(
-        wait_timeout=30,
-        sleep=1,
-        func=get_ovs_daemonset,
-        admin_client=admin_client,
-        hco_namespace=hco_namespace,
-    )
-    try:
-        for sample in samples:
-            if sample:
-                return sample
-
-    except TimeoutExpiredError:
-        LOGGER.error("OVS daemonset doesn't exists after opt-in")
-        raise
 
 
 @contextlib.contextmanager
@@ -1016,24 +659,6 @@ def network_device(
         yield iface
 
 
-def enable_hyperconverged_ovs_annotations(
-    admin_client,
-    hco_namespace,
-    hyperconverged_resource,
-    network_addons_config,
-):
-    with ResourceEditorValidateHCOReconcile(
-        patches={hyperconverged_resource: {"metadata": {"annotations": {DEPLOY_OVS: "true"}}}},
-        list_resource_reconcile=[NetworkAddonsConfig],
-        wait_for_reconcile_post_update=True,
-        admin_client=admin_client,
-    ):
-        wait_for_ovs_status(network_addons_config=network_addons_config, status=True)
-        ovs_daemonset = wait_for_ovs_daemonset_resource(admin_client=admin_client, hco_namespace=hco_namespace)
-        ovs_daemonset.wait_until_deployed()
-        yield ovs_daemonset
-
-
 def cloud_init(ip_address):
     network_data_data = {"ethernets": {"eth1": {"addresses": [f"{ip_address}/24"]}}}
     return cloud_init_network_data(data=network_data_data)
@@ -1056,50 +681,6 @@ def is_destination_pingable_from_vm(
 
 def get_cluster_cni_type(admin_client):
     return Network(client=admin_client, name="cluster").instance.status.networkType
-
-
-def wait_for_ready_sriov_nodes(snns):
-    for status in (INPROGRESS, SriovNetworkNodePolicy.Status.SUCCEEDED):
-        for sriov_node_network_state in snns:
-            LOGGER.info(f"Checking state: {sriov_node_network_state.name}")
-            try:
-                sriov_node_network_state.wait_for_status_sync(wanted_status=status)
-            except TimeoutExpiredError:
-                if (
-                    status == INPROGRESS
-                    and sriov_node_network_state.instance.status.syncStatus == SriovNetworkNodePolicy.Status.SUCCEEDED
-                ):
-                    continue
-                else:
-                    LOGGER.error(
-                        f"Current status: {sriov_node_network_state.instance.status.syncStatus} expected: {status}"
-                    )
-                    raise
-
-
-def create_sriov_node_policy(
-    nncp_name,
-    namespace,
-    sriov_iface,
-    sriov_nodes_states,
-    sriov_resource_name,
-    client,
-    mtu=MTU_9000,
-):
-    with network_device(
-        interface_type=SRIOV,
-        nncp_name=nncp_name,
-        namespace=namespace,
-        sriov_iface=sriov_iface,
-        sriov_resource_name=sriov_resource_name,
-        # sriov operator doesnt pass the mtu to the VFs when using vfio-pci device driver (the one we are using)
-        # so the mtu parameter only affects the PF. we need to change the mtu manually on the VM.
-        mtu=mtu,
-        client=client,
-    ) as policy:
-        wait_for_ready_sriov_nodes(snns=sriov_nodes_states)
-        yield policy
-    wait_for_ready_sriov_nodes(snns=sriov_nodes_states)
 
 
 def wait_for_node_marked_by_bridge(bridge_nad: LinuxBridgeNetworkAttachmentDefinition, node: Node) -> None:

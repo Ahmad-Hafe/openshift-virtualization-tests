@@ -1,5 +1,3 @@
-# -*- coding: utf-8 -*-
-
 """
 Automatic refresh of CDI certificates test suite
 """
@@ -18,14 +16,10 @@ from ocp_resources.secret import Secret
 from pytest_testconfig import config as py_config
 from timeout_sampler import TimeoutSampler
 
-from utilities.constants import (
-    CDI_SECRETS,
-    TIMEOUT_1MIN,
-    TIMEOUT_3MIN,
-    TIMEOUT_5SEC,
-    TIMEOUT_10MIN,
-    Images,
-)
+from utilities.constants import Images
+from utilities.constants.pytest import QUARANTINED
+from utilities.constants.storage import CDI_SECRETS
+from utilities.constants.timeouts import TIMEOUT_1MIN, TIMEOUT_3MIN, TIMEOUT_5SEC, TIMEOUT_10MIN
 from utilities.hco import ResourceEditorValidateHCOReconcile
 from utilities.storage import (
     check_upload_virtctl_result,
@@ -58,13 +52,13 @@ def x509_cert_is_valid(cert, seconds):
     except subprocess.CalledProcessError as e:
         if "Certificate will expire" in e.output:
             return False
-        raise e
+        raise
     return True
 
 
 @pytest.fixture(scope="module")
 def secrets(admin_client, hco_namespace):
-    return Secret.get(dyn_client=admin_client, namespace=hco_namespace.name)
+    return Secret.get(client=admin_client, namespace=hco_namespace.name)
 
 
 @pytest.fixture()
@@ -82,9 +76,9 @@ def valid_cdi_certificates(secrets):
 
                 start = secret.certificate_not_before
                 end = secret.certificate_not_after
-                start_dt = datetime.datetime.strptime(start, RFC3339_FORMAT).replace(tzinfo=datetime.timezone.utc)
-                end_dt = datetime.datetime.strptime(end, RFC3339_FORMAT).replace(tzinfo=datetime.timezone.utc)
-                now_dt = datetime.datetime.now(datetime.timezone.utc)
+                start_dt = datetime.datetime.strptime(start, RFC3339_FORMAT).replace(tzinfo=datetime.UTC)
+                end_dt = datetime.datetime.strptime(end, RFC3339_FORMAT).replace(tzinfo=datetime.UTC)
+                now_dt = datetime.datetime.now(datetime.UTC)
                 assert start_dt <= now_dt <= end_dt, f"Certificate of {cdi_secret} not valid at current time"
 
 
@@ -96,7 +90,9 @@ def valid_aggregated_api_client_cert(kube_system_namespace):
     """
     aggregated_cm = "extension-apiserver-authentication"
     cert_end = "-----END CERTIFICATE-----\n"
-    cm_data = ConfigMap(namespace=kube_system_namespace.name, name=aggregated_cm).instance["data"]
+    cm_data = ConfigMap(
+        namespace=kube_system_namespace.name, name=aggregated_cm, client=kube_system_namespace.client
+    ).instance["data"]
     for cert_attr, cert_data in cm_data.items():
         if "ca-file" not in cert_attr:
             continue
@@ -190,6 +186,7 @@ def test_upload_after_certs_renewal(
     """
     dv_name = "cnv-3667"
     with virtctl_upload_dv(
+        client=unprivileged_client,
         namespace=namespace.name,
         name=dv_name,
         size=Images.Cirros.DEFAULT_DV_SIZE,
@@ -234,7 +231,8 @@ def test_import_clone_after_certs_renewal(
         dv_name="dv-target",
         namespace=namespace.name,
         size=data_volume_multi_storage_scope_module.size,
-        source_pvc=data_volume_multi_storage_scope_module.name,
+        source_pvc_name=data_volume_multi_storage_scope_module.name,
+        source_pvc_namespace=data_volume_multi_storage_scope_module.namespace,
         storage_class=data_volume_multi_storage_scope_module.storage_class,
     ) as cdv:
         cdv.wait_for_dv_success(timeout=TIMEOUT_3MIN)
@@ -255,6 +253,7 @@ def test_upload_after_validate_aggregated_api_cert(
     """
     dv_name = "cnv-3977"
     with virtctl_upload_dv(
+        client=namespace.client,
         namespace=namespace.name,
         name=dv_name,
         size=Images.Cirros.DEFAULT_DV_SIZE,
@@ -263,7 +262,7 @@ def test_upload_after_validate_aggregated_api_cert(
         insecure=True,
     ) as res:
         check_upload_virtctl_result(result=res)
-        dv = DataVolume(namespace=namespace.name, name=dv_name)
+        dv = DataVolume(namespace=namespace.name, name=dv_name, client=unprivileged_client)
         dv.wait_for_dv_success(timeout=TIMEOUT_1MIN)
         create_vm_from_dv(client=unprivileged_client, dv=dv)
 
@@ -276,9 +275,10 @@ def certificate_exists(cdi_spec, hco_spec):
 
 
 @pytest.fixture()
-def updated_certconfig_in_hco_cr(hyperconverged_resource_scope_function, certificate_exists):
+def updated_certconfig_in_hco_cr(admin_client, hyperconverged_resource_scope_function, certificate_exists):
     # Update cert rotation with a short interval for easy testing.
     with ResourceEditorValidateHCOReconcile(
+        admin_client=admin_client,
         patches={
             hyperconverged_resource_scope_function: {
                 "spec": {
@@ -303,6 +303,10 @@ def downloaded_cirros_image(tmpdir):
 
 @pytest.mark.s390x
 @pytest.mark.polarion("CNV-5708")
+@pytest.mark.xfail(
+    reason=f"{QUARANTINED}: Test fails when running from container; tracked in CNV-18870",
+    run=False,
+)
 def test_cert_exposure_rotation(
     enabled_ca,
     updated_certconfig_in_hco_cr,
@@ -310,6 +314,7 @@ def test_cert_exposure_rotation(
     downloaded_cirros_image,
 ):
     with virtctl_upload_dv(
+        client=namespace.client,
         namespace=namespace.name,
         name="cnv-5708",
         size=Images.Cirros.DEFAULT_DV_SIZE,

@@ -3,13 +3,11 @@ import logging
 import pytest
 from ocp_resources.resource import Resource
 from ocp_resources.virtual_machine import VirtualMachine
-from pytest_testconfig import config as py_config
 
-from tests.observability.metrics.utils import (
-    validate_vmi_node_cpu_affinity_with_prometheus,
-)
-from tests.observability.utils import validate_metrics_value
-from tests.os_params import RHEL_LATEST, RHEL_LATEST_LABELS, RHEL_LATEST_OS
+from libs.net.cluster import is_ipv6_single_stack_cluster
+from tests.observability.metrics.constants import KUBEVIRT_VMI_NODE_CPU_AFFINITY
+from tests.observability.metrics.utils import validate_vmi_node_cpu_affinity_with_prometheus
+from utilities.monitoring import validate_metrics_value
 from utilities.virt import VirtualMachineForTests, fedora_vm_body, running_vm
 
 KUBEVIRT_VM_TAG = f"{Resource.ApiGroup.KUBEVIRT_IO}/vm"
@@ -41,61 +39,51 @@ def fedora_vm_without_name_in_label(
         client=unprivileged_client,
         run_strategy=VirtualMachine.RunStrategy.ALWAYS,
     ) as vm:
-        running_vm(vm=vm, check_ssh_connectivity=False)
+        running_vm(vm=vm, wait_for_interfaces=False, check_ssh_connectivity=False)
         yield vm
 
 
 class TestVmiNodeCpuAffinityLinux:
-    @pytest.mark.parametrize(
-        "golden_image_data_volume_scope_class, vm_from_template_scope_class",
-        [
-            pytest.param(
-                {
-                    "dv_name": RHEL_LATEST_OS,
-                    "image": RHEL_LATEST["image_path"],
-                    "storage_class": py_config["default_storage_class"],
-                    "dv_size": RHEL_LATEST["dv_size"],
-                },
-                {
-                    "vm_name": "rhel-latest",
-                    "template_labels": RHEL_LATEST_LABELS,
-                    "guest_agent": False,
-                    "ssh": False,
-                },
-            ),
-        ],
-        indirect=True,
-    )
     @pytest.mark.polarion("CNV-7295")
     @pytest.mark.s390x
-    def test_kubevirt_vmi_node_cpu_affinity(self, prometheus, vm_from_template_scope_class):
-        validate_vmi_node_cpu_affinity_with_prometheus(
-            vm=vm_from_template_scope_class,
+    def test_kubevirt_vmi_node_cpu_affinity(
+        self,
+        prometheus,
+        vm_with_cpu_spec,
+        expected_cpu_affinity_metric_value,
+    ):
+        validate_metrics_value(
             prometheus=prometheus,
+            metric_name=KUBEVIRT_VMI_NODE_CPU_AFFINITY.format(vm_name=vm_with_cpu_spec.name),
+            expected_value=expected_cpu_affinity_metric_value,
         )
 
 
 @pytest.mark.tier3
+@pytest.mark.windows
 class TestVmiNodeCpuAffinityWindows:
     @pytest.mark.polarion("CNV-11883")
-    def test_kubevirt_vmi_node_cpu_affinity_windows_vm(self, prometheus, windows_vm_for_test):
+    def test_kubevirt_vmi_node_cpu_affinity_windows_vm(self, admin_client, prometheus, windows_vm_for_test):
         validate_vmi_node_cpu_affinity_with_prometheus(
             vm=windows_vm_for_test,
             prometheus=prometheus,
+            admin_client=admin_client,
         )
 
 
 class TestVmNameInLabel:
     @pytest.mark.polarion("CNV-8582")
     @pytest.mark.s390x
-    def test_vm_name_in_virt_launcher_label(self, fedora_vm_without_name_in_label):
+    def test_vm_name_in_virt_launcher_label(self, fedora_vm_without_name_in_label, admin_client):
         """
         when VM created from vm.yaml,for the kind=VirtualMachine, doesn't have
         the VM name in label, then virt-launcher pod should have the
         VM name in the label populated automatically
         """
         # Get the label of virt-launcher pod
-        virt_launcher_pod_labels = fedora_vm_without_name_in_label.vmi.virt_launcher_pod.labels
+        virt_launcher_pod_labels = fedora_vm_without_name_in_label.vmi.get_virt_launcher_pod(
+            privileged_client=admin_client
+        ).labels
         vm_name = fedora_vm_without_name_in_label.name
         assert virt_launcher_pod_labels.get(f"{Resource.ApiGroup.VM_KUBEVIRT_IO}/name") == vm_name, (
             f"VM name {vm_name} is missing in the virt-launcher pod label"
@@ -107,9 +95,9 @@ class TestVirtHCOSingleStackIpv6:
     @pytest.mark.ipv6
     @pytest.mark.polarion("CNV-11740")
     @pytest.mark.s390x
-    def test_metric_kubevirt_hco_single_stack_ipv6(self, prometheus, ipv6_single_stack_cluster):
+    def test_metric_kubevirt_hco_single_stack_ipv6(self, prometheus):
         validate_metrics_value(
             prometheus=prometheus,
             metric_name="kubevirt_hco_single_stack_ipv6",
-            expected_value="1" if ipv6_single_stack_cluster else "0",
+            expected_value="1" if is_ipv6_single_stack_cluster() else "0",
         )

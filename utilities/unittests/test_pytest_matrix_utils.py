@@ -2,12 +2,17 @@
 
 """Unit tests for pytest_matrix_utils module"""
 
+from inspect import signature
 from unittest.mock import MagicMock, patch
 
-from utilities.pytest_matrix_utils import (  # noqa: E402
+import pytest
+
+from utilities.pytest_matrix_utils import (
     hpp_matrix,
     immediate_matrix,
     online_resize_matrix,
+    rwx_matrix,
+    snapshot_import_cron_format_matrix,
     snapshot_matrix,
     wffc_matrix,
     without_snapshot_capability_matrix,
@@ -241,45 +246,139 @@ class TestImmediateMatrix:
         assert result == []
 
 
+class TestRwxMatrix:
+    """Test cases for rwx_matrix function"""
+
+    def test_rwx_matrix_with_rwx_enabled(self):
+        """Test rwx_matrix filters storage classes with ReadWriteMany access mode"""
+        matrix = [
+            {"sc-with-rwx": {"access_mode": "ReadWriteMany", "other": "value"}},
+            {"sc-with-rwo": {"access_mode": "ReadWriteOnce", "other": "value"}},
+            {"sc-with-rwx-2": {"access_mode": "ReadWriteMany", "other": "value"}},
+        ]
+
+        result = rwx_matrix(matrix)
+
+        assert len(result) == 2
+        assert {"sc-with-rwx": {"access_mode": "ReadWriteMany", "other": "value"}} in result
+        assert {"sc-with-rwx-2": {"access_mode": "ReadWriteMany", "other": "value"}} in result
+        assert {"sc-with-rwo": {"access_mode": "ReadWriteOnce", "other": "value"}} not in result
+
+    def test_rwx_matrix_empty_matrix(self):
+        """Test rwx_matrix with empty matrix"""
+        matrix = []
+
+        result = rwx_matrix(matrix)
+
+        assert result == []
+
+    def test_rwx_matrix_no_rwx_enabled(self):
+        """Test rwx_matrix with no RWX storage classes"""
+        matrix = [
+            {"sc-rwo-1": {"access_mode": "ReadWriteOnce", "other": "value"}},
+            {"sc-rwo-2": {"access_mode": "ReadWriteOnce", "other": "value"}},
+        ]
+
+        result = rwx_matrix(matrix)
+
+        assert result == []
+
+    def test_rwx_matrix_missing_access_mode_key(self):
+        """Test rwx_matrix fails fast when access_mode key is missing"""
+        matrix = [
+            {"sc-no-key": {"other": "value"}},
+        ]
+
+        with pytest.raises(KeyError, match="access_mode"):
+            rwx_matrix(matrix)
+
+
+class TestSnapshotImportCronFormatMatrix:
+    """Test cases for snapshot_import_cron_format_matrix function"""
+
+    def test_snapshot_import_cron_format_matrix_with_snapshot_format(self):
+        """Test snapshot_import_cron_format_matrix filters storage classes with snapshot data import cron source format"""
+        matrix = [
+            {"sc-snapshot-format": {"data_import_cron_source_format": "snapshot", "other": "value"}},
+            {"sc-pvc-format": {"data_import_cron_source_format": "pvc", "other": "value"}},
+            {"sc-snapshot-format-2": {"data_import_cron_source_format": "snapshot", "other": "value"}},
+        ]
+
+        result = snapshot_import_cron_format_matrix(matrix)
+
+        assert len(result) == 2
+        assert {"sc-snapshot-format": {"data_import_cron_source_format": "snapshot", "other": "value"}} in result
+        assert {"sc-snapshot-format-2": {"data_import_cron_source_format": "snapshot", "other": "value"}} in result
+        assert {"sc-pvc-format": {"data_import_cron_source_format": "pvc", "other": "value"}} not in result
+
+    def test_snapshot_import_cron_format_matrix_empty_matrix(self):
+        """Test snapshot_import_cron_format_matrix with empty matrix"""
+        matrix = []
+
+        result = snapshot_import_cron_format_matrix(matrix)
+
+        assert result == []
+
+    def test_snapshot_import_cron_format_matrix_no_snapshot_format(self):
+        """Test snapshot_import_cron_format_matrix with no snapshot format storage classes"""
+        matrix = [
+            {"sc-pvc-1": {"data_import_cron_source_format": "pvc", "other": "value"}},
+            {"sc-pvc-2": {"data_import_cron_source_format": "pvc", "other": "value"}},
+        ]
+
+        result = snapshot_import_cron_format_matrix(matrix)
+
+        assert result == []
+
+
 class TestMatrixFunctionSignatures:
     """Test that all matrix functions accept only matrix argument"""
 
     def test_snapshot_matrix_signature(self):
         """Test snapshot_matrix function signature"""
-        import inspect
 
-        sig = inspect.signature(snapshot_matrix)
+        sig = signature(snapshot_matrix)
         params = list(sig.parameters.keys())
         assert params == ["matrix"]
 
     def test_without_snapshot_capability_matrix_signature(self):
         """Test without_snapshot_capability_matrix function signature"""
-        import inspect
 
-        sig = inspect.signature(without_snapshot_capability_matrix)
+        sig = signature(without_snapshot_capability_matrix)
         params = list(sig.parameters.keys())
         assert params == ["matrix"]
 
     def test_online_resize_matrix_signature(self):
         """Test online_resize_matrix function signature"""
-        import inspect
 
-        sig = inspect.signature(online_resize_matrix)
+        sig = signature(online_resize_matrix)
         params = list(sig.parameters.keys())
         assert params == ["matrix"]
 
     def test_hpp_matrix_signature(self):
         """Test hpp_matrix function signature"""
-        import inspect
 
-        sig = inspect.signature(hpp_matrix)
+        sig = signature(hpp_matrix)
         params = list(sig.parameters.keys())
         assert params == ["matrix"]
 
     def test_wffc_matrix_signature(self):
         """Test wffc_matrix function signature"""
-        import inspect
 
-        sig = inspect.signature(wffc_matrix)
+        sig = signature(wffc_matrix)
+        params = list(sig.parameters.keys())
+        assert params == ["matrix"]
+
+    def test_rwx_matrix_signature(self):
+        """Test rwx_matrix function signature"""
+
+        sig = signature(rwx_matrix)
+        params = list(sig.parameters.keys())
+        assert params == ["matrix"]
+
+    def test_snapshot_import_cron_format_matrix_signature(self):
+        """Test snapshot_import_cron_format_matrix function signature"""
+
+        sig = signature(snapshot_import_cron_format_matrix)
         params = list(sig.parameters.keys())
         assert params == ["matrix"]

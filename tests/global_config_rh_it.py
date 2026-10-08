@@ -3,7 +3,7 @@ from typing import Any
 import pytest_testconfig
 from ocp_resources.datavolume import DataVolume
 
-from utilities.constants import StorageClassNames
+from utilities.constants.storage import StorageClassNames
 
 global config
 global_config = pytest_testconfig.load_python(py_file="tests/global_config.py", encoding="utf-8")
@@ -19,6 +19,7 @@ storage_class_matrix = [
             "online_resize": True,
             "wffc": False,
             "default": True,
+            "data_import_cron_source_format": "pvc",
         }
     },
 ]
@@ -27,7 +28,7 @@ storage_class_a = StorageClassNames.RH_INTERNAL_NFS
 storage_class_b = StorageClassNames.RH_INTERNAL_NFS
 
 for _dir in dir():
-    if not config:  # noqa: F821
+    if not config:
         config: dict[str, Any] = {}
     val = locals()[_dir]
     if type(val) not in [bool, list, dict, str]:
@@ -36,4 +37,4 @@ for _dir in dir():
     if _dir in ["encoding", "py_file"]:
         continue
 
-    config[_dir] = locals()[_dir]  # noqa: F821
+    config[_dir] = locals()[_dir]

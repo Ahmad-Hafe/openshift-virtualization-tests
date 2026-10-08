@@ -12,15 +12,20 @@ from tests.install_upgrade_operators.crypto_policy.utils import (
     set_hco_crypto_policy,
     update_apiserver_crypto_policy,
 )
-from utilities.constants import TIMEOUT_2MIN, TIMEOUT_10SEC
+from utilities.constants.pytest import QUARANTINED
+from utilities.constants.timeouts import (
+    TIMEOUT_2MIN,
+    TIMEOUT_10SEC,
+)
 
 LOGGER = logging.getLogger(__name__)
 pytestmark = pytest.mark.tier3
 
 
 @pytest.fixture()
-def updated_hco_tls_custom_policy(hyperconverged_resource_scope_function):
+def updated_hco_tls_custom_policy(admin_client, hyperconverged_resource_scope_function):
     with set_hco_crypto_policy(
+        admin_client=admin_client,
         hco_resource=hyperconverged_resource_scope_function,
         tls_spec=TLS_CUSTOM_PROFILE,
     ):
@@ -28,9 +33,10 @@ def updated_hco_tls_custom_policy(hyperconverged_resource_scope_function):
 
 
 @pytest.fixture()
-def expected_all_managed_crs_crypto_policies(resources_dict):
+def expected_all_managed_crs_crypto_policies(resources_dict, admin_client):
     return get_resources_crypto_policy_dict(
         resources_dict=resources_dict,
+        admin_client=admin_client,
     )
 
 
@@ -49,9 +55,14 @@ def updated_apiserver_with_tls_old_profile(
         yield
 
 
+@pytest.mark.xfail(
+    reason=f"{QUARANTINED}: CNV-91966 — crypto-policy teardown leaves cluster unhealthy on bare metal, CNV-95835",
+    run=False,
+)
 @pytest.mark.jira("RHSTOR-6566", run=False)  # <skip-jira-utils-check>
 @pytest.mark.polarion("CNV-9368")
 def test_hco_overriding_apiserver_crypto_policy(
+    admin_client,
     resources_dict,
     updated_hco_tls_custom_policy,
     expected_all_managed_crs_crypto_policies,
@@ -62,6 +73,7 @@ def test_hco_overriding_apiserver_crypto_policy(
         sleep=TIMEOUT_10SEC,
         func=get_resources_crypto_policy_dict,
         resources_dict=resources_dict,
+        admin_client=admin_client,
     )
     try:
         for sample in sampler:
@@ -69,7 +81,7 @@ def test_hco_overriding_apiserver_crypto_policy(
                 conflicting_resources = {
                     resource.kind: crypto_policy
                     for resource, crypto_policy in sample.items()
-                    if expected_all_managed_crs_crypto_policies[resource] != sample[resource]
+                    if expected_all_managed_crs_crypto_policies[resource] != crypto_policy
                 }
                 assert not conflicting_resources, (
                     "API server crypto policy overrides HCO crypto policy\n"

@@ -2,24 +2,25 @@
 Common templates test RHEL OS support
 """
 
+from __future__ import annotations
+
 import logging
+from typing import TYPE_CHECKING
 
 import pytest
 
 from tests.virt.cluster.common_templates.utils import (
     check_machine_type,
-    restart_qemu_guest_agent_service,
     validate_fs_info_virtctl_vs_linux_os,
     validate_os_info_virtctl_vs_linux_os,
     validate_user_info_virtctl_vs_linux_os,
     vm_os_version,
 )
 from utilities import console
-from utilities.constants import LINUX_STR
-from utilities.infra import validate_os_info_vmi_vs_linux_os
+from utilities.constants.instance_types import LINUX_STR
+from utilities.infra import assert_secure_boot_mokutil_status, validate_os_info_vmi_vs_linux_os
 from utilities.virt import (
     assert_linux_efi,
-    assert_vm_xml_efi,
     check_qemu_guest_agent_installed,
     check_vm_xml_smbios,
     migrate_vm_and_verify,
@@ -32,14 +33,22 @@ from utilities.virt import (
     wait_for_console,
 )
 
-pytestmark = [pytest.mark.post_upgrade, pytest.mark.gating]
+if TYPE_CHECKING:
+    from kubernetes.dynamic import DynamicClient
+
+    from utilities.virt import VirtualMachineForTests
+
+pytestmark = [
+    pytest.mark.post_upgrade,
+    pytest.mark.gating,
+    pytest.mark.data_collector_scope(scope="module"),
+]
 
 
 LOGGER = logging.getLogger(__name__)
 TESTS_CLASS_NAME = "TestCommonTemplatesRhel"
 
 
-@pytest.mark.usefixtures("cluster_cpu_model_scope_class")
 class TestCommonTemplatesRhel:
     @pytest.mark.arm64
     @pytest.mark.sno
@@ -59,7 +68,6 @@ class TestCommonTemplatesRhel:
     @pytest.mark.polarion("CNV-3266")
     def test_start_vm(self, matrix_rhel_os_vm_from_template):
         """Test CNV common templates VM initiation"""
-
         running_vm(vm=matrix_rhel_os_vm_from_template)
 
     @pytest.mark.arm64
@@ -85,13 +93,12 @@ class TestCommonTemplatesRhel:
     @pytest.mark.sno
     @pytest.mark.dependency(depends=[f"{TESTS_CLASS_NAME}::start_vm"])
     @pytest.mark.polarion("CNV-8712")
-    def test_efi_secureboot_enabled_by_default(
-        self, xfail_on_rhel_version_below_rhel9, matrix_rhel_os_vm_from_template
-    ):
+    @pytest.mark.usefixtures("xfail_on_rhel_version_below_rhel9")
+    def test_efi_secureboot_enabled_by_default(self, matrix_rhel_os_vm_from_template):
         """Test CNV common templates EFI secureboot status"""
 
-        assert_vm_xml_efi(vm=matrix_rhel_os_vm_from_template)
         assert_linux_efi(vm=matrix_rhel_os_vm_from_template)
+        assert_secure_boot_mokutil_status(vm=matrix_rhel_os_vm_from_template)
 
     @pytest.mark.arm64
     @pytest.mark.sno
@@ -111,9 +118,9 @@ class TestCommonTemplatesRhel:
     @pytest.mark.polarion("CNV-3320")
     def test_expose_ssh(self, matrix_rhel_os_vm_from_template):
         """CNV common templates access VM via SSH"""
-        assert matrix_rhel_os_vm_from_template.ssh_exec.executor().is_connective(  # noqa: E501
-            tcp_timeout=120
-        ), "Failed to login via SSH"
+        assert matrix_rhel_os_vm_from_template.ssh_exec.executor().is_connective(tcp_timeout=120), (
+            "Failed to login via SSH"
+        )
 
     @pytest.mark.arm64
     @pytest.mark.sno
@@ -138,27 +145,24 @@ class TestCommonTemplatesRhel:
     @pytest.mark.sno
     @pytest.mark.dependency(depends=[f"{TESTS_CLASS_NAME}::vmi_guest_agent"])
     @pytest.mark.polarion("CNV-4195")
-    def test_virtctl_guest_agent_os_info(self, matrix_rhel_os_vm_from_template, rhel_os_matrix__class__):
-        # QGA Service restart is needed because of bugs 1910326 and 1845127
-        # when test rhel7, we need to restart QGA to synchronize hostname to the kernel
-        if "rhel-7" in [*rhel_os_matrix__class__][0]:
-            restart_qemu_guest_agent_service(vm=matrix_rhel_os_vm_from_template)
-        validate_os_info_virtctl_vs_linux_os(vm=matrix_rhel_os_vm_from_template)
+    def test_virtctl_guest_agent_os_info(self, admin_client, matrix_rhel_os_vm_from_template):
+        validate_os_info_virtctl_vs_linux_os(vm=matrix_rhel_os_vm_from_template, admin_client=admin_client)
 
     @pytest.mark.arm64
     @pytest.mark.sno
     @pytest.mark.dependency(depends=[f"{TESTS_CLASS_NAME}::vmi_guest_agent"])
     @pytest.mark.polarion("CNV-4550")
-    def test_virtctl_guest_agent_user_info(self, matrix_rhel_os_vm_from_template):
+    def test_virtctl_guest_agent_user_info(self, admin_client, matrix_rhel_os_vm_from_template):
         with console.Console(vm=matrix_rhel_os_vm_from_template):
-            validate_user_info_virtctl_vs_linux_os(vm=matrix_rhel_os_vm_from_template)
+            validate_user_info_virtctl_vs_linux_os(vm=matrix_rhel_os_vm_from_template, admin_client=admin_client)
 
     @pytest.mark.arm64
     @pytest.mark.sno
     @pytest.mark.dependency(depends=[f"{TESTS_CLASS_NAME}::vmi_guest_agent"])
     @pytest.mark.polarion("CNV-6531")
-    def test_virtctl_guest_agent_fs_info(self, xfail_rhel_with_old_guest_agent, matrix_rhel_os_vm_from_template):
-        validate_fs_info_virtctl_vs_linux_os(vm=matrix_rhel_os_vm_from_template)
+    @pytest.mark.usefixtures("xfail_rhel_with_old_guest_agent")
+    def test_virtctl_guest_agent_fs_info(self, admin_client, matrix_rhel_os_vm_from_template):
+        validate_fs_info_virtctl_vs_linux_os(vm=matrix_rhel_os_vm_from_template, admin_client=admin_client)
 
     @pytest.mark.arm64
     @pytest.mark.sno
@@ -171,8 +175,10 @@ class TestCommonTemplatesRhel:
     @pytest.mark.sno
     @pytest.mark.dependency(depends=[f"{TESTS_CLASS_NAME}::start_vm"])
     @pytest.mark.polarion("CNV-4201")
-    def test_vm_smbios_default(self, smbios_from_kubevirt_config, matrix_rhel_os_vm_from_template):
-        check_vm_xml_smbios(vm=matrix_rhel_os_vm_from_template, cm_values=smbios_from_kubevirt_config)
+    def test_vm_smbios_default(self, admin_client, smbios_from_kubevirt_config, matrix_rhel_os_vm_from_template):
+        check_vm_xml_smbios(
+            vm=matrix_rhel_os_vm_from_template, cm_values=smbios_from_kubevirt_config, admin_client=admin_client
+        )
 
     @pytest.mark.arm64
     @pytest.mark.sno
@@ -188,11 +194,11 @@ class TestCommonTemplatesRhel:
     @pytest.mark.dependency(
         name=f"{TESTS_CLASS_NAME}::migrate_vm_and_verify", depends=[f"{TESTS_CLASS_NAME}::vm_expose_ssh"]
     )
-    def test_migrate_vm(self, matrix_rhel_os_vm_from_template):
+    def test_migrate_vm(self, admin_client: DynamicClient, matrix_rhel_os_vm_from_template: VirtualMachineForTests):
         """Test SSH connectivity after migration"""
         vm = matrix_rhel_os_vm_from_template
-        migrate_vm_and_verify(vm=vm, check_ssh_connectivity=True)
-        validate_libvirt_persistent_domain(vm=vm)
+        migrate_vm_and_verify(vm=vm, client=admin_client, check_ssh_connectivity=True)
+        validate_libvirt_persistent_domain(vm=vm, admin_client=admin_client)
 
     @pytest.mark.arm64
     @pytest.mark.polarion("CNV-5902")
@@ -220,11 +226,12 @@ class TestCommonTemplatesRhel:
 
     @pytest.mark.polarion("CNV-6951")
     @pytest.mark.dependency(depends=[f"{TESTS_CLASS_NAME}::start_vm"])
-    def test_efi_secureboot_disabled(self, xfail_on_rhel_version_below_rhel9, matrix_rhel_os_vm_from_template):
+    @pytest.mark.usefixtures("xfail_on_rhel_version_below_rhel9")
+    def test_efi_secureboot_disabled(self, matrix_rhel_os_vm_from_template):
         vm = matrix_rhel_os_vm_from_template
         update_vm_efi_spec_and_restart(vm=vm, spec={"secureBoot": False})
-        assert_vm_xml_efi(vm=vm, secure_boot_enabled=False)
         assert_linux_efi(vm=vm)
+        assert_secure_boot_mokutil_status(vm=vm, expected_enabled=False)
 
     @pytest.mark.arm64
     @pytest.mark.sno

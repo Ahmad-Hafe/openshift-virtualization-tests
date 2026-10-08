@@ -1,5 +1,3 @@
-# -*- coding: utf-8 -*-
-
 """
 Tests to check, the default Security Context Constraint
 """
@@ -17,8 +15,8 @@ pytestmark = [
 
 
 @pytest.fixture(scope="module")
-def privileged_scc():
-    yield SecurityContextConstraints(name="privileged")
+def privileged_scc(admin_client):
+    yield SecurityContextConstraints(name="privileged", client=admin_client)
 
 
 @pytest.mark.polarion("CNV-4439")

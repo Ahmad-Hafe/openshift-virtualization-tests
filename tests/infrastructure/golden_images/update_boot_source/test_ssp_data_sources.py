@@ -5,7 +5,6 @@ import pytest
 from kubernetes.dynamic.exceptions import ResourceNotFoundError
 from ocp_resources.data_import_cron import DataImportCron
 from ocp_resources.data_source import DataSource
-from ocp_resources.datavolume import DataVolume
 from ocp_resources.resource import ResourceEditor
 from pytest_testconfig import py_config
 from timeout_sampler import TimeoutExpiredError, TimeoutSampler
@@ -14,18 +13,17 @@ from tests.infrastructure.golden_images.constants import (
     CUSTOM_DATA_IMPORT_CRON_NAME,
     CUSTOM_DATA_SOURCE_NAME,
     DATA_SOURCE_READY_FOR_CONSUMPTION_MESSAGE,
-    DEFAULT_FEDORA_REGISTRY_URL,
     PVC_NOT_FOUND_ERROR,
 )
-from tests.utils import get_parameters_from_template
-from utilities.artifactory import (
-    cleanup_artifactory_secret_and_config_map,
-    get_artifactory_config_map,
-    get_artifactory_secret,
-    get_http_image_url,
+from tests.infrastructure.golden_images.update_boot_source.utils import (
+    fedora_dv_for_data_source,
+    wait_for_data_source_unchanged_referenced_volume,
+    wait_for_data_source_updated_referenced_volume,
 )
-from utilities.constants import DATA_SOURCE_NAME, TIMEOUT_5MIN, TIMEOUT_10MIN, Images
-from utilities.exceptions import ResourceValueError
+from tests.utils import get_parameters_from_template
+from utilities.constants.hco import DATA_SOURCE_NAME
+from utilities.constants.images import DEFAULT_FEDORA_REGISTRY_URL
+from utilities.constants.timeouts import TIMEOUT_5MIN
 from utilities.ssp import wait_for_condition_message_value
 
 LOGGER = logging.getLogger(__name__)
@@ -37,89 +35,8 @@ DATA_SOURCE_MANAGED_BY_CDI_LABEL = f"{DataSource.ApiGroup.CDI_KUBEVIRT_IO}/dataI
 pytestmark = pytest.mark.post_upgrade
 
 
-@contextmanager
-def dv_for_data_source(name, data_source, admin_client):
-    artifactory_secret = get_artifactory_secret(namespace=data_source.namespace)
-    artifactory_config_map = get_artifactory_config_map(namespace=data_source.namespace)
-    with DataVolume(
-        client=admin_client,
-        name=name,
-        namespace=data_source.namespace,
-        # underlying OS is not relevant
-        url=get_http_image_url(image_directory=Images.Cirros.DIR, image_name=Images.Cirros.QCOW2_IMG),
-        source="http",
-        secret=artifactory_secret,
-        cert_configmap=artifactory_config_map.name,
-        size=Images.Cirros.DEFAULT_DV_SIZE,
-        storage_class=py_config["default_storage_class"],
-        bind_immediate_annotation=True,
-        api_name="storage",
-    ) as dv:
-        dv.wait_for_dv_success()
-        wait_for_condition_message_value(
-            resource=data_source,
-            expected_message=DATA_SOURCE_READY_FOR_CONSUMPTION_MESSAGE,
-        )
-        yield dv
-    cleanup_artifactory_secret_and_config_map(
-        artifactory_secret=artifactory_secret, artifactory_config_map=artifactory_config_map
-    )
-
-
 def opt_in_status_str(opt_in):
     return f"opt-{'in' if opt_in else 'out'}"
-
-
-def wait_for_data_source_reconciliation_after_update(
-    data_source, opt_in, volume_name_before_reconcile=DUMMY_VOLUME_NAME
-):
-    LOGGER.info(f"{opt_in_status_str(opt_in=opt_in)}: Verify DataSource {data_source.name} is reconciled after update.")
-    try:
-        for sample in TimeoutSampler(
-            wait_timeout=TIMEOUT_10MIN,
-            sleep=5,
-            func=lambda: data_source.source.name != volume_name_before_reconcile,
-        ):
-            if sample:
-                return
-    except TimeoutExpiredError:
-        LOGGER.error(f"dataSource {data_source.name} was not reconciled")
-        raise
-
-
-def wait_for_data_source_unchanged_referenced_volume(data_source, volume_name):
-    try:
-        for sample in TimeoutSampler(
-            wait_timeout=TIMEOUT_10MIN,
-            sleep=5,
-            func=lambda: data_source.source.name != volume_name,
-        ):
-            if sample:
-                raise ResourceValueError(
-                    f"DataSource {data_source.name} volume reference was updated, "
-                    f"expected {volume_name}, "
-                    f"spec: {data_source.instance.spec}"
-                )
-    except TimeoutExpiredError:
-        return
-
-
-def wait_for_data_source_updated_referenced_volume(data_source, volume_name):
-    try:
-        for sample in TimeoutSampler(
-            wait_timeout=TIMEOUT_10MIN,
-            sleep=5,
-            func=lambda: data_source.source.name == volume_name,
-        ):
-            if sample:
-                return
-    except TimeoutExpiredError:
-        LOGGER.error(
-            f"dataSource {data_source.name} volume reference was not updated, "
-            f"expected {volume_name}, "
-            f"spec: {data_source.instance.spec}"
-        )
-        raise
 
 
 def delete_data_source_and_wait_for_reconciliation(data_source, opt_in):
@@ -224,7 +141,7 @@ def update_data_source(data_source):
 
 @pytest.fixture()
 def golden_images_data_sources_scope_function(admin_client, golden_images_namespace):
-    return list(DataSource.get(dyn_client=admin_client, namespace=golden_images_namespace.name))
+    return list(DataSource.get(client=admin_client, namespace=golden_images_namespace.name))
 
 
 @pytest.fixture()
@@ -240,10 +157,10 @@ def data_sources_managed_by_data_import_crons_scope_function(
 
 @pytest.fixture()
 def data_sources_names_from_templates_scope_function(base_templates):
-    return set([
+    return {
         get_parameters_from_template(template=template, parameter_subset=DATA_SOURCE_NAME)[DATA_SOURCE_NAME]
         for template in base_templates
-    ])
+    }
 
 
 @pytest.fixture()
@@ -252,11 +169,6 @@ def data_sources_from_templates_scope_function(admin_client, data_sources_names_
         DataSource(client=admin_client, name=data_source_name, namespace=py_config["golden_images_namespace"])
         for data_source_name in data_sources_names_from_templates_scope_function
     ]
-
-
-@pytest.fixture()
-def data_source_by_name_scope_function(request, unprivileged_client, golden_images_namespace):
-    return DataSource(client=unprivileged_client, name=request.param, namespace=golden_images_namespace.name)
 
 
 @pytest.fixture(scope="class")
@@ -301,6 +213,7 @@ def opted_out_data_source_scope_class(
     ):
         wait_for_data_source_updated_referenced_volume(
             data_source=data_source_by_name_scope_class,
+            match_volume_name=True,
             volume_name=created_dv_for_data_import_cron_managed_data_source_scope_class.name,
         )
         yield
@@ -310,10 +223,8 @@ def opted_out_data_source_scope_class(
 def uploaded_dv_for_dangling_data_source_scope_function(admin_client, data_source_by_name_scope_function):
     expected_pvc_name = data_source_by_name_scope_function.instance.spec.source.pvc.name
     LOGGER.info(f"Create DV {expected_pvc_name} for DataSource {data_source_by_name_scope_function.name}")
-    with dv_for_data_source(
-        name=expected_pvc_name,
-        data_source=data_source_by_name_scope_function,
-        admin_client=admin_client,
+    with fedora_dv_for_data_source(
+        name=expected_pvc_name, data_source=data_source_by_name_scope_function, client=admin_client
     ) as dv:
         yield dv
 
@@ -322,10 +233,10 @@ def uploaded_dv_for_dangling_data_source_scope_function(admin_client, data_sourc
 def created_dv_for_data_import_cron_managed_data_source_scope_function(
     admin_client, golden_images_namespace, data_source_by_name_scope_function
 ):
-    with dv_for_data_source(
+    with fedora_dv_for_data_source(
         name=data_source_by_name_scope_function.instance.spec.source.pvc.name,
         data_source=data_source_by_name_scope_function,
-        admin_client=admin_client,
+        client=admin_client,
     ) as dv:
         yield dv
 
@@ -334,10 +245,10 @@ def created_dv_for_data_import_cron_managed_data_source_scope_function(
 def created_dv_for_data_import_cron_managed_data_source_scope_class(
     admin_client, golden_images_namespace, data_source_by_name_scope_class
 ):
-    with dv_for_data_source(
+    with fedora_dv_for_data_source(
         name=data_source_by_name_scope_class.instance.spec.source.pvc.name,
         data_source=data_source_by_name_scope_class,
-        admin_client=admin_client,
+        client=admin_client,
     ) as dv:
         yield dv
 
@@ -404,8 +315,10 @@ def test_opt_in_data_source_reconciles_after_deletion(
 def test_opt_in_data_source_reconciles_after_update(
     updated_opted_in_data_source_scope_function,
 ):
-    wait_for_data_source_reconciliation_after_update(
-        data_source=updated_opted_in_data_source_scope_function, opt_in=True
+    wait_for_data_source_updated_referenced_volume(
+        data_source=updated_opted_in_data_source_scope_function,
+        match_volume_name=False,
+        volume_name=DUMMY_VOLUME_NAME,
     )
 
 
@@ -457,12 +370,15 @@ def test_opt_out_data_source_reconciles_after_update(
     disabled_common_boot_image_import_hco_spec_scope_function,
     updated_opted_out_data_source_scope_function,
 ):
-    wait_for_data_source_reconciliation_after_update(
-        data_source=updated_opted_out_data_source_scope_function, opt_in=False
+    wait_for_data_source_updated_referenced_volume(
+        data_source=updated_opted_out_data_source_scope_function,
+        match_volume_name=False,
+        volume_name=DUMMY_VOLUME_NAME,
     )
 
 
 @pytest.mark.polarion("CNV-8100")
+@pytest.mark.s390x
 def test_opt_out_data_source_update(
     disabled_common_boot_image_import_hco_spec_scope_function,
     data_sources_from_templates_scope_function,
@@ -560,6 +476,7 @@ class TestDataSourcesOptInLabel:
         LOGGER.info("Verify DataSource is managed by DataImportCron after labelled and a PVC exists.")
         wait_for_data_source_updated_referenced_volume(
             data_source=data_source_by_name_scope_class,
+            match_volume_name=True,
             volume_name=data_source_referenced_volume_scope_class,
         )
 
@@ -568,9 +485,10 @@ class TestDataSourcesOptInLabel:
     def test_opt_in_label_data_source_reconciles_after_update_with_existing_pvc(
         self, updated_data_source_with_existing_pvc_scope_function
     ):
-        wait_for_data_source_reconciliation_after_update(
+        wait_for_data_source_updated_referenced_volume(
             data_source=updated_data_source_with_existing_pvc_scope_function,
-            opt_in=True,
+            match_volume_name=False,
+            volume_name=DUMMY_VOLUME_NAME,
         )
         wait_for_data_import_cron_label_in_data_source_when_opt_in(
             data_source=updated_data_source_with_existing_pvc_scope_function,
@@ -621,9 +539,10 @@ class TestDataSourcesOptOutLabel:
     def test_opt_out_label_data_source_reconciles_after_update_with_existing_pvc(
         self, updated_data_source_with_existing_pvc_scope_function
     ):
-        wait_for_data_source_reconciliation_after_update(
+        wait_for_data_source_updated_referenced_volume(
             data_source=updated_data_source_with_existing_pvc_scope_function,
-            opt_in=False,
+            match_volume_name=False,
+            volume_name=DUMMY_VOLUME_NAME,
         )
         wait_for_data_import_cron_label_in_data_source_when_opt_in(
             data_source=updated_data_source_with_existing_pvc_scope_function,
@@ -651,8 +570,8 @@ class TestDataSourcesOptOutLabel:
         wait_for_data_import_cron_label_in_data_source_when_opt_in(
             data_source=data_source_by_name_scope_class, opt_in=True
         )
-        wait_for_data_source_reconciliation_after_update(
+        wait_for_data_source_updated_referenced_volume(
             data_source=data_source_by_name_scope_class,
-            opt_in=True,
-            volume_name_before_reconcile=created_dv_for_data_import_cron_managed_data_source_scope_class.name,
+            match_volume_name=False,
+            volume_name=created_dv_for_data_import_cron_managed_data_source_scope_class.name,
         )

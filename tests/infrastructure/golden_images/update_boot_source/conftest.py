@@ -12,19 +12,18 @@ from ocp_resources.ssp import SSP
 from pytest_testconfig import py_config
 from timeout_sampler import TimeoutExpiredError, TimeoutSampler
 
-from tests.infrastructure.golden_images.constants import DEFAULT_FEDORA_REGISTRY_URL
 from tests.infrastructure.golden_images.update_boot_source.utils import (
     generate_data_import_cron_dict,
-    get_all_dic_volume_names,
     get_all_release_versions_from_docs,
 )
-from utilities.constants import (
-    BIND_IMMEDIATE_ANNOTATION,
+from utilities.constants import Images
+from utilities.constants.images import DEFAULT_FEDORA_REGISTRY_URL
+from utilities.constants.storage import BIND_IMMEDIATE_ANNOTATION
+from utilities.constants.timeouts import (
     TIMEOUT_1MIN,
     TIMEOUT_2MIN,
     TIMEOUT_5SEC,
     TIMEOUT_10MIN,
-    Images,
 )
 from utilities.hco import (
     ResourceEditorValidateHCOReconcile,
@@ -38,6 +37,11 @@ from utilities.storage import data_volume_template_with_source_ref_dict
 from utilities.virt import VirtualMachineForTests, running_vm
 
 LOGGER = logging.getLogger(__name__)
+
+
+@pytest.fixture()
+def data_source_by_name_scope_function(request, admin_client, golden_images_namespace):
+    return DataSource(client=admin_client, name=request.param, namespace=golden_images_namespace.name)
 
 
 @pytest.fixture()
@@ -67,15 +71,20 @@ def enabled_common_boot_image_import_feature_gate_scope_class(
 
 
 @pytest.fixture()
-def updated_hco_with_custom_data_import_cron_scope_function(request, hyperconverged_resource_scope_function):
+def updated_hco_with_custom_data_import_cron_scope_function(
+    request, admin_client, hyperconverged_resource_scope_function
+):
     data_import_cron_dict = generate_data_import_cron_dict(
         name=request.param["data_import_cron_name"],
         source_url=request.param["data_import_cron_source_url"],
         managed_data_source_name=request.param["managed_data_source_name"],
     )
     with ResourceEditorValidateHCOReconcile(
+        admin_client=admin_client,
         patches={
-            hyperconverged_resource_scope_function: {"spec": {"dataImportCronTemplates": [data_import_cron_dict]}}
+            hyperconverged_resource_scope_function: {
+                "spec": {"workloadSources": {"dataImportCronTemplates": [data_import_cron_dict]}}
+            }
         },
         list_resource_reconcile=[SSP, CDI],
     ):
@@ -94,7 +103,7 @@ def custom_data_import_cron_scope_function(
         sleep=5,
         func=lambda: list(
             DataImportCron.get(
-                dyn_client=admin_client,
+                client=admin_client,
                 name=expected_data_import_cron_name,
                 namespace=golden_images_namespace.name,
             )
@@ -111,7 +120,7 @@ def custom_data_source_scope_function(admin_client, custom_data_import_cron_scop
     try:
         return list(
             DataSource.get(
-                dyn_client=admin_client,
+                client=admin_client,
                 name=custom_data_source_name,
                 namespace=custom_data_import_cron_scope_function.namespace,
             )
@@ -164,7 +173,11 @@ def updated_data_import_cron(
     with ResourceEditor(
         patches={
             hyperconverged_resource_scope_function: {
-                "spec": {"dataImportCronTemplates": [updated_hco_with_custom_data_import_cron_scope_function]}
+                "spec": {
+                    "workloadSources": {
+                        "dataImportCronTemplates": [updated_hco_with_custom_data_import_cron_scope_function]
+                    }
+                }
             }
         }
     ):
@@ -213,11 +226,11 @@ def data_import_cron_namespace(admin_client, unprivileged_client):
 
 
 @pytest.fixture()
-def created_persistent_volume_claim(unprivileged_client, data_import_cron_namespace):
+def data_import_cron_pvc(unprivileged_client, data_import_cron_namespace):
     def _get_first_pvc():
         return next(
             PersistentVolumeClaim.get(
-                dyn_client=unprivileged_client,
+                client=unprivileged_client,
                 namespace=data_import_cron_namespace.name,
             ),
             None,
@@ -230,14 +243,12 @@ def created_persistent_volume_claim(unprivileged_client, data_import_cron_namesp
             func=_get_first_pvc,
         ):
             if sample:
-                created_dv = DataVolume(
+                DataVolume(
                     name=sample.name,
                     namespace=sample.namespace,
                     client=unprivileged_client,
-                )
-                created_dv.wait_for_dv_success()
+                ).wait_for_dv_success()
                 yield sample
-                created_dv.clean_up()
                 return
     except TimeoutExpiredError:
         LOGGER.error(f"No PVCs were created in {data_import_cron_namespace.name}")
@@ -266,6 +277,7 @@ def created_data_import_cron(
     with DataImportCron(
         name="data-import-cron-for-test",
         namespace=data_import_cron_namespace.name,
+        client=unprivileged_client,
         managed_data_source=golden_images_data_import_cron_spec.managedDataSource,
         schedule=golden_images_data_import_cron_spec.schedule,
         annotations=BIND_IMMEDIATE_ANNOTATION,
@@ -284,8 +296,3 @@ def created_data_import_cron(
         },
     ) as data_import_cron:
         yield data_import_cron
-
-
-@pytest.fixture
-def existing_dic_volumes_before_disable(admin_client, golden_images_namespace):
-    return get_all_dic_volume_names(client=admin_client, namespace=golden_images_namespace.name)

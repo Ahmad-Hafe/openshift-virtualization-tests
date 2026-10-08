@@ -1,6 +1,7 @@
 import importlib
 import logging
 import pkgutil
+import re
 
 import pytest
 from kubernetes.dynamic.exceptions import ResourceNotFoundError
@@ -12,30 +13,81 @@ from ocp_resources.storage_class import StorageClass
 from pytest_testconfig import py_config
 
 from tests.install_upgrade_operators.constants import (
+    EXPECTED_KUBEVIRT_HARDCODED_FEATUREGATES,
     RESOURCE_NAME_STR,
     RESOURCE_NAMESPACE_STR,
     RESOURCE_TYPE_STR,
+    S390X_SPECIFIC_KUBEVIRT_FEATUREGATES,
 )
+from tests.install_upgrade_operators.relationship_labels.constants import PART_OF_LABEL_KEY
 from tests.install_upgrade_operators.utils import (
     get_network_addon_config,
     get_resource_by_name,
-    get_resource_from_module_name,
+    get_resource_from_related_object,
 )
-from utilities.constants import HOSTPATH_PROVISIONER_CSI, HPP_POOL
+from utilities.constants.components import (
+    HCO_OPERATOR,
+    HCO_PART_OF_LABEL_VALUE,
+    HOSTPATH_PROVISIONER_CSI,
+    HPP_POOL,
+)
 from utilities.hco import ResourceEditorValidateHCOReconcile, get_hco_version
 from utilities.infra import (
     get_daemonset_by_name,
     get_deployment_by_name,
     get_pod_by_name_prefix,
+    wait_for_version_explorer_response,
 )
+from utilities.jira import is_jira_open
 from utilities.operator import (
     disable_default_sources_in_operatorhub,
     get_machine_config_pools_conditions,
 )
+from utilities.pytest_utils import exit_pytest_execution
 from utilities.storage import get_hyperconverged_cdi
 from utilities.virt import get_hyperconverged_kubevirt
 
 LOGGER = logging.getLogger(__name__)
+
+
+@pytest.fixture(scope="session")
+def discovered_cnv_deployments(admin_client, hco_namespace):
+    """Discover CNV deployments in the HCO namespace.
+
+    Returns:
+        tuple[Deployment, ...]: Deployments matching the HCO part-of label.
+    """
+    return tuple(
+        Deployment.get(
+            client=admin_client,
+            namespace=hco_namespace.name,
+            label_selector=f"{PART_OF_LABEL_KEY}={HCO_PART_OF_LABEL_VALUE}",
+        )
+    )
+
+
+@pytest.fixture(scope="session")
+def iib_build_info(cnv_source, cnv_image_url, admin_client):
+    """Queries Version Explorer for IIB build info.
+
+    Returns:
+        Build info dict for osbs/fbc sources, empty dict for other sources.
+    """
+    if cnv_source in ("osbs", "fbc"):
+        iib_format_match = re.search(r"/iib:(\d+)$", cnv_image_url)
+        assert iib_format_match, f"Cannot extract IIB number from: {cnv_image_url} (expected format: .../iib:<number>)"
+        iib_number = iib_format_match.group(1)
+
+        if build_info := wait_for_version_explorer_response(
+            api_end_point="GetBuildByIIB",
+            query_string=f"iib_number={iib_number}",
+        ):
+            return build_info
+        exit_pytest_execution(
+            admin_client=admin_client,
+            log_message=f"Version Explorer returned empty response for IIB {iib_number}.",
+        )
+    return {}
 
 
 @pytest.fixture()
@@ -46,7 +98,7 @@ def cnv_deployment_by_name(admin_client, hco_namespace, hpp_cr_installed, cnv_de
             pytest.xfail(f"{deployment_name} deployment shouldn't be present on the cluster if HPP CR is not installed")
         hpp_pool_deployments = list(
             Deployment.get(
-                dyn_client=admin_client,
+                client=admin_client,
                 namespace=hco_namespace.name,
                 label_selector=f"{StorageClass.Provisioner.HOSTPATH_CSI}/storagePool=hpp-csi-pvc-block-hpp",
             )
@@ -57,6 +109,7 @@ def cnv_deployment_by_name(admin_client, hco_namespace, hpp_cr_installed, cnv_de
     return get_deployment_by_name(
         namespace_name=hco_namespace.name,
         deployment_name=deployment_name,
+        admin_client=admin_client,
     )
 
 
@@ -88,7 +141,7 @@ def cnv_pods_by_type(
     if pod_prefix.startswith((HOSTPATH_PROVISIONER_CSI, HPP_POOL)) and not hpp_cr_installed:
         pytest.xfail(f"{pod_prefix} pods shouldn't be present on the cluster if HPP CR is not installed")
     pod_list = get_pod_by_name_prefix(
-        dyn_client=admin_client,
+        client=admin_client,
         namespace=hco_namespace.name,
         pod_prefix=pod_prefix,
         get_all=True,
@@ -136,6 +189,7 @@ def updated_hco_cr(request, hyperconverged_resource_scope_function, admin_client
     This fixture updates HCO CR with values specified via request.param
     """
     with ResourceEditorValidateHCOReconcile(
+        admin_client=admin_client,
         patches={hyperconverged_resource_scope_function: request.param["patch"]},
         list_resource_reconcile=request.param.get("list_resource_reconcile", [NetworkAddonsConfig, CDI, KubeVirt]),
         wait_for_reconcile_post_update=True,
@@ -149,6 +203,7 @@ def updated_kubevirt_cr(request, kubevirt_resource, admin_client, hco_namespace)
     Attempts to update kubevirt CR
     """
     with ResourceEditorValidateHCOReconcile(
+        admin_client=admin_client,
         patches={kubevirt_resource: request.param["patch"]},
         list_resource_reconcile=[KubeVirt],
         wait_for_reconcile_post_update=True,
@@ -164,6 +219,16 @@ def ssp_cr_spec(ssp_resource_scope_function):
 @pytest.fixture(scope="module")
 def hco_spec_scope_module(hyperconverged_resource_scope_module):
     return hyperconverged_resource_scope_module.instance.to_dict()["spec"]
+
+
+@pytest.fixture()
+def xfail_if_sriov_conforma_jira_open_and_hco_operator(admin_client, hco_namespace, request):
+    try:
+        is_hco_operator = request.getfixturevalue("cnv_deployment_by_name").name == HCO_OPERATOR
+    except pytest.FixtureLookupError:
+        is_hco_operator = any(pod.name.startswith(HCO_OPERATOR) for pod in request.getfixturevalue("cnv_pods_by_type"))
+    if not is_hco_operator:
+        return
 
 
 @pytest.fixture(scope="class")
@@ -192,7 +257,7 @@ def machine_config_pools_conditions_scope_module(machine_config_pools):
 
 @pytest.fixture()
 def ocp_resource_by_name(admin_client, ocp_resources_submodule_list, related_object_from_hco_status):
-    return get_resource_from_module_name(
+    return get_resource_from_related_object(
         related_obj=related_object_from_hco_status,
         ocp_resources_submodule_list=ocp_resources_submodule_list,
         admin_client=admin_client,
@@ -221,17 +286,33 @@ def related_object_from_hco_status(
 @pytest.fixture()
 def updated_resource(
     request,
+    admin_client,
 ):
     cr_kind = request.param.get(RESOURCE_TYPE_STR)
     cr = get_resource_by_name(
         resource_kind=cr_kind,
         name=request.param.get(RESOURCE_NAME_STR),
+        admin_client=admin_client,
         namespace=request.param.get(RESOURCE_NAMESPACE_STR),
     )
     with ResourceEditorValidateHCOReconcile(
+        admin_client=admin_client,
         patches={cr: request.param["patch"]},
         action="replace",
         list_resource_reconcile=request.param.get("list_resource_reconcile", [cr_kind]),
         wait_for_reconcile_post_update=True,
     ):
         yield cr
+
+
+@pytest.fixture()
+def expected_value(request, is_s390x_cluster):
+    expected = request.param.copy()
+    if expected == EXPECTED_KUBEVIRT_HARDCODED_FEATUREGATES and is_s390x_cluster:
+        expected |= S390X_SPECIFIC_KUBEVIRT_FEATUREGATES
+    return expected
+
+
+@pytest.fixture(scope="session")
+def jira_76659_open():
+    return is_jira_open(jira_id="CNV-98645")

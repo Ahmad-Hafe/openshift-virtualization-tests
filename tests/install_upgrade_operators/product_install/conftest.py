@@ -1,5 +1,4 @@
 import logging
-import os
 
 import bitmath
 import pytest
@@ -8,30 +7,28 @@ from ocp_resources.hostpath_provisioner import HostPathProvisioner
 from ocp_resources.hyperconverged import HyperConverged
 from ocp_resources.installplan import InstallPlan
 from ocp_resources.persistent_volume import PersistentVolume
-from ocp_resources.resource import get_client
+from ocp_resources.storage_class import StorageClass
 from pytest_testconfig import py_config
+from timeout_sampler import TimeoutSampler
 
 from tests.install_upgrade_operators.product_install.constants import (
     HCO_NOT_INSTALLED_ALERT,
-    OPENSHIFT_VIRTUALIZATION,
 )
-from tests.install_upgrade_operators.product_install.utils import get_all_resources
-from utilities.constants import (
-    BREW_REGISTERY_SOURCE,
-    CRITICAL_STR,
-    HCO_CATALOG_SOURCE,
+from utilities.constants.components import HCO_CATALOG_SOURCE
+from utilities.constants.hco import (
     HCO_SUBSCRIPTION,
-    ICSP_FILE,
-    IDMS_FILE,
+    PRODUCTION_CATALOG_SOURCE,
+)
+from utilities.constants.monitoring import (
+    CRITICAL_STR,
     INFO_STR,
     PENDING_STR,
-    PRODUCTION_CATALOG_SOURCE,
-    TIMEOUT_5MIN,
-    TIMEOUT_10MIN,
-    StorageClassNames,
 )
-from utilities.data_collector import (
-    get_data_collector_base_directory,
+from utilities.constants.storage import StorageClassNames
+from utilities.constants.timeouts import (
+    TIMEOUT_5MIN,
+    TIMEOUT_5SEC,
+    TIMEOUT_10MIN,
 )
 from utilities.infra import (
     create_ns,
@@ -42,93 +39,24 @@ from utilities.infra import (
 )
 from utilities.operator import (
     create_catalog_source,
-    create_icsp_idms_from_file,
     create_operator,
     create_operator_group,
     create_subscription,
-    generate_icsp_idms_file,
     get_hco_csv_name_by_version,
     get_install_plan_from_subscription,
-    get_mcp_updating_transition_times,
     wait_for_catalogsource_ready,
-    wait_for_mcp_update_end,
-    wait_for_mcp_update_start,
 )
 from utilities.storage import (
     HppCsiStorageClass,
     HPPWithStoragePool,
     create_hpp_storage_class,
+    get_default_storage_class,
+    persist_storage_class_default,
 )
 
 INSTALLATION_VERSION_MISMATCH = "98"
 LOCAL_BLOCK_HPP = "local-block-hpp"
 LOGGER = logging.getLogger(__name__)
-
-
-@pytest.fixture(scope="session")
-def installation_data_dir():
-    return os.path.join(get_data_collector_base_directory(), "resource_information")
-
-
-@pytest.fixture(scope="session")
-def before_installation_all_resources(installation_data_dir):
-    return get_all_resources(file_name="before_installation", base_directory=installation_data_dir)
-
-
-@pytest.fixture(scope="module")
-def after_installation_all_resources(installation_data_dir):
-    return get_all_resources(file_name="after_installation", base_directory=installation_data_dir)
-
-
-@pytest.fixture(scope="module")
-def hyperconverged_directory(tmpdir_factory, is_production_source):
-    if is_production_source:
-        yield
-    else:
-        yield tmpdir_factory.mktemp(f"{OPENSHIFT_VIRTUALIZATION}-folder")
-
-
-@pytest.fixture(scope="module")
-def generated_hyperconverged_icsp_idms(
-    is_production_source,
-    is_idms_cluster,
-    hyperconverged_directory,
-    generated_pulled_secret,
-    cnv_image_url,
-):
-    if is_production_source:
-        LOGGER.info("This is installation from production source, icsp update is not needed.")
-        return
-    folder_name = f"{hyperconverged_directory}/{OPENSHIFT_VIRTUALIZATION}-manifest"
-    LOGGER.info(f"Create CNV ICSP/IDMS file {ICSP_FILE}/{IDMS_FILE} in {hyperconverged_directory}")
-    mirror_cmd = (
-        f"oc adm catalog mirror {cnv_image_url} {BREW_REGISTERY_SOURCE} --manifests-only"
-        f" --to-manifests {folder_name} --registry-config={generated_pulled_secret}"
-    )
-
-    return generate_icsp_idms_file(folder_name=folder_name, command=mirror_cmd, is_idms_file=is_idms_cluster)
-
-
-@pytest.fixture(scope="module")
-def updated_icsp_hyperconverged(
-    is_production_source,
-    generated_hyperconverged_icsp_idms,
-    machine_config_pools,
-    machine_config_pools_conditions_scope_module,
-):
-    initial_updating_transition_times = get_mcp_updating_transition_times(
-        mcp_conditions=machine_config_pools_conditions_scope_module
-    )
-    if is_production_source:
-        LOGGER.info("This is installation from production source, icsp/idms update is not needed.")
-        return
-    create_icsp_idms_from_file(file_path=generated_hyperconverged_icsp_idms)
-    LOGGER.info("Wait for MCP update after ICSP/IDMS modification.")
-    wait_for_mcp_update_start(
-        machine_config_pools_list=machine_config_pools,
-        initial_transition_times=initial_updating_transition_times,
-    )
-    wait_for_mcp_update_end(machine_config_pools_list=machine_config_pools)
 
 
 @pytest.fixture(scope="module")
@@ -140,6 +68,7 @@ def hyperconverged_catalog_source(admin_client, is_production_source, cnv_image_
     catalog_source = create_catalog_source(
         catalog_name=HCO_CATALOG_SOURCE,
         image=cnv_image_url,
+        admin_client=admin_client,
     )
     wait_for_catalogsource_ready(
         admin_client=admin_client,
@@ -163,17 +92,19 @@ def created_cnv_namespace(admin_client):
 
 
 @pytest.fixture(scope="module")
-def created_cnv_operator_group(created_cnv_namespace):
+def created_cnv_operator_group(admin_client, created_cnv_namespace):
     cnv_namespace_name = created_cnv_namespace.name
     return create_operator_group(
         namespace_name=cnv_namespace_name,
         operator_group_name="openshift-cnv-group",
+        admin_client=admin_client,
         target_namespaces=[cnv_namespace_name],
     )
 
 
 @pytest.fixture(scope="module")
 def installed_cnv_subscription(
+    admin_client,
     is_production_source,
     hyperconverged_catalog_source,
     created_cnv_namespace,
@@ -184,6 +115,7 @@ def installed_cnv_subscription(
         package_name=py_config["hco_cr_name"],
         namespace_name=created_cnv_namespace.name,
         catalogsource_name=PRODUCTION_CATALOG_SOURCE if is_production_source else hyperconverged_catalog_source.name,
+        admin_client=admin_client,
         channel_name=cnv_version_to_install_info["channel"],
     )
 
@@ -218,7 +150,6 @@ def cnv_install_plan_installed(
 def installed_openshift_virtualization(
     admin_client,
     disabled_default_sources_in_operatorhub_scope_module,
-    updated_icsp_hyperconverged,
     hyperconverged_catalog_source,
     created_cnv_namespace,
     created_cnv_operator_group,
@@ -230,10 +161,11 @@ def installed_openshift_virtualization(
 
 
 @pytest.fixture(scope="module")
-def created_hco_cr(created_cnv_namespace, installed_openshift_virtualization):
+def created_hco_cr(admin_client, created_cnv_namespace, installed_openshift_virtualization):
     return create_operator(
         operator_class=HyperConverged,
         operator_name=py_config["hco_cr_name"],
+        admin_client=admin_client,
         namespace_name=created_cnv_namespace.name,
     )
 
@@ -266,11 +198,11 @@ def cluster_backend_storage(admin_client):
 
 
 @pytest.fixture(scope="module")
-def hpp_volume_size(cluster_backend_storage):
+def hpp_volume_size(admin_client, cluster_backend_storage):
     hpp_volume_size = "70Gi"
     if cluster_backend_storage == LOCAL_BLOCK_HPP:
         persistent_volumes = PersistentVolume.get(
-            dyn_client=get_client(),
+            client=admin_client,
             label_selector=f"storage.openshift.com/local-volume-owner-name={cluster_backend_storage}",
         )
         for persistent_volume in persistent_volumes:
@@ -281,31 +213,33 @@ def hpp_volume_size(cluster_backend_storage):
 
 
 @pytest.fixture(scope="module")
-def installed_hpp(cluster_backend_storage, hpp_volume_size):
+def installed_hpp(admin_client, cluster_backend_storage, hpp_volume_size):
     LOGGER.info(f"Creating HPP CR using backend storage: {cluster_backend_storage} and storage size: {hpp_volume_size}")
     hpp_cr = HPPWithStoragePool(
         name=HostPathProvisioner.Name.HOSTPATH_PROVISIONER,
         backend_storage_class_name=cluster_backend_storage,
         volume_size=hpp_volume_size,
+        client=admin_client,
     )
     hpp_cr.deploy(wait=True)
     create_hpp_storage_class(
         storage_class_name=HppCsiStorageClass.Name.HOSTPATH_CSI_BASIC,
+        admin_client=admin_client,
     )
     create_hpp_storage_class(
         storage_class_name=HppCsiStorageClass.Name.HOSTPATH_CSI_PVC_BLOCK,
+        admin_client=admin_client,
     )
 
 
 @pytest.fixture(scope="session")
 def cnv_version_to_install_info(is_production_source, ocp_current_version, cnv_image_url):
     if is_production_source:
-        latest_z_stream = get_latest_stable_released_z_stream_info(
-            minor_version=f"v{ocp_current_version.major}.{ocp_current_version.minor}"
-        )
+        minor_version = f"{ocp_current_version.major}.{ocp_current_version.minor}"
+        latest_z_stream = get_latest_stable_released_z_stream_info(minor_version=f"v{minor_version}")
         LOGGER.info(
-            f"Using production catalog source for: {ocp_current_version},"
-            f" CNV latest stable released version info: {latest_z_stream}"
+            f"Using production catalog source for: {minor_version}. "
+            f"CNV latest stable released version info: {latest_z_stream}"
         )
     else:
         latest_z_stream = get_cnv_info_by_iib(iib=cnv_image_url.split(":")[-1])
@@ -313,3 +247,37 @@ def cnv_version_to_install_info(is_production_source, ocp_current_version, cnv_i
     if not latest_z_stream:
         pytest.exit(reason="CNV version can't be determined for this run", returncode=INSTALLATION_VERSION_MISMATCH)
     return latest_z_stream
+
+
+@pytest.fixture()
+def default_storage_class_from_config(admin_client):
+    # if its not on the matrix - we dont need to test it.
+    default_storage_class_name = py_config["default_storage_class"]
+    if not any(default_storage_class_name in sc_dict for sc_dict in py_config["storage_class_matrix"]):
+        pytest.xfail(f"Storage class {default_storage_class_name} not found in the storage class matrix")
+    # Some storageclasses are created asynchronously, for example ocs-virt,
+    # so we need to wait for them to be created
+    LOGGER.info(f"Waiting for storage class {default_storage_class_name} to be created")
+    default_storage_class = StorageClass(client=admin_client, name=default_storage_class_name)
+    for sample in TimeoutSampler(
+        wait_timeout=TIMEOUT_5MIN,
+        sleep=TIMEOUT_5SEC,
+        func=lambda: default_storage_class.exists,
+    ):
+        if sample:
+            break
+
+    return default_storage_class
+
+
+@pytest.fixture()
+def updated_default_storage_class_from_config(admin_client, default_storage_class_from_config):
+    # Swaps the current default StorageClass with the one defined in our config.
+    try:
+        current_default_sc = get_default_storage_class(client=admin_client)
+        if current_default_sc.name == default_storage_class_from_config.name:
+            return
+        persist_storage_class_default(default=False, storage_class=current_default_sc)
+    except ValueError:
+        LOGGER.info("No default storage class exists, setting the config one as default")
+    persist_storage_class_default(default=True, storage_class=default_storage_class_from_config)

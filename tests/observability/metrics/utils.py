@@ -2,24 +2,25 @@ import logging
 import math
 import re
 import shlex
-import time
 import urllib
+from collections.abc import Generator
 from contextlib import contextmanager
-from datetime import datetime, timezone
-from typing import Any, Generator, Optional
+from datetime import UTC, datetime
 
 import bitmath
+import pytest
+from _pytest.subtests import Subtests
 from kubernetes.dynamic import DynamicClient
 from ocp_resources.datavolume import DataVolume
 from ocp_resources.persistent_volume_claim import PersistentVolumeClaim
 from ocp_resources.resource import Resource
 from ocp_resources.virtual_machine_cluster_instancetype import VirtualMachineClusterInstancetype
 from ocp_resources.virtual_machine_cluster_preference import VirtualMachineClusterPreference
+from ocp_resources.virtual_machine_instance_migration import VirtualMachineInstanceMigration
 from ocp_utilities.monitoring import Prometheus
 from pyhelper_utils.shell import run_ssh_commands
 from timeout_sampler import TimeoutExpiredError, TimeoutSampler
 
-from tests.observability.constants import KUBEVIRT_VIRT_OPERATOR_READY
 from tests.observability.metrics.constants import (
     BINDING_NAME,
     BINDING_TYPE,
@@ -27,36 +28,49 @@ from tests.observability.metrics.constants import (
     KUBE_VERSION_STR,
     KUBEVIRT_VMI_FILESYSTEM_BYTES,
     KUBEVIRT_VMI_FILESYSTEM_BYTES_WITH_MOUNT_POINT,
+    KUBEVIRT_VMI_MIGRATION_END_TIME_SECONDS,
+    KUBEVIRT_VMI_MIGRATION_START_TIME_SECONDS,
+    METRICS_WITH_CNV_97013_BUG,
+    MIGRATION_METRICS,
 )
-from tests.observability.utils import validate_metrics_value
 from utilities.artifactory import (
     cleanup_artifactory_secret_and_config_map,
     get_artifactory_config_map,
     get_artifactory_secret,
-    get_http_image_url,
+    get_test_artifact_server_url,
 )
-from utilities.constants import (
+from utilities.constants import Images
+from utilities.constants.cluster import NODE_STR
+from utilities.constants.components import (
+    VIRT_CONTROLLER,
+    VIRT_HANDLER,
+)
+from utilities.constants.images import OS_FLAVOR_WINDOWS
+from utilities.constants.instance_types import WINDOWS_11_PREFERENCE
+from utilities.constants.storage import (
     CAPACITY,
-    KUBEVIRT_VIRT_OPERATOR_UP,
-    NODE_STR,
-    OS_FLAVOR_WINDOWS,
+    REGISTRY_STR,
+    USED,
+)
+from utilities.constants.timeouts import (
     TIMEOUT_1MIN,
     TIMEOUT_2MIN,
+    TIMEOUT_3MIN,
     TIMEOUT_4MIN,
     TIMEOUT_5MIN,
+    TIMEOUT_5SEC,
     TIMEOUT_10SEC,
     TIMEOUT_15SEC,
     TIMEOUT_20SEC,
     TIMEOUT_30SEC,
-    USED,
-    VIRT_HANDLER,
-    Images,
+    TIMEOUT_40MIN,
 )
-from utilities.monitoring import get_metrics_value
+from utilities.jira import is_jira_open
+from utilities.monitoring import get_metrics_value, validate_metrics_value
+from utilities.storage import construct_datavolume_source_dict
 from utilities.virt import VirtualMachineForTests, running_vm
 
 LOGGER = logging.getLogger(__name__)
-CURL_QUERY = "curl -k https://localhost:8443/metrics"
 SINGLE_VM = 1
 COUNT_THREE = 3
 
@@ -97,98 +111,34 @@ def get_vm_metrics(prometheus: Prometheus, query: str, vm_name: str, timeout: in
     return None
 
 
-def assert_vm_metric(prometheus: Prometheus, query: str, vm_name: str):
-    assert get_vm_metrics(prometheus=prometheus, query=query, vm_name=vm_name), (
-        f"query: {query} has no result for vm: {vm_name}"
-    )
-
-
-def parse_vm_metric_results(raw_output: str) -> dict[str, Any]:
-    """
-    Parse metrics received from virt-handler pod
+def assert_vm_metric_labels(
+    prometheus: Prometheus, query: str, vm: VirtualMachineForTests, admin_client: DynamicClient
+) -> None:
+    """Validates that Prometheus metric results contain correct node and namespace labels for the VM.
 
     Args:
-        raw_output (str): raw metric output received from virt-handler pods
-
-    Returns:
-        dict: Dictionary of parsed output
+        prometheus: Prometheus client instance.
+        query: Prometheus query string.
+        vm: VM to validate metric labels for.
+        admin_client: Admin client for privileged operations.
     """
-    regex_metrics = r"(?P<metric>\S+)\{(?P<labels>[^\}]+)\}[ ](?P<value>\d+)"
-    metric_results: dict[str, Any] = {}
-    for line in raw_output.splitlines():
-        if line.startswith("# HELP"):
-            metric, description = line[7:].split(" ", 1)
-            metric_results.setdefault(metric, {})["help"] = description
-        elif line.startswith("# TYPE"):
-            metric, metric_type = line[7:].split(" ", 1)
-            metric_results.setdefault(metric, {})["type"] = metric_type
-        elif re.match(regex_metrics, line):
-            match = re.match(regex_metrics, line)
-            if match:
-                metric_instance_dict = match.groupdict()
-                metric_instance_dict["labeldict"] = {
-                    val[0]: val[-1]
-                    for val in [label.partition("=") for label in metric_instance_dict["labels"].split(",")]
-                }
-                metric_results.setdefault(metric_instance_dict["metric"], {}).setdefault("results", []).append(
-                    metric_instance_dict
-                )
-        else:
-            metric, metric_type = line.split(" ", 1)
-            metric_results.setdefault(metric, {})["type"] = metric_type
-    return metric_results
+    results = get_vm_metrics(prometheus=prometheus, query=query, vm_name=vm.name)
+    assert results, f"query: {query} has no result for vm: {vm.name}"
 
-
-def assert_vm_metric_virt_handler_pod(query: str, vm: VirtualMachineForTests):
-    """
-    Get vm metric information from virt-handler pod
-
-    Args:
-        query (str): Prometheus query string
-        vm (VirtualMachineForTests): A VirtualMachineForTests
-
-    """
-    pod = vm.privileged_vmi.virt_handler_pod
-    output = parse_vm_metric_results(raw_output=pod.execute(command=["bash", "-c", f"{CURL_QUERY}"]))
-    assert output, f'No query output found from {VIRT_HANDLER} pod "{pod.name}" for query: "{CURL_QUERY}"'
-    metrics_list = []
-    if query in output:
-        metrics_list = [
-            result["labeldict"]
-            for result in output[query]["results"]
-            if "labeldict" in result and vm.name in result["labeldict"]["name"]
-        ]
-    assert metrics_list, (
-        f'{VIRT_HANDLER} pod query:"{CURL_QUERY}" did not return any vm metric information for vm: {vm.name} '
-        f"from {VIRT_HANDLER} pod: {pod.name}. "
-    )
-    assert_validate_vm_metric(vm=vm, metrics_list=metrics_list)
-
-
-def assert_validate_vm_metric(vm: VirtualMachineForTests, metrics_list: list[dict[str, str]]) -> None:
-    """
-    Validate vm metric information fetched from virt-handler pod
-
-    Args:
-        vm (VirtualMachineForTests): A VirtualMachineForTests
-        metrics_list (list): List of metrics entries collected from associated Virt-handler pod
-
-    """
-    expected_values = {
-        "kubernetes_vmi_label_kubevirt_io_nodeName": vm.vmi.node.name,
+    vmi_node = vm.vmi.get_node(privileged_client=admin_client)
+    vm_results = [result["metric"] for result in results if result["metric"].get("name") == vm.name]
+    expected_labels = {
         "namespace": vm.namespace,
-        "node": vm.vmi.node.name,
+        "node": vmi_node.name,
     }
-    LOGGER.info(f"{VIRT_HANDLER} pod metrics associated with vm: {vm.name} are: {metrics_list}")
-    metric_data_mismatch = [
-        entity
-        for key in expected_values
-        for entity in metrics_list
-        if not entity.get(key, None) or expected_values[key] not in entity[key]
+    label_mismatches = [
+        metric
+        for metric in vm_results
+        for label, expected_value in expected_labels.items()
+        if metric.get(label) != expected_value
     ]
-
-    assert not metric_data_mismatch, (
-        f"Vm metric validation via {VIRT_HANDLER} pod {vm.vmi.virt_handler_pod} failed: {metric_data_mismatch}"
+    assert not label_mismatches, (
+        f"Metric label validation failed for vm {vm.name}. Expected: {expected_labels}, mismatched: {label_mismatches}"
     )
 
 
@@ -224,7 +174,7 @@ def enable_swap_fedora_vm(vm: VirtualMachineForTests) -> None:
     vm.ssh_exec.executor(sudo=True).run_cmd(cmd=shlex.split("sysctl vm.swappiness=100"))
 
 
-def get_vm_cpu_info_from_prometheus(prometheus: Prometheus, vm_name: str) -> Optional[int]:
+def get_vm_cpu_info_from_prometheus(prometheus: Prometheus, vm_name: str) -> int | None:
     query = urllib.parse.quote_plus(
         f'kubevirt_vmi_node_cpu_affinity{{kubernetes_vmi_label_kubevirt_io_domain="{vm_name}"}}'
     )
@@ -245,14 +195,17 @@ def get_vm_cpu_info_from_prometheus(prometheus: Prometheus, vm_name: str) -> Opt
     return None
 
 
-def validate_vmi_node_cpu_affinity_with_prometheus(prometheus: Prometheus, vm: VirtualMachineForTests) -> None:
+def validate_vmi_node_cpu_affinity_with_prometheus(
+    prometheus: Prometheus, vm: VirtualMachineForTests, admin_client: DynamicClient
+) -> None:
     vm_cpu = vm.vmi.instance.spec.domain.cpu
     cpu_count_from_vm = (vm_cpu.threads or 1) * (vm_cpu.cores or 1) * (vm_cpu.sockets or 1)
     LOGGER.info(f"Cpu count from vm {vm.name}: {cpu_count_from_vm}")
     cpu_info_from_prometheus = get_vm_cpu_info_from_prometheus(prometheus=prometheus, vm_name=vm.name)
     LOGGER.info(f"CPU information from prometheus: {cpu_info_from_prometheus}")
-    cpu_count_from_vm_node = int(vm.privileged_vmi.node.instance.status.capacity.cpu)
-    LOGGER.info(f"Cpu count from node {vm.privileged_vmi.node.name}: {cpu_count_from_vm_node}")
+    vmi_node = vm.vmi.get_node(privileged_client=admin_client)
+    cpu_count_from_vm_node = int(vmi_node.instance.status.capacity.cpu)
+    LOGGER.info(f"Cpu count from node {vmi_node.name}: {cpu_count_from_vm_node}")
 
     if cpu_count_from_vm > 1:
         cpu_count_from_vm_node = cpu_count_from_vm_node * cpu_count_from_vm
@@ -326,37 +279,32 @@ def validate_metric_value_within_range(
         raise
 
 
-def network_packets_received(vm: VirtualMachineForTests, interface_name: str) -> dict[str, str]:
-    ip_link_show_content = run_ssh_commands(host=vm.ssh_exec, commands=shlex.split("ip -s link show"))[0]
+def network_packets_received(
+    vm: VirtualMachineForTests, interface_name: str, windows_wsl: bool = False
+) -> dict[str, str]:
+    ip_link_show_content = run_ssh_commands(
+        host=vm.ssh_exec, commands=shlex.split(f"{'wsl' if windows_wsl else ''} ip -s link show")
+    )[0]
+
     pattern = re.compile(
         rf".*?{re.escape(interface_name)}:.*?"  # Match the line with the interface name
-        r"(?:RX:\s+bytes\s+packets\s+errors\s+dropped\s+.*?(\d+)\s+(\d+)\s+(\d+)\s+(\d+)).*?"  # Capture RX stats
-        r"(?:TX:\s+bytes\s+packets\s+errors\s+dropped\s+.*?(\d+)\s+(\d+)\s+(\d+)\s+(\d+))",  # Capture TX stats
+        r"RX:.*?\n\s+(?P<rx_bytes>\d+)\s+(?P<rx_packets>\d+)\s+(?P<rx_errs>\d+)\s+(?P<rx_drop>\d+)\s+\d+\s+\d+.*?"
+        r"TX:.*?\n\s+(?P<tx_bytes>\d+)\s+(?P<tx_packets>\d+)\s+(?P<tx_errs>\d+)\s+(?P<tx_drop>\d+)",
         re.DOTALL | re.IGNORECASE,
     )
     match = pattern.search(string=ip_link_show_content)
+
     if match:
-        rx_bytes, rx_packets, rx_errs, rx_drop, tx_bytes, tx_packets, tx_errs, tx_drop = match.groups()
-        return {
-            "rx_bytes": rx_bytes,
-            "rx_packets": rx_packets,
-            "rx_errs": rx_errs,
-            "rx_drop": rx_drop,
-            "tx_bytes": tx_bytes,
-            "tx_packets": tx_packets,
-            "tx_errs": tx_errs,
-            "tx_drop": tx_drop,
-        }
-    return {}
+        result = match.groupdict()
+        LOGGER.info(f"Successfully parsed network stats: {result}")
+        return result
+    raise ValueError(f"No match found for interface '{interface_name}' in ip link show output : {ip_link_show_content}")
 
 
 def compare_network_traffic_bytes_and_metrics(
-    prometheus: Prometheus, vm: VirtualMachineForTests, vm_interface_name: str
+    prometheus: Prometheus, vm: VirtualMachineForTests, network_packet_received: dict[str, str]
 ) -> bool:
-    packet_received = network_packets_received(vm=vm, interface_name=vm_interface_name)
     rx_tx_indicator = False
-    LOGGER.info("Waiting for metric kubevirt_vmi_network_traffic_bytes_total to update")
-    time.sleep(TIMEOUT_15SEC)
     metric_result = (
         prometheus
         .query(query=f"kubevirt_vmi_network_traffic_bytes_total{{name='{vm.name}'}}")
@@ -365,19 +313,15 @@ def compare_network_traffic_bytes_and_metrics(
     )
     for entry in metric_result:
         entry_value = entry.get("value")[1]
-        if math.isclose(
-            int(entry_value), int(packet_received[f"{entry.get('metric').get('type')}_bytes"]), rel_tol=0.05
-        ):
+        if int(entry_value) >= int(network_packet_received[f"{entry.get('metric').get('type')}_bytes"]):
             rx_tx_indicator = True
         else:
             break
-    if rx_tx_indicator:
-        return True
-    return False
+    return bool(rx_tx_indicator)
 
 
 def validate_network_traffic_metrics_value(
-    prometheus: Prometheus, vm: VirtualMachineForTests, interface_name: str
+    prometheus: Prometheus, vm: VirtualMachineForTests, network_packet_received: dict[str, str]
 ) -> None:
     samples = TimeoutSampler(
         wait_timeout=TIMEOUT_4MIN,
@@ -385,7 +329,7 @@ def validate_network_traffic_metrics_value(
         func=compare_network_traffic_bytes_and_metrics,
         prometheus=prometheus,
         vm=vm,
-        vm_interface_name=interface_name,
+        network_packet_received=network_packet_received,
     )
     try:
         for sample in samples:
@@ -393,53 +337,6 @@ def validate_network_traffic_metrics_value(
                 return
     except TimeoutExpiredError:
         LOGGER.error("Metric value and domistat value not correlate.")
-        raise
-
-
-def get_metric_sum_value(prometheus: Prometheus, metric: str) -> int:
-    metrics = prometheus.query(query=metric)
-    metrics_result = metrics["data"].get("result", [])
-    if metrics_result:
-        return sum(int(metric_metrics_result["value"][1]) for metric_metrics_result in metrics_result)
-    LOGGER.warning(f"For Query {metric}, empty results found.")
-    return 0
-
-
-def wait_for_expected_metric_value_sum(
-    prometheus: Prometheus,
-    metric_name: str,
-    expected_value: int,
-    check_times: int = 3,
-    timeout: int = TIMEOUT_4MIN,
-) -> None:
-    sampler = TimeoutSampler(
-        wait_timeout=timeout,
-        sleep=TIMEOUT_15SEC,
-        func=get_metric_sum_value,
-        prometheus=prometheus,
-        metric=metric_name,
-    )
-    sample = None
-    current_check = 0
-    comparison_values_log = {}
-    try:
-        for sample in sampler:
-            if sample:
-                comparison_values_log[datetime.now()] = (
-                    f"metric: {metric_name} value is: {sample}, the expected value is {expected_value}"
-                )
-            if sample == expected_value:
-                current_check += 1
-                if current_check >= check_times:
-                    return
-            else:
-                current_check = 0
-
-    except TimeoutExpiredError:
-        LOGGER.error(
-            f"Metric: {metric_name}, metrics value: {sample}, expected: {expected_value}, "
-            f"comparison log: {comparison_values_log}"
-        )
         raise
 
 
@@ -506,28 +403,17 @@ def compare_kubevirt_vmi_info_metric_with_vm_info(
         raise
 
 
-def validate_initial_virt_operator_replicas_reverted(
-    prometheus: Prometheus, initial_virt_operator_replicas: str
-) -> None:
-    for metric in [KUBEVIRT_VIRT_OPERATOR_READY, KUBEVIRT_VIRT_OPERATOR_UP]:
-        validate_metrics_value(
-            prometheus=prometheus,
-            expected_value=initial_virt_operator_replicas,
-            metric_name=metric,
-        )
-
-
 def timestamp_to_seconds(timestamp: str) -> int:
     # Parse the timestamp with UTC timezone and convert to seconds
     dt = datetime.strptime(timestamp, "%Y-%m-%dT%H:%M:%SZ")
-    dt = dt.replace(tzinfo=timezone.utc)  # Ensure it is treated as UTC
+    dt = dt.replace(tzinfo=UTC)  # Ensure it is treated as UTC
     return int(dt.timestamp())
 
 
 def wait_for_non_empty_metrics_value(prometheus: Prometheus, metric_name: str) -> None:
     samples = TimeoutSampler(
-        wait_timeout=TIMEOUT_5MIN,
-        sleep=TIMEOUT_30SEC,
+        wait_timeout=TIMEOUT_3MIN,
+        sleep=TIMEOUT_5SEC,
         func=get_metrics_value,
         prometheus=prometheus,
         metrics_name=metric_name,
@@ -542,10 +428,10 @@ def wait_for_non_empty_metrics_value(prometheus: Prometheus, metric_name: str) -
         raise
 
 
-def disk_file_system_info(vm: VirtualMachineForTests) -> dict[str, dict[str, str]]:
+def disk_file_system_info(vm: VirtualMachineForTests, admin_client: DynamicClient) -> dict[str, dict[str, str]]:
     lines = re.findall(
         r"fs\.(\d+)\.(mountpoint|total-bytes|used-bytes)\s*:\s*(.*)\s*",
-        vm.privileged_vmi.execute_virsh_command(command="guestinfo --filesystem"),
+        vm.vmi.execute_virsh_command(command="guestinfo --filesystem", privileged_client=admin_client),
         re.MULTILINE,
     )
     mount_points_and_values_dict: dict[str, dict[str, str]] = {}
@@ -565,12 +451,14 @@ def compare_metric_file_system_values_with_vm_file_system_values(
     vm_for_test: VirtualMachineForTests,
     mount_point: str,
     capacity_or_used: str,
+    admin_client: DynamicClient,
 ) -> None:
     samples = TimeoutSampler(
         wait_timeout=TIMEOUT_2MIN,
         sleep=TIMEOUT_15SEC,
         func=disk_file_system_info,
         vm=vm_for_test,
+        admin_client=admin_client,
     )
     sample = None
     metric_value = None
@@ -604,8 +492,10 @@ def expected_metric_labels_and_values(
 ) -> None:
     mismatch = {
         label: {
-            f"{label} metric result: {values_from_prometheus.get(label)}, "
-            f"expected_label_results: {expected_label_results}"
+            (
+                f"{label} metric result: {values_from_prometheus.get(label)}, "
+                f"expected_label_results: {expected_label_results}"
+            )
         }
         for label, expected_label_results in expected_labels_and_values.items()
         if values_from_prometheus.get(label) != expected_label_results
@@ -644,13 +534,27 @@ def binding_name_and_type_from_vm_or_vmi(vm_interface: dict[str, str]) -> dict[s
 
 
 def validate_vnic_info(prometheus: Prometheus, vnic_info_to_compare: dict[str, str], metric_name: str) -> None:
-    vnic_info_metric_result = prometheus.query_sampler(query=metric_name)[0].get("metric")
-    mismatch_vnic_info = {}
-    for info, expected_value in vnic_info_to_compare.items():
-        actual_value = vnic_info_metric_result.get(info)
-        if actual_value != expected_value:
-            mismatch_vnic_info[info] = {f"Expected: {expected_value}", f"Actual: {actual_value}"}
-    assert not mismatch_vnic_info, f"There is a mismatch between expected and actual results:\n {mismatch_vnic_info}"
+    samples = TimeoutSampler(
+        wait_timeout=TIMEOUT_5MIN,
+        sleep=TIMEOUT_30SEC,
+        func=prometheus.query,
+        query=metric_name,
+    )
+    mismatch_vnic_info = None
+    try:
+        for sample in samples:
+            if sample and (result := sample.get("data", {}).get("result")):
+                vnic_info_metric_result = result[0].get("metric")
+                mismatch_vnic_info = {}
+                for info, expected_value in vnic_info_to_compare.items():
+                    actual_value = vnic_info_metric_result.get(info)
+                    if actual_value != expected_value:
+                        mismatch_vnic_info[info] = {f"Expected: {expected_value}", f"Actual: {actual_value}"}
+                if not mismatch_vnic_info:
+                    return
+    except TimeoutExpiredError:
+        LOGGER.error(f"There is a mismatch between expected and actual results:\n {mismatch_vnic_info}")
+        raise
 
 
 def get_metric_labels_non_empty_value(prometheus: Prometheus, metric_name: str) -> dict[str, str]:
@@ -692,32 +596,37 @@ def create_windows11_wsl2_vm(
     artifactory_secret = get_artifactory_secret(namespace=namespace)
     artifactory_config_map = get_artifactory_config_map(namespace=namespace)
     dv = DataVolume(
+        client=client,
         name=dv_name,
         namespace=namespace,
-        storage_class=storage_class,
-        source="http",
-        url=get_http_image_url(image_directory=Images.Windows.DIR, image_name=Images.Windows.WIN11_WSL2_IMG),
-        size=Images.Windows.DEFAULT_DV_SIZE,
-        client=client,
         api_name="storage",
-        secret=artifactory_secret,
-        cert_configmap=artifactory_config_map.name,
+        source_dict=construct_datavolume_source_dict(
+            source=REGISTRY_STR,
+            url=f"{get_test_artifact_server_url(schema=REGISTRY_STR)}/docker-local/windows-qe/win_11:virtio",
+            secret_name=artifactory_secret.name,
+            cert_configmap_name=artifactory_config_map.name,
+        ),
+        size=Images.Windows.CONTAINER_DISK_DV_SIZE,
+        storage_class=storage_class,
     )
     dv.to_dict()
+
     with VirtualMachineForTests(
         os_flavor=OS_FLAVOR_WINDOWS,
         name=vm_name,
         namespace=namespace,
         client=client,
-        vm_instance_type=VirtualMachineClusterInstancetype(client=client, name="u1.xlarge"),
-        vm_preference=VirtualMachineClusterPreference(client=client, name="windows.11"),
+        vm_instance_type=VirtualMachineClusterInstancetype(client=client, name="u1.large"),
+        vm_preference=VirtualMachineClusterPreference(client=client, name=WINDOWS_11_PREFERENCE),
         data_volume_template={"metadata": dv.res["metadata"], "spec": dv.res["spec"]},
     ) as vm:
-        running_vm(vm=vm)
-        yield vm
-    cleanup_artifactory_secret_and_config_map(
-        artifactory_secret=artifactory_secret, artifactory_config_map=artifactory_config_map
-    )
+        try:
+            running_vm(vm=vm, dv_wait_timeout=TIMEOUT_40MIN)
+            yield vm
+        finally:
+            cleanup_artifactory_secret_and_config_map(
+                artifactory_secret=artifactory_secret, artifactory_config_map=artifactory_config_map
+            )
 
 
 def get_vm_comparison_info_dict(vm: VirtualMachineForTests) -> dict[str, str]:
@@ -729,7 +638,7 @@ def get_vm_comparison_info_dict(vm: VirtualMachineForTests) -> dict[str, str]:
 
 
 def get_vmi_guest_os_kernel_release_info_metric_from_vm(
-    vm: VirtualMachineForTests, windows: bool = False
+    vm: VirtualMachineForTests, admin_client: DynamicClient, windows: bool = False
 ) -> dict[str, str]:
     guest_os_kernel_release = run_ssh_commands(
         host=vm.ssh_exec, commands=shlex.split("ver" if windows else "uname -r")
@@ -738,11 +647,12 @@ def get_vmi_guest_os_kernel_release_info_metric_from_vm(
         guest_os_kernel_release = re.search(r"\[Version\s(\d+\.\d+\.(\d+))", guest_os_kernel_release)
         assert guest_os_kernel_release, "OS kernel release version not found."
         guest_os_kernel_release = guest_os_kernel_release.group(2)
+    virt_launcher_pod = vm.vmi.get_virt_launcher_pod(privileged_client=admin_client)
     return {
         "guest_os_kernel_release": guest_os_kernel_release,
         "namespace": vm.namespace,
-        NODE_STR: vm.vmi.virt_launcher_pod.node.name,
-        "vmi_pod": vm.vmi.virt_launcher_pod.name,
+        NODE_STR: virt_launcher_pod.node.name,
+        "vmi_pod": virt_launcher_pod.name,
     }
 
 
@@ -763,7 +673,10 @@ def get_pvc_size_bytes(vm: VirtualMachineForTests) -> str:
 
 
 def validate_metric_value_greater_than_initial_value(
-    prometheus: Prometheus, metric_name: str, initial_value: int, timeout: int = TIMEOUT_4MIN
+    prometheus: Prometheus,
+    metric_name: str,
+    initial_value: float,
+    timeout: int = TIMEOUT_4MIN,
 ) -> None:
     samples = TimeoutSampler(
         wait_timeout=timeout,
@@ -772,10 +685,11 @@ def validate_metric_value_greater_than_initial_value(
         prometheus=prometheus,
         metrics_name=metric_name,
     )
+    sample = None
     try:
         for sample in samples:
             if sample:
-                if int(sample) > initial_value:
+                if float(sample) > initial_value:
                     return
     except TimeoutExpiredError:
         LOGGER.error(f"{sample} should be greater than {initial_value}")
@@ -832,3 +746,157 @@ def validate_values_from_kube_application_aware_resourcequota_metric(
             return metric_sample
 
     raise TimeoutError("Timed out waiting for Prometheus metrics to match expected values.")
+
+
+def validate_vmi_sync_total_reported_and_positive(
+    prometheus: Prometheus,
+    metric_query: str,
+) -> list[dict[str, str]]:
+    """Polls until kubevirt_vmi_sync_total has positive values from both virt-controller and virt-handler.
+
+    Args:
+        prometheus: Prometheus client instance.
+        metric_query: PromQL query for kubevirt_vmi_sync_total.
+
+    Returns:
+        List of Prometheus result dicts from the first passing sample.
+
+    Raises:
+        TimeoutExpiredError: If the metric does not stabilize within TIMEOUT_4MIN.
+    """
+    samples = TimeoutSampler(
+        wait_timeout=TIMEOUT_4MIN,
+        sleep=TIMEOUT_15SEC,
+        func=prometheus.query_sampler,
+        query=metric_query,
+    )
+    sample = None
+    try:
+        for sample in samples:
+            if not sample or len(sample) < 2:
+                continue
+            pods = {result["metric"]["pod"] for result in sample}
+            has_controller = any(pod.startswith(VIRT_CONTROLLER) for pod in pods)
+            has_handler = any(pod.startswith(VIRT_HANDLER) for pod in pods)
+            all_positive = all(float(result["value"][1]) > 0 for result in sample)
+            if has_controller and has_handler and all_positive:
+                return sample
+    except TimeoutExpiredError:
+        LOGGER.error(f"Expected entries from both virt-controller and virt-handler, got: {sample}")
+        raise
+    return []
+
+
+def validate_vmi_sync_total_after_migration(
+    prometheus: Prometheus,
+    metric_query: str,
+    initial_values: dict[str, float],
+) -> None:
+    """Polls until virt-controller values increase and a new virt-handler pod reports a positive value.
+
+    Args:
+        prometheus: Prometheus client instance.
+        metric_query: PromQL query for kubevirt_vmi_sync_total.
+        initial_values: Pod-to-value mapping captured before migration.
+
+    Raises:
+        TimeoutExpiredError: If the expected post-migration pattern is not observed within TIMEOUT_4MIN.
+    """
+    samples = TimeoutSampler(
+        wait_timeout=TIMEOUT_4MIN,
+        sleep=TIMEOUT_15SEC,
+        func=prometheus.query_sampler,
+        query=metric_query,
+    )
+    current_values = None
+    try:
+        for sample in samples:
+            if sample:
+                current_values = {result["metric"]["pod"]: float(result["value"][1]) for result in sample}
+                controller_same_and_increased = all(
+                    pod in current_values and current_values[pod] > value
+                    for pod, value in initial_values.items()
+                    if pod.startswith(VIRT_CONTROLLER)
+                )
+                new_handler_with_value = any(
+                    pod.startswith(VIRT_HANDLER) and pod not in initial_values and value > 0
+                    for pod, value in current_values.items()
+                )
+                if controller_same_and_increased and new_handler_with_value:
+                    return
+    except TimeoutExpiredError:
+        LOGGER.error(f"Post-migration validation failed. Initial: {initial_values}, current: {current_values}")
+        raise
+
+
+def validate_metric_value_cleared(
+    prometheus: Prometheus,
+    metric_name: str,
+    timeout: int = TIMEOUT_4MIN,
+) -> None:
+    """Polls until the metric returns no samples or all values are zero.
+
+    Args:
+        prometheus: Prometheus client instance.
+        metric_name: PromQL query for the metric to check.
+        timeout: Maximum wait time in seconds.
+
+    Raises:
+        TimeoutExpiredError: If the metric still has non-zero values after timeout.
+    """
+    samples = TimeoutSampler(
+        wait_timeout=timeout,
+        sleep=TIMEOUT_15SEC,
+        func=prometheus.query_sampler,
+        query=metric_name,
+    )
+    sample = None
+    try:
+        for sample in samples:
+            if not sample or all(result["value"][1] == "0" for result in sample):
+                return
+    except TimeoutExpiredError:
+        LOGGER.error(f"Metric {metric_name} still has non-zero values: {sample}")
+        raise
+
+
+def validate_dual_stream_migration_metrics(
+    subtests: Subtests, prometheus: Prometheus, vm: VirtualMachineForTests, vmim: VirtualMachineInstanceMigration
+) -> None:
+    """Polls until dual stream migration metrics are collected.
+    Args:
+        subtests: Sub-tests object.
+        prometheus: Prometheus client instance.
+        vm: Virtual Machine object.
+        vmim: Virtual Machine Migration object.
+    """
+    for metric in MIGRATION_METRICS:
+        with subtests.test(msg=metric):
+            if metric in METRICS_WITH_CNV_97013_BUG and is_jira_open(jira_id="CNV-98667"):
+                pytest.xfail(reason=f"CNV-98667: {metric} returns no data during migration")
+            if metric == KUBEVIRT_VMI_MIGRATION_START_TIME_SECONDS:
+                validate_metrics_value(
+                    prometheus=prometheus,
+                    metric_name=KUBEVIRT_VMI_MIGRATION_START_TIME_SECONDS.format(vm_name=vm.name),
+                    expected_value=str(
+                        timestamp_to_seconds(timestamp=vm.vmi.instance.status.migrationState.startTimestamp)
+                    ),
+                )
+            elif metric == KUBEVIRT_VMI_MIGRATION_END_TIME_SECONDS:
+                vmim.wait_for_status(
+                    status=vmim.Status.SUCCEEDED,
+                    timeout=TIMEOUT_5MIN,
+                )
+                validate_metrics_value(
+                    prometheus=prometheus,
+                    metric_name=KUBEVIRT_VMI_MIGRATION_END_TIME_SECONDS.format(vm_name=vm.name),
+                    expected_value=str(
+                        timestamp_to_seconds(timestamp=vm.vmi.instance.status.migrationState.endTimestamp)
+                    ),
+                )
+            else:
+                validate_metric_value_greater_than_initial_value(
+                    prometheus=prometheus,
+                    metric_name=metric.format(vm_name=vm.name),
+                    initial_value=0,
+                )

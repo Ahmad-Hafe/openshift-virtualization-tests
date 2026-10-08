@@ -11,7 +11,8 @@ from tests.utils import (
     hotplug_spec_vm_and_verify_hotplug,
 )
 from tests.virt.utils import append_feature_gate_to_hco
-from utilities.constants import (
+from utilities.constants.architecture import AMD_64
+from utilities.constants.virt import (
     EIGHT_CPU_SOCKETS,
     FOUR_CPU_SOCKETS,
     FOUR_GI_MEMORY,
@@ -50,7 +51,7 @@ def vm_with_memory_load(
 
 
 @pytest.fixture(scope="session")
-def vmx_disabled_flag():
+def vmx_disabled_flag(nodes_cpu_architecture):
     """
     VMX CPU feature should be disabled, otherwise hotplugged CPUs come up offline on RHEL.
     """
@@ -63,19 +64,20 @@ def vmx_disabled_flag():
                 }
             ]
         }
-        if is_jira_open("CNV-62851")
+        if nodes_cpu_architecture == AMD_64 and is_jira_open("CNV-62851")
         else None
     )
 
 
 @pytest.fixture(scope="class")
-def hotplugged_vm(
+def vm_with_hotplug_support(
     request,
     namespace,
     unprivileged_client,
     golden_image_data_volume_template_for_test_scope_class,
     modern_cpu_for_migration,
     vmx_disabled_flag,
+    is_s390x_cluster,
 ):
     with VirtualMachineForTestsFromTemplate(
         name=request.param["vm_name"],
@@ -85,7 +87,8 @@ def hotplugged_vm(
         client=unprivileged_client,
         data_volume_template=golden_image_data_volume_template_for_test_scope_class,
         cpu_max_sockets=EIGHT_CPU_SOCKETS,
-        memory_max_guest=TEN_GI_MEMORY,
+        # s390x doesn't support maxGuest as it doesn't support hotplug memory
+        memory_max_guest=None if is_s390x_cluster else TEN_GI_MEMORY,
         cpu_sockets=FOUR_CPU_SOCKETS,
         cpu_threads=ONE_CPU_THREAD,
         cpu_cores=ONE_CPU_CORE,
@@ -98,19 +101,22 @@ def hotplugged_vm(
 
 
 @pytest.fixture()
-def hotplugged_sockets_memory_guest(request, admin_client, hotplugged_vm, unprivileged_client):
+def hotplugged_sockets_memory_guest(request, admin_client, vm_with_hotplug_support, unprivileged_client):
     param = request.param
+    clean_up_migration_jobs(client=admin_client, vm=vm_with_hotplug_support)
     if param.get("skip_migration"):
-        hotplug_spec_vm(vm=hotplugged_vm, sockets=param.get("sockets"), memory_guest=param.get("memory_guest"))
+        hotplug_spec_vm(
+            vm=vm_with_hotplug_support, sockets=param.get("sockets"), memory_guest=param.get("memory_guest")
+        )
     else:
         hotplug_spec_vm_and_verify_hotplug(
-            vm=hotplugged_vm,
+            vm=vm_with_hotplug_support,
             client=unprivileged_client,
             sockets=param.get("sockets"),
             memory_guest=param.get("memory_guest"),
         )
     yield
-    clean_up_migration_jobs(client=admin_client, vm=hotplugged_vm)
+    clean_up_migration_jobs(client=admin_client, vm=vm_with_hotplug_support)
 
 
 @pytest.fixture()
@@ -133,8 +139,9 @@ def enabled_featuregate_scope_function(
 
 
 @pytest.fixture(scope="class")
-def migration_policy_with_allow_auto_converge(namespace):
+def migration_policy_with_allow_auto_converge(admin_client, namespace):
     with MigrationPolicy(
+        client=admin_client,
         name="migration-policy-auto-converge",
         namespace_selector={f"{Resource.ApiGroup.KUBERNETES_IO}/metadata.name": namespace.name},
         allow_auto_converge=True,

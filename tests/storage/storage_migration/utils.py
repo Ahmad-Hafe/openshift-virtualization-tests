@@ -1,28 +1,19 @@
 import shlex
 
-import pytest
+from ocp_resources.multi_namespace_virtual_machine_storage_migration import MultiNamespaceVirtualMachineStorageMigration
 from ocp_resources.persistent_volume_claim import PersistentVolumeClaim
 from pyhelper_utils.shell import run_ssh_commands
+from timeout_sampler import TimeoutExpiredError, TimeoutSampler
 
 from tests.storage.storage_migration.constants import (
     CONTENT,
     FILE_BEFORE_STORAGE_MIGRATION,
-    MOUNT_HOTPLUGGED_DEVICE_PATH,
-    NO_STORAGE_CLASS_FAILURE_MESSAGE,
+    MOUNT_HOTPLUGGED_DEVICE_PATHS,
 )
-from utilities import console
-from utilities.constants import LS_COMMAND, TIMEOUT_20SEC
+from tests.storage.utils import check_file_in_vm
+from utilities.constants.timeouts import TIMEOUT_2MIN, TIMEOUT_5SEC, TIMEOUT_10MIN, TIMEOUT_10SEC
+from utilities.exceptions import StorageMigrationError
 from utilities.virt import VirtualMachineForTests, get_vm_boot_time
-
-
-def check_file_in_vm(vm: VirtualMachineForTests, file_name: str, file_content: str) -> None:
-    if not vm.ready:
-        vm.start(wait=True)
-    with console.Console(vm=vm) as vm_console:
-        vm_console.sendline(LS_COMMAND)
-        vm_console.expect(file_name, timeout=TIMEOUT_20SEC)
-        vm_console.sendline(f"cat {file_name}")
-        vm_console.expect(file_content, timeout=TIMEOUT_20SEC)
 
 
 def verify_vms_boot_time_after_storage_migration(
@@ -83,25 +74,87 @@ def verify_storage_migration_succeeded(
         verify_vm_storage_class_updated(vm=vm, target_storage_class=target_storage_class)
 
 
-def get_storage_class_for_storage_migration(storage_class: str, cluster_storage_classes_names: list[str]) -> str:
-    if storage_class in cluster_storage_classes_names:
-        return storage_class
-    else:
-        pytest.fail(
-            NO_STORAGE_CLASS_FAILURE_MESSAGE.format(
-                storage_class=storage_class, cluster_storage_classes_names=cluster_storage_classes_names
-            )
-        )
+def verify_files_in_hotplugged_disks(vm: VirtualMachineForTests, file_name: str, file_content: str) -> None:
+    """Verify that a file exists with expected content on all hotplugged disk mount paths.
+
+    Args:
+        vm: The VM to check.
+        file_name: Name of the file to verify on each mount path.
+        file_content: Expected content of the file.
+    """
+    mismatches = {}
+    for mount_path in MOUNT_HOTPLUGGED_DEVICE_PATHS:
+        output = run_ssh_commands(
+            host=vm.ssh_exec,
+            commands=shlex.split(f"cat {mount_path}/{file_name}"),
+            wait_timeout=TIMEOUT_2MIN,
+            sleep=TIMEOUT_5SEC,
+        )[0]
+        stripped_output = output.strip()
+        if stripped_output != file_content:
+            mismatches[mount_path] = f"'{stripped_output}' does not equal '{file_content}'"
+    assert not mismatches, f"Data mismatch on hotplugged disk(s): {mismatches}"
 
 
-def verify_file_in_hotplugged_disk(vm: VirtualMachineForTests, file_name: str, file_content: str) -> None:
-    output = run_ssh_commands(
-        host=vm.ssh_exec, commands=shlex.split(f"cat {MOUNT_HOTPLUGGED_DEVICE_PATH}/{file_name}")
-    )[0]
-    assert output.strip() == file_content, f"'{output}' does not equal '{file_content}'"
+def wait_for_storage_migration_completed(
+    mig_migration: MultiNamespaceVirtualMachineStorageMigration, timeout: int = TIMEOUT_10MIN
+) -> None:
+    """Wait for all namespaces in the migration to have phase == Completed."""
+    last_sample = None
+    samples = TimeoutSampler(
+        wait_timeout=timeout,
+        sleep=TIMEOUT_10SEC,
+        func=lambda: mig_migration.instance.status,
+    )
+    try:
+        for sample in samples:
+            last_sample = sample
+            if sample and sample.namespaces:
+                all_completed = all(ns.get("phase") == mig_migration.Status.COMPLETED for ns in sample.namespaces)
+                if all_completed:
+                    return
+    except TimeoutExpiredError as err:
+        raise StorageMigrationError(
+            f"Timeout waiting for storage migration '{mig_migration.name}' to complete. "
+            f"Last status sample: {last_sample}"
+        ) from err
 
 
-def verify_file_in_windows_vm(windows_vm: VirtualMachineForTests, file_name_with_path: str, file_content: str) -> None:
-    cmd = shlex.split(f'powershell -command "Get-Content {file_name_with_path}"')
-    out = run_ssh_commands(host=windows_vm.ssh_exec, commands=cmd)[0].strip()
-    assert out.strip() == file_content, f"'{out}' does not equal '{file_content}'"
+def build_namespaces_spec_for_storage_migration(
+    vms: list[VirtualMachineForTests], target_storage_class: str
+) -> list[dict]:
+    """
+    Build namespaces spec for MultiNamespaceVirtualMachineStorageMigrationPlan:
+    [
+        {"name": "namespace1", "virtualMachines": [vm1, vm2, ...]},
+        {"name": "namespace2", "virtualMachines": [vm3, ...]},
+    ]
+
+    Args:
+        vms: List of VMs to include in the migration plan.
+        target_storage_class: Target storage class for the migration.
+
+    Returns:
+        List of namespace specs with VMs and their target migration PVCs.
+    """
+    namespaces_dict: dict[str, list] = {}
+    for vm in vms:
+        # Get volume names from VM spec
+        target_migration_pvcs = []
+        for volume in vm.instance.spec.template.spec.volumes:
+            if "dataVolume" in volume.keys():
+                target_migration_pvcs.append({
+                    "volumeName": volume.name,
+                    "destinationPVC": {
+                        "volumeMode": "Auto",
+                        "accessModes": ["Auto"],
+                        "storageClassName": target_storage_class,
+                    },
+                })
+        # Group VMs by namespace
+        namespaces_dict.setdefault(vm.namespace, []).append({
+            "name": vm.name,
+            "targetMigrationPVCs": target_migration_pvcs,
+        })
+
+    return [{"name": ns_name, "virtualMachines": vms} for ns_name, vms in namespaces_dict.items()]

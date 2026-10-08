@@ -1,15 +1,20 @@
+import contextlib
 import logging
 from abc import ABC, abstractmethod
-from typing import Final
+from collections.abc import Generator
+from typing import Final, Self
 
 from ocp_resources.pod import Pod
 from ocp_utilities.exceptions import CommandExecFailed
 from timeout_sampler import retry
 
+from libs.net.ip import filter_link_local_addresses
+from libs.net.vmspec import lookup_iface_status, lookup_iface_status_ip
 from libs.vm.vm import BaseVirtualMachine
 
 _DEFAULT_CMD_TIMEOUT_SEC: Final[int] = 10
 _IPERF_BIN: Final[str] = "iperf3"
+IPERF_SERVER_PORT: Final[int] = 5201
 
 
 LOGGER = logging.getLogger(__name__)
@@ -23,8 +28,12 @@ class BaseTcpClient(ABC):
         self.server_port = server_port
         self._cmd = f"{_IPERF_BIN} --client {self._server_ip} --time 0 --port {self.server_port} --connect-timeout 300"
 
+    @property
+    def server_ip(self) -> str:
+        return self._server_ip
+
     @abstractmethod
-    def __enter__(self) -> "BaseTcpClient":
+    def __enter__(self) -> Self:
         pass
 
     @abstractmethod
@@ -44,18 +53,25 @@ class TcpServer:
     Args:
         vm (BaseVirtualMachine): The virtual machine where the server runs.
         port (int): The port on which the server listens for client connections.
+        bind_ip (str): The IP address to bind the server to (optional).
+        bind_dev (str): Guest network device to bind the server socket to via SO_BINDTODEVICE
+            (e.g. "eth1"). Forces responses out this interface, bypassing ECMP routing.
     """
 
     def __init__(
         self,
         vm: BaseVirtualMachine,
         port: int,
+        bind_ip: str | None = None,
+        bind_dev: str | None = None,
     ):
         self._vm = vm
         self._port = port
         self._cmd = f"{_IPERF_BIN} --server --port {self._port} --one-off"
+        self._cmd += f" --bind {bind_ip}" if bind_ip else ""
+        self._cmd += f" --bind-dev {bind_dev}" if bind_dev else ""
 
-    def __enter__(self) -> "TcpServer":
+    def __enter__(self) -> Self:
         self._vm.console(
             commands=[f"{self._cmd} &"],
             timeout=_DEFAULT_CMD_TIMEOUT_SEC,
@@ -89,6 +105,8 @@ class VMTcpClient(BaseTcpClient):
         server_port (int): The port on which the server listens for connections.
         maximum_segment_size (int): Define explicitly the TCP payload size (in bytes).
                                     Default value is 0 (do not change mss).
+        bind_dev (str): Guest network device to bind the client socket to via SO_BINDTODEVICE
+            (e.g. "eth1"). Forces traffic out this interface, bypassing ECMP routing.
     """
 
     def __init__(
@@ -97,12 +115,14 @@ class VMTcpClient(BaseTcpClient):
         server_ip: str,
         server_port: int,
         maximum_segment_size: int = 0,
+        bind_dev: str | None = None,
     ):
         super().__init__(server_ip=server_ip, server_port=server_port)
         self._vm = vm
+        self._cmd += f" --bind-dev {bind_dev}" if bind_dev else ""
         self._cmd += f" --set-mss {maximum_segment_size}" if maximum_segment_size else ""
 
-    def __enter__(self) -> "VMTcpClient":
+    def __enter__(self) -> Self:
         self._vm.console(
             commands=[f"{self._cmd} &"],
             timeout=_DEFAULT_CMD_TIMEOUT_SEC,
@@ -155,15 +175,23 @@ class PodTcpClient(BaseTcpClient):
         server_port (int): The port on which the server listens for connections.
         bind_interface (str): The interface or IP address to bind the client to (optional).
             If not specified, the client will use the default interface.
+        container (str): Container name to execute commands in.
     """
 
-    def __init__(self, pod: Pod, server_ip: str, server_port: int, bind_interface: str | None = None):
+    def __init__(
+        self,
+        pod: Pod,
+        server_ip: str,
+        server_port: int,
+        bind_interface: str | None = None,
+        container: str | None = None,
+    ) -> None:
         super().__init__(server_ip=server_ip, server_port=server_port)
         self._pod = pod
-        self._container = _IPERF_BIN
+        self._container = container or _IPERF_BIN
         self._cmd += f" --bind {bind_interface}" if bind_interface else ""
 
-    def __enter__(self) -> "PodTcpClient":
+    def __enter__(self) -> Self:
         # run the command in the background using nohup to ensure it keeps running after the exec session ends
         self._pod.execute(
             command=["sh", "-c", f"nohup {self._cmd} >/tmp/{_IPERF_BIN}.log 2>&1 &"], container=self._container
@@ -186,3 +214,79 @@ class PodTcpClient(BaseTcpClient):
 
 def is_tcp_connection(server: TcpServer, client: BaseTcpClient) -> bool:
     return server.is_running() and client.is_running()
+
+
+@contextlib.contextmanager
+def active_tcp_connections(
+    client_vm: BaseVirtualMachine,
+    server_vm: BaseVirtualMachine,
+    iface_name: str,
+) -> Generator[list[tuple[VMTcpClient, TcpServer]]]:
+    """Start iperf3 client-server connections for all IPs on the server's interface.
+       The helper assumed the ip addresses are up.
+
+    Args:
+        client_vm: VM running the iperf3 client.
+        server_vm: VM running the iperf3 server.
+        iface_name: Network interface name on the server VM to resolve IPs from.
+
+    Yields:
+        List of (VMTcpClient, TcpServer) tuples, one per enabled IP family.
+    """
+    iface = lookup_iface_status(vm=server_vm, iface_name=iface_name)
+    server_ips = [ip for ip in filter_link_local_addresses(ip_addresses=iface.ipAddresses)]
+    with contextlib.ExitStack() as stack:
+        active_conns = []
+        for server_ip in server_ips:
+            active_conns.append(
+                stack.enter_context(
+                    client_server_active_connection(
+                        client_vm=client_vm,
+                        server_vm=server_vm,
+                        spec_logical_network=iface.name,
+                        ip_family=server_ip.version,
+                    )
+                )
+            )
+        yield active_conns
+
+
+@contextlib.contextmanager
+def client_server_active_connection(
+    client_vm: BaseVirtualMachine,
+    server_vm: BaseVirtualMachine,
+    spec_logical_network: str,
+    port: int = IPERF_SERVER_PORT,
+    maximum_segment_size: int = 0,
+    ip_family: int = 4,
+) -> Generator[tuple[VMTcpClient, TcpServer]]:
+    """Start iperf3 client-server connection with continuous TCP traffic flow.
+
+    Automatically starts an iperf3 server and client, with traffic flowing continuously
+    while inside the context. Both processes stop automatically on exit.
+
+    Args:
+        client_vm: VM running the iperf3 client (sends traffic).
+        server_vm: VM running the iperf3 server (receives traffic).
+        spec_logical_network: Network interface name on server VM for IP resolution.
+        port: TCP port for iperf3 connection.
+        maximum_segment_size: Define explicitly the TCP payload size (in bytes).
+                              Use for jumbo frame testing.
+                              Default value is 0 (do not change mss).
+        ip_family: IP version to use (4 for IPv4, 6 for IPv6). Default is 4.
+
+    Yields:
+        tuple[VMTcpClient, TcpServer]: Client and server objects with active traffic flowing.
+
+    Note:
+        Traffic runs with infinite duration until context exits.
+    """
+    server_ip = str(lookup_iface_status_ip(vm=server_vm, iface_name=spec_logical_network, ip_family=ip_family))
+    with TcpServer(vm=server_vm, port=port, bind_ip=server_ip) as server:
+        with VMTcpClient(
+            vm=client_vm,
+            server_ip=server_ip,
+            server_port=port,
+            maximum_segment_size=maximum_segment_size,
+        ) as client:
+            yield client, server

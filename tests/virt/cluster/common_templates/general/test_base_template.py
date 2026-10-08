@@ -16,7 +16,12 @@ from ocp_resources.template import Template
 from pytest_testconfig import config as py_config
 
 from tests.os_params import FEDORA_LATEST_LABELS
-from utilities.constants import DATA_SOURCE_NAME, DATA_SOURCE_NAMESPACE, HYPERV_FEATURES_LABELS_VM_YAML, Images
+from utilities.constants import Images
+from utilities.constants.hco import (
+    DATA_SOURCE_NAME,
+    DATA_SOURCE_NAMESPACE,
+)
+from utilities.constants.virt import HYPERV_FEATURES_LABELS_VM_YAML
 
 pytestmark = [pytest.mark.post_upgrade, pytest.mark.sno]
 
@@ -198,7 +203,7 @@ def test_base_templates_annotations(base_templates, common_templates_expected_li
 
     assert not set(base_templates) ^ set(common_templates_expected_list), (
         f"Not all base CNV templates exist\n extra templates: {extra_templates}\n "
-        f"missing templates: {missing_templates}",
+        f"missing templates: {missing_templates}"
     )
 
 
@@ -367,7 +372,7 @@ def test_common_templates_golden_images_params(base_templates):
             for gi_params in template_parameters_dict
             if gi_params["name"] in [DATA_SOURCE_NAME, DATA_SOURCE_NAMESPACE]
         ]
-        if not len(golden_images_params) == 2:
+        if len(golden_images_params) != 2:
             unmatched_templates.update({template.name: "Missing golden images parameters"})
         for gi_params in golden_images_params:
             # DATA_SOURCE_NAME contains either:
@@ -514,7 +519,7 @@ def test_hyperv_features_exist_in_windows_templates(os_base_templates):
     templates_with_wrong_hyperv_labels = {}
     for template in os_base_templates:
         template_hyperv_features = template.instance.objects[0].spec.template.spec.domain.features.get("hyperv")
-        if sorted(list(template_hyperv_features.keys())) != sorted(HYPERV_FEATURES_LABELS_VM_YAML):
+        if sorted(template_hyperv_features.keys()) != sorted(HYPERV_FEATURES_LABELS_VM_YAML):
             templates_with_wrong_hyperv_labels[template.name] = list(template_hyperv_features.keys())
     assert not templates_with_wrong_hyperv_labels, (
         f"Windows templates are missing hyperV labels.\n"

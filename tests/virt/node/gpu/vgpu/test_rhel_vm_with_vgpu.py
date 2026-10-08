@@ -27,6 +27,7 @@ from tests.virt.utils import (
 )
 from utilities.virt import (
     VirtualMachineForTestsFromTemplate,
+    get_data_volume_template_dict_with_default_storage_class,
     pause_unpause_vm_and_check_connectivity,
     running_vm,
     vm_instance_from_template,
@@ -48,7 +49,7 @@ TESTS_CLASS_NAME = "TestVGPURHELGPUSSpec"
 def gpu_vmb(
     unprivileged_client,
     namespace,
-    golden_image_data_volume_template_for_test_scope_class,
+    golden_image_data_source_for_test_scope_class,
     supported_gpu_device,
     gpu_vma,
 ):
@@ -60,7 +61,9 @@ def gpu_vmb(
         namespace=namespace.name,
         client=unprivileged_client,
         labels=Template.generate_template_labels(**RHEL_LATEST_LABELS),
-        data_volume_template=golden_image_data_volume_template_for_test_scope_class,
+        data_volume_template=get_data_volume_template_dict_with_default_storage_class(
+            data_source=golden_image_data_source_for_test_scope_class,
+        ),
         vm_affinity=gpu_vma.vm_affinity,
         gpu_name=supported_gpu_device[VGPU_DEVICE_NAME_STR],
     ) as vm:
@@ -69,26 +72,25 @@ def gpu_vmb(
 
 
 @pytest.fixture(scope="class")
-def node_mdevtype_gpu_vm(
+def node_specific_vgpu_vm(
     request,
     unprivileged_client,
     namespace,
-    golden_image_data_volume_template_for_test_scope_class,
+    golden_image_data_source_for_test_scope_class,
     nodes_with_supported_gpus,
     supported_gpu_device,
 ):
     """
-    VM Fixture for nodeMediatedDeviceType vGPU based Tests.
-
-    This VM fixture is used to create a VM on a node on which
-    the global GPU Mdev Type has been overridden via the configuration
-    'nodeMediatedDeviceTypes' in HCO CR.
+    VM on the node whose vGPU type was overridden via NVIDIA GPU Operator
+    node-specific vgpu.config label.
     """
     with vm_instance_from_template(
         request=request,
         namespace=namespace,
         unprivileged_client=unprivileged_client,
-        data_volume_template=golden_image_data_volume_template_for_test_scope_class,
+        data_volume_template=get_data_volume_template_dict_with_default_storage_class(
+            data_source=golden_image_data_source_for_test_scope_class,
+        ),
         vm_affinity=build_node_affinity_dict(values=[[*nodes_with_supported_gpus][1].name]),
         gpu_name=supported_gpu_device[VGPU_GRID_NAME_STR],
     ) as vm:
@@ -97,8 +99,8 @@ def node_mdevtype_gpu_vm(
 
 
 @pytest.fixture(scope="class")
-def vm_with_no_gpu(gpu_vma, node_mdevtype_gpu_vm):
-    return [vm.name for vm in [gpu_vma, node_mdevtype_gpu_vm] if not get_num_gpu_devices_in_rhel_vm(vm=vm) == 1]
+def vm_with_no_gpu(gpu_vma, node_specific_vgpu_vm):
+    return [vm.name for vm in [gpu_vma, node_specific_vgpu_vm] if get_num_gpu_devices_in_rhel_vm(vm=vm) != 1]
 
 
 @pytest.mark.parametrize(
@@ -168,12 +170,12 @@ class TestVGPURHELGPUSSpec:
         """
         Test vGPU is accessible in both the RHEL VMs, using same GPU, using GPUs spec.
         """
-        vm_with_no_gpu = [vm.name for vm in [gpu_vma, gpu_vmb] if not get_num_gpu_devices_in_rhel_vm(vm=vm) == 1]
+        vm_with_no_gpu = [vm.name for vm in [gpu_vma, gpu_vmb] if get_num_gpu_devices_in_rhel_vm(vm=vm) != 1]
         assert not vm_with_no_gpu, f"GPU does not exist in following vms: {vm_with_no_gpu}"
 
 
 @pytest.mark.parametrize(
-    "golden_image_data_source_for_test_scope_class, gpu_vma, node_mdevtype_gpu_vm",
+    "golden_image_data_source_for_test_scope_class, gpu_vma, node_specific_vgpu_vm",
     [
         pytest.param(
             {"os_dict": RHEL_LATEST},
@@ -183,7 +185,7 @@ class TestVGPURHELGPUSSpec:
                 "gpu_device": VGPU_DEVICE_NAME_STR,
             },
             {
-                "vm_name": "node-mdevtype-rhel-vgpu-gpus-spec-vm2",
+                "vm_name": "node-specific-rhel-vgpu-gpus-spec-vm2",
                 "template_labels": RHEL_LATEST_LABELS,
             },
         ),
@@ -191,26 +193,20 @@ class TestVGPURHELGPUSSpec:
     indirect=True,
 )
 @pytest.mark.usefixtures(
-    "hco_cr_with_node_specific_mdev_permitted_hostdevices",
+    "hco_cr_with_node_specific_vgpu_permitted_hostdevices",
 )
-class TestNodeMDEVTypeVGPURHELGPUSSpec:
+class TestNodeSpecificVGPURHELGPUSSpec:
     """
-    Test vGPU with RHEL VM using GPUS Spec.
+    Test vGPU with RHEL VM using GPUS Spec and node-specific vGPU configuration via GPU operator.
     """
 
     @pytest.mark.polarion("CNV-8744")
     def test_node_specific_permitted_hostdevices_vgpu_visible(
-        self, gpu_vma, node_mdevtype_gpu_vm, nodes_with_supported_gpus, supported_gpu_device
+        self, gpu_vma, node_specific_vgpu_vm, nodes_with_supported_gpus, supported_gpu_device
     ):
         """
         Test Permitted HostDevice is visible and count updated under Capacity/Allocatable
-        section for both nodes.
-
-        Automatic Configuration of node specific mediated devices using nodeMediatedDeviceTypes
-        Here we are using 'nodeMediatedDeviceTypes' in HCO CR, hence different nodes would
-        have different mdevtype configured.
-        Without the use of 'nodeMediatedDeviceTypes' in HCO CR, all the nodes, would have
-        the same mdevtype configured for all the nodes.
+        section for both nodes, configured via GPU operator's node-specific vGPU config.
         """
         vgpu_device_name = supported_gpu_device[VGPU_DEVICE_NAME_STR]
         vgpu_grid_name = supported_gpu_device[VGPU_GRID_NAME_STR]
@@ -228,13 +224,13 @@ class TestNodeMDEVTypeVGPURHELGPUSSpec:
         )
 
     @pytest.mark.polarion("CNV-8745")
-    def test_access_vgpus_using_node_mdevtype(
+    def test_access_vgpus_using_node_specific_vgpu(
         self,
         gpu_vma,
-        node_mdevtype_gpu_vm,
+        node_specific_vgpu_vm,
         vm_with_no_gpu,
     ):
         """
-        Test vGPU is accessible in both the RHEL VMs, using GPUs spec.
+        Test vGPU is accessible in both RHEL VMs, including the node-specific vGPU type.
         """
         assert not vm_with_no_gpu, f"GPU does not exist in following vms: {vm_with_no_gpu}"

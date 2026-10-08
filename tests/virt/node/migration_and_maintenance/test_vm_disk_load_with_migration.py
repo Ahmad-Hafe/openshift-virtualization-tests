@@ -1,14 +1,22 @@
+from __future__ import annotations
+
 import logging
 import re
 import shlex
+from typing import TYPE_CHECKING
 
 import pytest
 from pyhelper_utils.shell import run_ssh_commands
 from timeout_sampler import TimeoutExpiredError, TimeoutSampler
 
 from tests.os_params import FEDORA_LATEST, FEDORA_LATEST_LABELS
-from utilities.constants import TIMEOUT_1MIN
+from utilities.constants.timeouts import TIMEOUT_1MIN, TIMEOUT_2MIN
 from utilities.virt import migrate_vm_and_verify, running_vm, vm_instance_from_template
+
+if TYPE_CHECKING:
+    from kubernetes.dynamic import DynamicClient
+
+    from utilities.virt import VirtualMachineForTests
 
 LOGGER = logging.getLogger(__name__)
 
@@ -16,14 +24,18 @@ LOGGER = logging.getLogger(__name__)
 @pytest.fixture()
 def vm_with_fio(
     request,
-    cluster_cpu_model_scope_function,
+    cpu_for_migration,
     unprivileged_client,
     namespace,
     golden_image_data_volume_template_for_test_scope_class,
+    is_s390x_cluster,
 ):
+    if is_s390x_cluster:
+        request.param["cpu_threads"] = 1
     with vm_instance_from_template(
         request=request,
         unprivileged_client=unprivileged_client,
+        vm_cpu_model=cpu_for_migration,
         namespace=namespace,
         data_volume_template=golden_image_data_volume_template_for_test_scope_class,
     ) as vm_with_fio:
@@ -34,7 +46,11 @@ def vm_with_fio(
 @pytest.fixture()
 def running_fio_in_vm(vm_with_fio):
     LOGGER.info("Installing fio and iotop tools")
-    run_ssh_commands(host=vm_with_fio.ssh_exec, commands=shlex.split("sudo dnf install -y iotop fio"))
+    run_ssh_commands(
+        host=vm_with_fio.ssh_exec,
+        commands=shlex.split("sudo dnf install -y iotop fio"),
+        wait_timeout=TIMEOUT_2MIN,
+    )
 
     # Random write/read -  create a 1G file, and perform 4KB reads and writes using a 75%/25%
     LOGGER.info("Running fio in VM")
@@ -43,7 +59,11 @@ def running_fio_in_vm(vm_with_fio):
         "--gtod_reduce=1 --name=test --filename=/home/fedora/random_read_write.fio --bs=4k --iodepth=64 "
         "--size=1G --readwrite=randrw --rwmixread=75 --numjobs=8 >& /dev/null &"
     )
-    run_ssh_commands(host=vm_with_fio.ssh_exec, commands=fio_cmd)
+    run_ssh_commands(
+        host=vm_with_fio.ssh_exec,
+        commands=fio_cmd,
+        wait_timeout=TIMEOUT_2MIN,
+    )
     get_disk_usage(ssh_exec=vm_with_fio.ssh_exec)
 
 
@@ -86,8 +106,10 @@ def get_disk_usage(ssh_exec):
     ],
     indirect=True,
 )
+@pytest.mark.s390x
 @pytest.mark.rwx_default_storage
-def test_fedora_vm_load_migration(vm_with_fio, running_fio_in_vm):
+@pytest.mark.usefixtures("running_fio_in_vm")
+def test_fedora_vm_load_migration(admin_client: DynamicClient, vm_with_fio: VirtualMachineForTests):
     LOGGER.info("Test migrate VM with disk load")
-    migrate_vm_and_verify(vm=vm_with_fio, check_ssh_connectivity=True)
+    migrate_vm_and_verify(vm=vm_with_fio, client=admin_client, check_ssh_connectivity=True)
     get_disk_usage(ssh_exec=vm_with_fio.ssh_exec)

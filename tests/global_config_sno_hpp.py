@@ -2,7 +2,12 @@ from typing import Any
 
 import pytest_testconfig
 
-from utilities.constants import ALL_CNV_DAEMONSETS, ALL_CNV_DEPLOYMENTS, ALL_CNV_PODS, HPP_CAPABILITIES
+from utilities.constants.components import (
+    ALL_CNV_DAEMONSETS,
+    ALL_CNV_DEPLOYMENTS,
+    ALL_CNV_PODS,
+)
+from utilities.constants.storage import HPP_CAPABILITIES
 from utilities.storage import HppCsiStorageClass
 
 global config
@@ -21,7 +26,7 @@ storage_class_matrix = [
 
 
 for _dir in dir():
-    if not config:  # noqa: F821
+    if not config:
         config: dict[str, Any] = {}
     val = locals()[_dir]
     if type(val) not in [bool, list, dict, str, int]:
@@ -30,4 +35,4 @@ for _dir in dir():
     if _dir in ["encoding", "py_file"]:
         continue
 
-    config[_dir] = locals()[_dir]  # noqa: F821
+    config[_dir] = locals()[_dir]

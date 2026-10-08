@@ -5,33 +5,32 @@ Clone tests
 import pytest
 from ocp_resources.datavolume import DataVolume
 
-from tests.os_params import FEDORA_LATEST, WINDOWS_11, WINDOWS_11_TEMPLATE_LABELS
+from tests.os_params import FEDORA_LATEST
+from tests.storage.stop_status_utils import dv_stop_status_restart_threshold
 from tests.storage.utils import (
     assert_pvc_snapshot_clone_annotation,
     assert_use_populator,
-    create_windows_vm_validate_guest_agent_info,
 )
-from utilities.constants import (
-    OS_FLAVOR_FEDORA,
-    OS_FLAVOR_WINDOWS,
-    TIMEOUT_1MIN,
-    TIMEOUT_40MIN,
-    Images,
-)
+from tests.utils import create_windows2022_vm
+from utilities.constants import Images
+from utilities.constants.images import OS_FLAVOR_FEDORA, OS_FLAVOR_WINDOWS
+from utilities.constants.timeouts import TIMEOUT_1MIN
+from utilities.constants.virt import WIN_2K22
+from utilities.ssp import validate_os_info_vmi_vs_windows_os
 from utilities.storage import (
-    check_disk_count_in_vm,
+    assert_guest_disk_count,
     create_dv,
     create_vm_from_dv,
-    data_volume_template_dict,
+    data_volume_template_dict_with_pvc_source,
+    get_dv_size_from_datasource,
     overhead_size_for_dv,
+    sc_volume_binding_mode_is_wffc,
 )
 from utilities.virt import (
     VirtualMachineForTests,
     restart_vm_wait_for_running_vm,
     running_vm,
 )
-
-WINDOWS_CLONE_TIMEOUT = TIMEOUT_40MIN
 
 
 def create_vm_from_clone_dv_template(
@@ -47,10 +46,10 @@ def create_vm_from_clone_dv_template(
     with VirtualMachineForTests(
         name=vm_name,
         namespace=namespace_name,
-        os_flavor=Images.Cirros.OS_FLAVOR,
+        os_flavor=OS_FLAVOR_FEDORA,
         client=client,
-        memory_guest=Images.Cirros.DEFAULT_MEMORY_SIZE,
-        data_volume_template=data_volume_template_dict(
+        memory_guest=Images.Fedora.DEFAULT_MEMORY_SIZE,
+        data_volume_template=data_volume_template_dict_with_pvc_source(
             target_dv_name=dv_name,
             target_dv_namespace=namespace_name,
             source_dv=source_dv,
@@ -59,39 +58,7 @@ def create_vm_from_clone_dv_template(
             storage_class=storage_class,
         ),
     ) as vm:
-        running_vm(vm=vm, wait_for_interfaces=False)
-
-
-@pytest.mark.tier3
-@pytest.mark.parametrize(
-    "data_volume_multi_storage_scope_function",
-    [
-        pytest.param(
-            {
-                "dv_name": "dv-source",
-                "image": f"{Images.Windows.DIR}/{Images.Windows.WIN11_IMG}",
-                "dv_size": Images.Windows.DEFAULT_DV_SIZE,
-            },
-            marks=(pytest.mark.polarion("CNV-1892")),
-        ),
-    ],
-    indirect=True,
-)
-@pytest.mark.s390x
-def test_successful_clone_of_large_image(
-    admin_client,
-    namespace,
-    data_volume_multi_storage_scope_function,
-):
-    with create_dv(
-        source="pvc",
-        dv_name="dv-target",
-        namespace=namespace.name,
-        size=data_volume_multi_storage_scope_function.size,
-        source_pvc=data_volume_multi_storage_scope_function.name,
-        storage_class=data_volume_multi_storage_scope_function.storage_class,
-    ) as cdv:
-        cdv.wait_for_dv_success(timeout=WINDOWS_CLONE_TIMEOUT)
+        running_vm(vm=vm)
 
 
 @pytest.mark.sno
@@ -105,28 +72,28 @@ def test_successful_vm_restart_with_cloned_dv(
     fedora_data_source_scope_module,
     cluster_csi_drivers_names,
 ):
-    source_dict = fedora_data_source_scope_module.source.instance.to_dict()
-    source_spec_dict = source_dict["spec"]
-    size = source_spec_dict.get("resources", {}).get("requests", {}).get("storage") or source_dict.get(
-        "status", {}
-    ).get("restoreSize")
-
-    with DataVolume(
-        name="dv-target",
+    size = get_dv_size_from_datasource(data_source=fedora_data_source_scope_module)
+    with create_dv(
+        dv_name="dv-target",
         namespace=namespace.name,
         client=unprivileged_client,
         size=size,
-        api_name="storage",
         storage_class=storage_class_name_scope_module,
+        consume_wffc=False,
         source_ref={
             "kind": fedora_data_source_scope_module.kind,
             "name": fedora_data_source_scope_module.name,
             "namespace": fedora_data_source_scope_module.namespace,
         },
     ) as cdv:
-        cdv.wait(timeout=TIMEOUT_1MIN, wait_for_exists_only=True)
-        cdv.pvc.wait()
-
+        if sc_volume_binding_mode_is_wffc(sc=storage_class_name_scope_module, client=unprivileged_client):
+            cdv.wait_for_status(status=DataVolume.Status.PENDING_POPULATION, timeout=TIMEOUT_1MIN)
+            cdv.pvc.wait()
+        else:
+            cdv.wait_for_dv_success(
+                stop_status_func=dv_stop_status_restart_threshold,
+                dv=cdv,
+            )
         with create_vm_from_dv(
             client=unprivileged_client,
             dv=cdv,
@@ -145,49 +112,66 @@ def test_successful_vm_restart_with_cloned_dv(
 
 
 @pytest.mark.tier3
-@pytest.mark.parametrize(
-    ("data_volume_multi_storage_scope_function", "vm_params"),
-    [
-        pytest.param(
-            {
-                "dv_name": "dv-source",
-                "source": "http",
-                "image": f"{Images.Windows.DIR}/{Images.Windows.WIN11_IMG}",
-                "dv_size": Images.Windows.DEFAULT_DV_SIZE,
-            },
-            {
-                "vm_name": f"vm-win-{WINDOWS_11.get('os_version')}",
-                "template_labels": WINDOWS_11_TEMPLATE_LABELS,
-                "os_version": WINDOWS_11.get("os_version"),
-                "ssh": True,
-            },
-            marks=pytest.mark.polarion("CNV-3638"),
-        ),
-    ],
-    indirect=["data_volume_multi_storage_scope_function"],
-)
-def test_successful_vm_from_cloned_dv_windows(
-    unprivileged_client,
-    data_volume_multi_storage_scope_function,
-    vm_params,
-    namespace,
-):
-    with create_dv(
-        client=unprivileged_client,
-        source="pvc",
-        dv_name="dv-target",
-        namespace=data_volume_multi_storage_scope_function.namespace,
-        size=data_volume_multi_storage_scope_function.size,
-        source_pvc=data_volume_multi_storage_scope_function.name,
-        storage_class=data_volume_multi_storage_scope_function.storage_class,
-    ) as cdv:
-        cdv.wait_for_dv_success(timeout=WINDOWS_CLONE_TIMEOUT)
-        create_windows_vm_validate_guest_agent_info(
-            dv=cdv,
-            namespace=namespace,
-            unprivileged_client=unprivileged_client,
-            vm_params=vm_params,
+@pytest.mark.incremental
+@pytest.mark.conformance
+@pytest.mark.windows
+class TestWindowsClonedDv:
+    """
+    Tests for Windows 2022 DV cloning, and VM creation with vTPM.
+
+    Preconditions:
+        - Windows Server 2022 DataVolume
+        - Cloned DataVolume created from the source DataVolume (PVC clone)
+    """
+
+    @pytest.mark.polarion("CNV-1892")
+    def test_clone_dv_windows(self, cloned_windows_dv_multi_storage_scope_class):
+        """
+        Test that a large image can be cloned.
+
+        Preconditions:
+            - Cloned DataVolume created from the source DataVolume (PVC clone)
+
+        Steps:
+            1. Verify the cloned DataVolume status
+
+        Expected:
+            - Cloned DataVolume status is "Succeeded"
+        """
+        assert cloned_windows_dv_multi_storage_scope_class.status == DataVolume.Status.SUCCEEDED, (
+            f"Cloned DV status is {cloned_windows_dv_multi_storage_scope_class.status}, expected {DataVolume.Status.SUCCEEDED}"
         )
+
+    @pytest.mark.polarion("CNV-3638")
+    def test_vm_from_cloned_dv_windows(
+        self,
+        unprivileged_client,
+        namespace,
+        modern_cpu_for_migration,
+        cloned_windows_dv_multi_storage_scope_class,
+    ):
+        """
+        Test that a Windows 2022 VM with vTPM boots from a cloned DataVolume.
+
+        Preconditions:
+            - Cloned DataVolume created from the source DataVolume (PVC clone)
+
+        Steps:
+            1. Create a Windows 2022 VM with vTPM from the cloned DataVolume using instance type and preference
+            2. Wait for the VM to reach Running state
+            3. Wait for Windows OS to be ready inside the VM
+
+        Expected:
+            - VM OS info reported by VMI matches the expected Windows OS parameters
+        """
+        with create_windows2022_vm(
+            namespace=namespace.name,
+            client=unprivileged_client,
+            vm_name=f"vm-{WIN_2K22}",
+            cpu_model=modern_cpu_for_migration,
+            data_volume=cloned_windows_dv_multi_storage_scope_class,
+        ) as vm:
+            validate_os_info_vmi_vs_windows_os(vm=vm)
 
 
 @pytest.mark.parametrize(
@@ -203,7 +187,7 @@ def test_successful_vm_from_cloned_dv_windows(
         ),
         pytest.param(
             {
-                "dv_name": "dv-source-win",
+                "dv_name": f"dv-source-{OS_FLAVOR_WINDOWS}",
                 "image": f"{Images.Windows.DIR}/{Images.Windows.WIN11_IMG}",
                 "dv_size": Images.Windows.DEFAULT_DV_SIZE,
             },
@@ -225,11 +209,15 @@ def test_successful_snapshot_clone(
         dv_name="dv-target",
         namespace=namespace,
         size=data_volume_snapshot_capable_storage_scope_function.size,
-        source_pvc=data_volume_snapshot_capable_storage_scope_function.name,
+        source_pvc_name=data_volume_snapshot_capable_storage_scope_function.name,
+        source_pvc_namespace=data_volume_snapshot_capable_storage_scope_function.namespace,
         storage_class=storage_class,
     ) as cdv:
-        cdv.wait_for_dv_success()
-        if OS_FLAVOR_WINDOWS not in data_volume_snapshot_capable_storage_scope_function.url.split("/")[-1]:
+        cdv.wait_for_dv_success(
+            stop_status_func=dv_stop_status_restart_threshold,
+            dv=cdv,
+        )
+        if OS_FLAVOR_WINDOWS not in data_volume_snapshot_capable_storage_scope_function.name:
             with create_vm_from_dv(
                 client=unprivileged_client,
                 dv=cdv,
@@ -238,7 +226,7 @@ def test_successful_snapshot_clone(
                 memory_guest=Images.Fedora.DEFAULT_MEMORY_SIZE,
                 wait_for_interfaces=True,
             ) as vm_dv:
-                check_disk_count_in_vm(vm=vm_dv)
+                assert_guest_disk_count(vm=vm_dv)
         pvc = cdv.pvc
         assert_use_populator(
             pvc=pvc,
@@ -249,26 +237,42 @@ def test_successful_snapshot_clone(
 
 
 @pytest.mark.gating
+@pytest.mark.conformance
 @pytest.mark.polarion("CNV-5607")
 @pytest.mark.s390x
 def test_clone_from_fs_to_block_using_dv_template(
     skip_test_if_no_block_sc,
     unprivileged_client,
     namespace,
-    cirros_dv_with_filesystem_volume_mode,
+    fedora_dv_with_filesystem_volume_mode,
     storage_class_with_block_volume_mode,
 ):
+    """
+    Test cloning a DV from filesystem to block volume mode via DV template.
+
+    Preconditions:
+        - Fedora DataVolume with filesystem volume mode
+        - Storage class supporting block volume mode
+
+    Steps:
+        1. Create a VM using a clone DataVolume template that clones the filesystem DV to block
+        2. Wait for the VM to reach Running state with SSH connectivity
+
+    Expected:
+        - VM boots successfully with the cloned block DV
+    """
     create_vm_from_clone_dv_template(
         vm_name="vm-5607",
         dv_name="dv-5607",
         namespace_name=namespace.name,
-        source_dv=cirros_dv_with_filesystem_volume_mode,
+        source_dv=fedora_dv_with_filesystem_volume_mode,
         client=unprivileged_client,
         volume_mode=DataVolume.VolumeMode.BLOCK,
         storage_class=storage_class_with_block_volume_mode,
     )
 
 
+@pytest.mark.conformance
 @pytest.mark.polarion("CNV-5608")
 @pytest.mark.smoke()
 @pytest.mark.s390x
@@ -276,21 +280,64 @@ def test_clone_from_block_to_fs_using_dv_template(
     skip_test_if_no_block_sc,
     unprivileged_client,
     namespace,
-    cirros_dv_with_block_volume_mode,
+    fedora_dv_with_block_volume_mode,
     storage_class_with_filesystem_volume_mode,
     default_fs_overhead,
 ):
+    """
+    Test cloning a DV from block to filesystem volume mode via DV template.
+
+    Preconditions:
+        - Fedora DataVolume with block volume mode
+        - Storage class supporting filesystem volume mode
+
+    Steps:
+        1. Create a VM using a clone DataVolume template that clones the block DV to filesystem
+        2. Wait for the VM to reach Running state with SSH connectivity
+
+    Expected:
+        - VM boots successfully with the cloned filesystem DV
+    """
     create_vm_from_clone_dv_template(
         vm_name="vm-5608",
         dv_name="dv-5608",
         namespace_name=namespace.name,
-        source_dv=cirros_dv_with_block_volume_mode,
+        source_dv=fedora_dv_with_block_volume_mode,
         client=unprivileged_client,
         volume_mode=DataVolume.VolumeMode.FILE,
         # add fs overhead and round up the result
         size=overhead_size_for_dv(
-            image_size=int(cirros_dv_with_block_volume_mode.size[:-2]),
+            image_size=int(fedora_dv_with_block_volume_mode.size[:-2]),
             overhead_value=default_fs_overhead,
         ),
         storage_class=storage_class_with_filesystem_volume_mode,
     )
+
+
+@pytest.mark.tier3
+@pytest.mark.conformance
+@pytest.mark.polarion("CNV-16775")
+def test_clone_vm_with_4_disks(target_vm_from_4_disk_clone):
+    """
+    Test that cloning a VM with 4 source disks preserves all 5 VM-spec disks, including cloud-init.
+
+    Jira: https://issues.redhat.com/browse/CNV-88909  # <skip-jira-utils-check>
+
+    Preconditions:
+        - Source Fedora VM with 1 boot disk (cloned from golden image DataSource), 3 blank data disks,
+          and a cloud-init disk
+
+    Steps:
+        1. Clone the source VM using VirtualMachineClone
+        2. Wait for the clone job to succeed
+        3. Start the target VM and verify all 5 VM-spec disks are visible inside the guest
+
+    Expected:
+        - All 5 VM-spec disks are visible inside the running target VM
+    """
+    expected_disks = 5  # 1 boot + 1 cloud-init + 3 blank data disks
+    actual_spec_disks = len(target_vm_from_4_disk_clone.instance.spec.template.spec.domain.devices.disks)
+    assert actual_spec_disks == expected_disks, (
+        f"Target VM spec has {actual_spec_disks} disks, expected {expected_disks}"
+    )
+    assert_guest_disk_count(vm=target_vm_from_4_disk_clone)

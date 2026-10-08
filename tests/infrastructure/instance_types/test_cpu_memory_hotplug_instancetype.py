@@ -1,3 +1,7 @@
+from __future__ import annotations
+
+from typing import TYPE_CHECKING
+
 import pytest
 from kubernetes.dynamic.exceptions import UnprocessibleEntityError
 from ocp_resources.datavolume import DataVolume
@@ -6,13 +10,13 @@ from ocp_resources.virtual_machine_cluster_preference import VirtualMachineClust
 from ocp_resources.virtual_machine_snapshot import VirtualMachineSnapshot
 
 from tests.utils import (
-    assert_guest_os_cpu_count,
     assert_restart_required_condition,
     clean_up_migration_jobs,
     hotplug_instance_type_vm_and_verify,
     update_vm_instancetype_name,
+    wait_for_guest_os_cpu_count,
 )
-from utilities.constants import (
+from utilities.constants.virt import (
     FOUR_CPU_SOCKETS,
     SIX_CPU_SOCKETS,
     TEN_CPU_SOCKETS,
@@ -26,6 +30,9 @@ from utilities.virt import (
     restart_vm_wait_for_running_vm,
     running_vm,
 )
+
+if TYPE_CHECKING:
+    from kubernetes.dynamic import DynamicClient
 
 pytestmark = [pytest.mark.usefixtures("skip_if_no_common_modern_cpu")]
 
@@ -80,25 +87,25 @@ def hotplug_preference(admin_client):
 
 
 @pytest.fixture(scope="class")
-def four_sockets_instance_type(modern_cpu_for_migration):
+def four_sockets_instance_type(admin_client, modern_cpu_for_migration):
     with cluster_instance_type_for_hot_plug(
-        guest_sockets=FOUR_CPU_SOCKETS, cpu_model=modern_cpu_for_migration
+        client=admin_client, guest_sockets=FOUR_CPU_SOCKETS, cpu_model=modern_cpu_for_migration
     ) as instance_type:
         yield instance_type
 
 
 @pytest.fixture(scope="class")
-def six_sockets_instance_type(modern_cpu_for_migration):
+def six_sockets_instance_type(admin_client, modern_cpu_for_migration):
     with cluster_instance_type_for_hot_plug(
-        guest_sockets=SIX_CPU_SOCKETS, cpu_model=modern_cpu_for_migration
+        client=admin_client, guest_sockets=SIX_CPU_SOCKETS, cpu_model=modern_cpu_for_migration
     ) as instance_type:
         yield instance_type
 
 
 @pytest.fixture(scope="class")
-def ten_sockets_instance_type(modern_cpu_for_migration):
+def ten_sockets_instance_type(admin_client, modern_cpu_for_migration):
     with cluster_instance_type_for_hot_plug(
-        guest_sockets=TEN_CPU_SOCKETS, cpu_model=modern_cpu_for_migration
+        client=admin_client, guest_sockets=TEN_CPU_SOCKETS, cpu_model=modern_cpu_for_migration
     ) as instance_type:
         yield instance_type
 
@@ -128,12 +135,15 @@ class TestCPUHotPlugInstanceType:
     @pytest.mark.dependency(name=f"{TESTS_CLASS_NAME}::hotplug_cpu_instance_type")
     @pytest.mark.polarion("CNV-11401")
     def test_hotplug_cpu_instance_type(self, instance_type_hotplug_vm, hotplugged_six_sockets_instance_type):
-        assert_guest_os_cpu_count(vm=instance_type_hotplug_vm, spec_cpu_amount=SIX_CPU_SOCKETS)
+        wait_for_guest_os_cpu_count(vm=instance_type_hotplug_vm, spec_cpu_amount=SIX_CPU_SOCKETS)
 
     @pytest.mark.dependency(depends=[f"{TESTS_CLASS_NAME}::hotplug_cpu_instance_type"])
     @pytest.mark.polarion("CNV-11402")
-    def test_migrate_snapshot_hotplugged_vm(self, hotplug_vm_snapshot_instance_type, instance_type_hotplug_vm):
-        migrate_vm_and_verify(vm=instance_type_hotplug_vm, check_ssh_connectivity=True)
+    @pytest.mark.usefixtures("hotplug_vm_snapshot_instance_type")
+    def test_migrate_snapshot_hotplugged_vm(
+        self, admin_client: DynamicClient, instance_type_hotplug_vm: VirtualMachineForTests
+    ):
+        migrate_vm_and_verify(vm=instance_type_hotplug_vm, client=admin_client, check_ssh_connectivity=True)
 
     @pytest.mark.dependency(
         name=f"{TESTS_CLASS_NAME}::decrease_cpu_value", depends=[f"{TESTS_CLASS_NAME}::hotplug_cpu_instance_type"]

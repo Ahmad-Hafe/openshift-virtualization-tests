@@ -1,10 +1,18 @@
+from __future__ import annotations
+
 import logging
+from typing import TYPE_CHECKING
 
 import pytest
 from ocp_resources.virtual_machine_restore import VirtualMachineRestore
 
+from tests.storage.upgrade.constants import (
+    UPGRADE_FIRST_FILE_CONTENT,
+    UPGRADE_FIRST_FILE_NAME,
+    UPGRADE_SECOND_FILE_NAME,
+)
+from tests.storage.utils import assert_disk_bus
 from tests.upgrade_params import (
-    CDI_SCRATCH_PRESERVE_NODE_ID,
     HOTPLUG_VM_AFTER_UPGRADE_NODE_ID,
     IUO_UPGRADE_TEST_DEPENDENCY_NODE_ID,
     IUO_UPGRADE_TEST_ORDERING_NODE_ID,
@@ -12,14 +20,21 @@ from tests.upgrade_params import (
     SNAPSHOT_RESTORE_CREATE_AFTER_UPGRADE,
     STORAGE_NODE_ID_PREFIX,
 )
-from utilities.constants import DEPENDENCY_SCOPE_SESSION, LS_COMMAND
+from utilities.constants.pytest import DEPENDENCY_SCOPE_SESSION, QUARANTINED
+from utilities.constants.storage import HOTPLUG_DISK_VIRTIO_BUS
 from utilities.storage import (
     assert_disk_serial,
-    assert_hotplugvolume_nonexist_optional_restart,
-    run_command_on_cirros_vm_and_check_output,
+    assert_hotplugvolume_nonexist,
+    run_command_on_vm_and_check_output,
     wait_for_vm_volume_ready,
 )
-from utilities.virt import migrate_vm_and_verify
+from utilities.virt import migrate_vm_and_verify, running_vm
+
+if TYPE_CHECKING:
+    from kubernetes.dynamic import DynamicClient
+    from ocp_resources.datavolume import DataVolume
+
+    from utilities.virt import VirtualMachineForTests
 
 LOGGER = logging.getLogger(__name__)
 
@@ -35,47 +50,44 @@ pytestmark = [
 class TestUpgradeStorage:
     """Pre-upgrade tests"""
 
-    @pytest.mark.sno
-    @pytest.mark.polarion("CNV-4880")
-    @pytest.mark.order(before=IUO_UPGRADE_TEST_ORDERING_NODE_ID)
-    @pytest.mark.dependency(name=f"{STORAGE_NODE_ID_PREFIX}::test_cdiconfig_scratch_overriden_before_upgrade")
-    def test_cdiconfig_scratch_overriden_before_upgrade(
-        self,
-        cdi_config,
-        storage_class_for_updating_cdiconfig_scratch,
-        override_cdiconfig_scratch_spec,
-    ):
-        """
-        Check that the scratch StorageClass configuration should be changed before CNV upgrade
-        """
-        expected_sc = storage_class_for_updating_cdiconfig_scratch.instance.metadata.name
-        actual_sc = cdi_config.scratch_space_storage_class_from_status
-        assert actual_sc == expected_sc, (
-            "The scratchSpaceStorageClass on CDIConfig config should be changed before upgrade"
-        )
-
+    @pytest.mark.xfail(
+        reason=f"{QUARANTINED}: Flaky UEFI boot failure after DV clone on upgrade cluster; CNV-95012",
+        run=False,
+    )
     @pytest.mark.sno
     @pytest.mark.polarion("CNV-5993")
     @pytest.mark.order(before=IUO_UPGRADE_TEST_ORDERING_NODE_ID)
     @pytest.mark.dependency(name=f"{STORAGE_NODE_ID_PREFIX}::test_vm_snapshot_restore_before_upgrade")
     def test_vm_snapshot_restore_before_upgrade(
         self,
+        admin_client,
         skip_if_no_storage_class_for_snapshot,
-        cirros_vm_for_upgrade_a,
+        rhel_vm_for_upgrade_a,
         snapshots_for_upgrade_a,
     ):
         with VirtualMachineRestore(
-            name=f"restore-snapshot-{cirros_vm_for_upgrade_a.name}",
+            client=admin_client,
+            name=f"restore-snapshot-{rhel_vm_for_upgrade_a.name}",
             namespace=snapshots_for_upgrade_a.namespace,
-            vm_name=cirros_vm_for_upgrade_a.name,
+            vm_name=rhel_vm_for_upgrade_a.name,
             snapshot_name=snapshots_for_upgrade_a.name,
         ) as vm_restore:
+            if rhel_vm_for_upgrade_a.ready:
+                rhel_vm_for_upgrade_a.stop(wait=True)
             vm_restore.wait_restore_done()
-            cirros_vm_for_upgrade_a.start(wait=True)
-            run_command_on_cirros_vm_and_check_output(
-                vm=cirros_vm_for_upgrade_a,
-                command=LS_COMMAND,
-                expected_result="1",
+            running_vm(vm=rhel_vm_for_upgrade_a)
+            # Verify first file exists (created before snapshot)
+            run_command_on_vm_and_check_output(
+                vm=rhel_vm_for_upgrade_a,
+                command=f"cat {UPGRADE_FIRST_FILE_NAME}",
+                expected_result=UPGRADE_FIRST_FILE_CONTENT,
+            )
+
+            # Verify second file does NOT exist (created after snapshot)
+            run_command_on_vm_and_check_output(
+                vm=rhel_vm_for_upgrade_a,
+                command=f"test ! -f {UPGRADE_SECOND_FILE_NAME} && echo 'file not found'",
+                expected_result="file not found",
             )
 
     @pytest.mark.sno
@@ -100,37 +112,16 @@ class TestUpgradeStorage:
         fedora_vm_for_hotplug_upg,
         hotplug_volume_upg,
     ):
-        wait_for_vm_volume_ready(vm=fedora_vm_for_hotplug_upg)
+        wait_for_vm_volume_ready(vm=fedora_vm_for_hotplug_upg, volume_name=blank_disk_dv_with_default_sc.name)
         assert_disk_serial(vm=fedora_vm_for_hotplug_upg)
-        assert_hotplugvolume_nonexist_optional_restart(vm=fedora_vm_for_hotplug_upg, restart=True)
+        assert_disk_bus(
+            vm=fedora_vm_for_hotplug_upg,
+            volume=blank_disk_dv_with_default_sc,
+            expected_bus=HOTPLUG_DISK_VIRTIO_BUS,
+        )
+        assert_hotplugvolume_nonexist(vm=fedora_vm_for_hotplug_upg)
 
     """ Post-upgrade tests """
-
-    @pytest.mark.sno
-    @pytest.mark.polarion("CNV-2952")
-    @pytest.mark.order(after=IUO_UPGRADE_TEST_ORDERING_NODE_ID)
-    @pytest.mark.dependency(
-        name=CDI_SCRATCH_PRESERVE_NODE_ID,
-        depends=[
-            IUO_UPGRADE_TEST_DEPENDENCY_NODE_ID,
-            f"{STORAGE_NODE_ID_PREFIX}::test_cdiconfig_scratch_overriden_before_upgrade",
-        ],
-        scope=DEPENDENCY_SCOPE_SESSION,
-    )
-    def test_cdiconfig_scratch_preserved_after_upgrade(
-        self,
-        skip_if_not_override_cdiconfig_scratch_space,
-        cdi_config,
-        storage_class_for_updating_cdiconfig_scratch,
-    ):
-        """
-        Check that the scratch StorageClass configuration should be preserved by the upgrade
-        """
-        expected_sc = storage_class_for_updating_cdiconfig_scratch.instance.metadata.name
-        actual_sc = cdi_config.scratch_space_storage_class_from_status
-        assert actual_sc == expected_sc, (
-            "The scratchSpaceStorageClass on CDIConfig config should not change after upgrade"
-        )
 
     @pytest.mark.sno
     @pytest.mark.polarion("CNV-5994")
@@ -145,12 +136,21 @@ class TestUpgradeStorage:
     )
     def test_vm_snapshot_restore_check_after_upgrade(
         self,
-        cirros_vm_for_upgrade_a,
+        rhel_vm_for_upgrade_a,
     ):
-        run_command_on_cirros_vm_and_check_output(
-            vm=cirros_vm_for_upgrade_a,
-            command=LS_COMMAND,
-            expected_result="1",
+        running_vm(vm=rhel_vm_for_upgrade_a)
+        # Verify first file exists (created before snapshot, should still be there after upgrade)
+        run_command_on_vm_and_check_output(
+            vm=rhel_vm_for_upgrade_a,
+            command=f"cat {UPGRADE_FIRST_FILE_NAME}",
+            expected_result=UPGRADE_FIRST_FILE_CONTENT,
+        )
+
+        # Verify second file does NOT exist (was created after snapshot, should not be present after restore)
+        run_command_on_vm_and_check_output(
+            vm=rhel_vm_for_upgrade_a,
+            command=f"test ! -f {UPGRADE_SECOND_FILE_NAME} && echo 'file not found'",
+            expected_result="file not found",
         )
 
     @pytest.mark.sno
@@ -164,19 +164,34 @@ class TestUpgradeStorage:
         ],
         scope=DEPENDENCY_SCOPE_SESSION,
     )
-    def test_vm_snapshot_restore_create_after_upgrade(self, cirros_vm_for_upgrade_b, snapshots_for_upgrade_b):
+    def test_vm_snapshot_restore_create_after_upgrade(
+        self, admin_client, rhel_vm_for_upgrade_b, snapshots_for_upgrade_b
+    ):
         with VirtualMachineRestore(
-            name=f"restore-snapshot-{cirros_vm_for_upgrade_b.name}",
+            client=admin_client,
+            name=f"restore-snapshot-{rhel_vm_for_upgrade_b.name}",
             namespace=snapshots_for_upgrade_b.namespace,
-            vm_name=cirros_vm_for_upgrade_b.name,
+            vm_name=rhel_vm_for_upgrade_b.name,
             snapshot_name=snapshots_for_upgrade_b.name,
         ) as vm_restore:
+            if rhel_vm_for_upgrade_b.ready:
+                rhel_vm_for_upgrade_b.stop(wait=True)
             vm_restore.wait_restore_done()
-            cirros_vm_for_upgrade_b.start(wait=True)
-            run_command_on_cirros_vm_and_check_output(
-                vm=cirros_vm_for_upgrade_b,
-                command=LS_COMMAND,
-                expected_result="1",
+
+            running_vm(vm=rhel_vm_for_upgrade_b)
+
+            # Verify first file exists (created before snapshot)
+            run_command_on_vm_and_check_output(
+                vm=rhel_vm_for_upgrade_b,
+                command=f"cat {UPGRADE_FIRST_FILE_NAME}",
+                expected_result=UPGRADE_FIRST_FILE_CONTENT,
+            )
+
+            # Verify second file does NOT exist (created after snapshot)
+            run_command_on_vm_and_check_output(
+                vm=rhel_vm_for_upgrade_b,
+                command=f"test ! -f {UPGRADE_SECOND_FILE_NAME} && echo 'file not found'",
+                expected_result="file not found",
             )
 
     @pytest.mark.polarion("CNV-5310")
@@ -189,14 +204,19 @@ class TestUpgradeStorage:
         ],
         scope=DEPENDENCY_SCOPE_SESSION,
     )
+    @pytest.mark.usefixtures("hotplug_volume_upg", "fedora_vm_for_hotplug_upg_ssh_connectivity")
     def test_vm_with_hotplug_after_upgrade(
         self,
-        upgrade_namespace_scope_session,
-        blank_disk_dv_with_default_sc,
-        fedora_vm_for_hotplug_upg,
-        hotplug_volume_upg,
-        fedora_vm_for_hotplug_upg_ssh_connectivity,
+        admin_client: DynamicClient,
+        blank_disk_dv_with_default_sc: DataVolume,
+        fedora_vm_for_hotplug_upg: VirtualMachineForTests,
     ):
+        wait_for_vm_volume_ready(vm=fedora_vm_for_hotplug_upg, volume_name=blank_disk_dv_with_default_sc.name)
         assert_disk_serial(vm=fedora_vm_for_hotplug_upg)
-        assert_hotplugvolume_nonexist_optional_restart(vm=fedora_vm_for_hotplug_upg)
-        migrate_vm_and_verify(vm=fedora_vm_for_hotplug_upg, check_ssh_connectivity=True)
+        assert_disk_bus(
+            vm=fedora_vm_for_hotplug_upg,
+            volume=blank_disk_dv_with_default_sc,
+            expected_bus=HOTPLUG_DISK_VIRTIO_BUS,
+        )
+        assert_hotplugvolume_nonexist(vm=fedora_vm_for_hotplug_upg)
+        migrate_vm_and_verify(vm=fedora_vm_for_hotplug_upg, client=admin_client, check_ssh_connectivity=True)

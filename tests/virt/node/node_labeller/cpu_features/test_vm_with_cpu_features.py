@@ -5,7 +5,7 @@ VM with CPU features
 import pytest
 from kubernetes.dynamic.exceptions import UnprocessibleEntityError
 
-from utilities.constants import AMD
+from utilities.constants.architecture import AMD
 from utilities.virt import VirtualMachineForTests, fedora_vm_body, running_vm
 
 pytestmark = [pytest.mark.post_upgrade, pytest.mark.sno, pytest.mark.usefixtures("fail_if_amd_cpu_nodes")]
@@ -72,6 +72,7 @@ def test_vm_with_cpu_feature_positive(cpu_features_vm_positive):
         ),
     ],
 )
+@pytest.mark.s390x
 def test_invalid_cpu_feature_policy_negative(unprivileged_client, namespace, features):
     """VM should not be created successfully"""
     vm_name = "invalid-cpu-feature-policy-vm"

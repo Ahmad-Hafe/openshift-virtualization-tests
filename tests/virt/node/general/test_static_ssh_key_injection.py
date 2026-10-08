@@ -9,7 +9,11 @@ from ocp_resources.resource import ResourceEditor
 from ocp_resources.secret import Secret
 
 from tests.os_params import RHEL_LATEST
-from utilities.constants import CLOUD_INIT_NO_CLOUD, CNV_VM_SSH_KEY_PATH, OS_FLAVOR_RHEL
+from utilities.constants.images import OS_FLAVOR_RHEL
+from utilities.constants.virt import (
+    CLOUD_INIT_NO_CLOUD,
+    CNV_VM_SSH_KEY_PATH,
+)
 from utilities.data_utils import authorized_key, base64_encode_str
 from utilities.virt import VirtualMachineForTests, running_vm
 
@@ -17,8 +21,9 @@ NAME = "static-access-creds-injection"
 
 
 @pytest.fixture(scope="class")
-def ssh_secret(namespace):
+def ssh_secret(unprivileged_client, namespace):
     with Secret(
+        client=unprivileged_client,
         name=f"{NAME}-secret",
         namespace=namespace.name,
         data_dict={

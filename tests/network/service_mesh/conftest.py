@@ -11,7 +11,6 @@ from ocp_resources.service_account import ServiceAccount
 from ocp_resources.virtual_service import VirtualService
 from timeout_sampler import TimeoutExpiredError, TimeoutSampler
 
-from tests.network.constants import HTTPBIN_IMAGE
 from tests.network.service_mesh.constants import (
     AUTH_COMMAND,
     DESTINATION_RULE_TYPE,
@@ -36,11 +35,14 @@ from tests.network.utils import (
     ServiceMeshDeployments,
     ServiceMeshDeploymentService,
 )
-from utilities.constants import OS_FLAVOR_FEDORA, PORT_80, TIMEOUT_4MIN, TIMEOUT_10SEC
+from utilities.constants.images import OS_FLAVOR_FEDORA
+from utilities.constants.networking import PORT_80
+from utilities.constants.timeouts import TIMEOUT_4MIN, TIMEOUT_10SEC
 from utilities.infra import add_scc_to_service_account, create_ns, label_project, unique_name
 from utilities.virt import VirtualMachineForTests, fedora_vm_body, vm_console_run_commands
 
 LOGGER = logging.getLogger(__name__)
+HTTPBIN_IMAGE = "quay.io/openshifttest/httpbin:1.2.2"
 
 
 class GatewayForTests(Gateway):
@@ -373,7 +375,7 @@ def traffic_management_service_mesh_convergence(
 @pytest.fixture(scope="class")
 def service_mesh_ingress_service_addr(admin_client, istio_system_namespace):
     for svc in Service.get(
-        dyn_client=admin_client,
+        client=admin_client,
         name=INGRESS_SERVICE,
         namespace=istio_system_namespace.metadata.name,
     ):

@@ -5,28 +5,32 @@ from typing import Any
 
 from ocp_resources.template import Template
 
-from utilities.constants import (
+from utilities.constants import Images
+from utilities.constants.hco import DATA_SOURCE_NAME
+from utilities.constants.images import ArchImages
+from utilities.constants.instance_types import (
+    FLAVOR_STR,
+    OS_STR,
+    PREFERENCE_STR,
+    WORKLOAD_STR,
+)
+from utilities.constants.os_matrix import (
     CONTAINER_DISK_IMAGE_PATH_STR,
-    DATA_SOURCE_NAME,
     DATA_SOURCE_STR,
     DV_SIZE_STR,
-    FLAVOR_STR,
     IMAGE_NAME_STR,
     IMAGE_PATH_STR,
     LATEST_RELEASE_STR,
-    OS_STR,
     OS_VERSION_STR,
-    PREFERENCE_STR,
     TEMPLATE_LABELS_STR,
-    WIN_2K16,
+)
+from utilities.constants.virt import (
     WIN_2K19,
     WIN_2K22,
     WIN_2K25,
-    WIN_10,
     WIN_11,
-    WORKLOAD_STR,
-    Images,
 )
+from utilities.exceptions import OsDictNotFoundError
 
 LOGGER = logging.getLogger(__name__)
 
@@ -35,18 +39,12 @@ def get_windows_container_disk_path(os_value: str) -> str:
     """Generate the full container disk path for Windows OS values."""
     if not os_value.startswith("win"):
         raise ValueError(f"os_value must start with 'win', got: {os_value}")
-    return f"{Images.Windows.DOCKER_IMAGE_DIR}/windows{os_value.removeprefix('win')}-container-disk:4.99"
+    return f"{ArchImages.AMD64.Windows.DOCKER_IMAGE_DIR}/windows{os_value.removeprefix('win')}-container-disk:4.99"
 
 
 RHEL_OS_MAPPING: dict[str, dict[str, Any]] = {
     WORKLOAD_STR: Template.Workload.SERVER,
     FLAVOR_STR: Template.Flavor.TINY,
-    "rhel-7-9": {
-        IMAGE_NAME_STR: "RHEL7_9_IMG",
-        OS_VERSION_STR: "7.9",
-        OS_STR: "rhel7.9",
-        DATA_SOURCE_STR: "rhel7",
-    },
     "rhel-8-10": {
         IMAGE_NAME_STR: "RHEL8_10_IMG",
         OS_VERSION_STR: "8.10",
@@ -70,24 +68,6 @@ RHEL_OS_MAPPING: dict[str, dict[str, Any]] = {
 WINDOWS_OS_MAPPING: dict[str, dict[str, str | Any]] = {
     WORKLOAD_STR: Template.Workload.SERVER,
     FLAVOR_STR: Template.Flavor.MEDIUM,
-    "win-10": {
-        IMAGE_NAME_STR: "WIN10_IMG",
-        OS_VERSION_STR: "10",
-        OS_STR: WIN_10,
-        WORKLOAD_STR: Template.Workload.DESKTOP,
-        FLAVOR_STR: Template.Flavor.MEDIUM,
-        "uefi": True,
-        DATA_SOURCE_STR: WIN_10,
-        CONTAINER_DISK_IMAGE_PATH_STR: get_windows_container_disk_path(os_value=WIN_10),
-    },
-    "win-2016": {
-        IMAGE_NAME_STR: "WIN2k16_IMG",
-        OS_VERSION_STR: "2016",
-        OS_STR: WIN_2K16,
-        "uefi": True,
-        DATA_SOURCE_STR: WIN_2K16,
-        CONTAINER_DISK_IMAGE_PATH_STR: get_windows_container_disk_path(os_value=WIN_2K16),
-    },
     "win-2019": {
         IMAGE_NAME_STR: "WIN2k19_IMG",
         OS_VERSION_STR: "2019",
@@ -151,13 +131,16 @@ CENTOS_OS_MAPPING: dict[str, dict[str, str | Any]] = {
 }
 
 
-def generate_os_matrix_dict(os_name: str, supported_operating_systems: list[str]) -> list[dict[str, Any]]:
+def generate_os_matrix_dict(
+    os_name: str, supported_operating_systems: list[str], arch: str | None = None
+) -> list[dict[str, Any]]:
     """
     Generate a dictionary of OS matrix for the given OS name and supported operating systems.
 
     Args:
         os_name (str): The name of the OS.
         supported_operating_systems (list[str]): A list of supported operating systems.
+        arch (optional) (str): The architecture of the OS.
 
     Returns:
         list[dict[str, Any]]: A list of dictionaries representing the OS matrix.
@@ -193,11 +176,13 @@ def generate_os_matrix_dict(os_name: str, supported_operating_systems: list[str]
     if not base_dict:
         raise ValueError(f"Unsupported OS: {os_name}. Supported: rhel, windows, fedora, centos")
 
-    os_base_class = getattr(Images, os_name.title(), None)
+    images_class = getattr(ArchImages, arch.upper(), None) if arch else Images
+
+    os_base_class = getattr(images_class, os_name.title(), None)
     if not os_base_class:
         raise ValueError(
             f"Unsupported OS: {os_name}. "
-            "Make sure it is supported under `utilities.constants.ArchImages` class for cluster architecture."
+            "Make sure it is supported under `utilities.constants.images.ArchImages` for cluster architecture."
         )
 
     latest_os_release = getattr(os_base_class, "LATEST_RELEASE_STR", None)
@@ -241,6 +226,10 @@ def generate_os_matrix_dict(os_name: str, supported_operating_systems: list[str]
                 DATA_SOURCE_STR: base_version_dict.get(DATA_SOURCE_STR),
             }
 
+            if arch:
+                os_base_dict[TEMPLATE_LABELS_STR]["architecture"] = arch
+                os_base_dict[DATA_SOURCE_STR] = f"{os_base_dict[DATA_SOURCE_STR]}-{arch}"
+
             if CONTAINER_DISK_IMAGE_PATH_STR in base_version_dict:
                 os_base_dict[CONTAINER_DISK_IMAGE_PATH_STR] = base_version_dict[CONTAINER_DISK_IMAGE_PATH_STR]
 
@@ -259,7 +248,11 @@ def generate_os_matrix_dict(os_name: str, supported_operating_systems: list[str]
 
 
 def generate_linux_instance_type_os_matrix(
-    os_name: str, preferences: list[str], arch_suffix: str | None = None
+    os_name: str,
+    preferences: list[str],
+    arch_suffix: str | None = None,
+    add_preference_arch_suffix: bool = True,
+    add_data_source_arch_suffix: bool = False,
 ) -> list[dict[str, dict[str, Any]]]:
     """
     Generate a list of dictionaries representing the instance type matrix for a Linux OS type.
@@ -269,6 +262,12 @@ def generate_linux_instance_type_os_matrix(
         os_name (str): The name of the OS.
         preferences (list[str]): A list of preferences for the instance types. Preference format is "<os>.<version>".
         arch_suffix: Optional architecture suffix. Example: "s390x", "arm64" . Omit to keep original preference.
+        add_preference_arch_suffix: When True, append arch_suffix to the preference name. Set to False for OSes whose
+            ClusterPreferences have no arch suffix (e.g. centos — "centos.stream10" exists,
+            "centos.stream10.arm64" does not).
+        add_data_source_arch_suffix: When True, append arch_suffix to the DataSource name. Only True on
+            multiarch clusters where SSP creates per-arch DataSources (e.g. "rhel10-arm64").
+            On homogeneous clusters DataSources are bare (e.g. "rhel10").
 
     Returns:
         list[dict[str, dict[str, Any]]]: A list of dictionaries representing the instance type matrix.
@@ -289,10 +288,13 @@ def generate_linux_instance_type_os_matrix(
     instance_types: list[dict[str, dict[str, Any]]] = []
 
     for preference in preferences:
-        arch_preference = f"{preference}.{arch_suffix}" if arch_suffix else preference
+        arch_preference = f"{preference}.{arch_suffix}" if arch_suffix and add_preference_arch_suffix else preference
+        data_source_name = _format_data_source_name(preference_name=preference)
         preference_config: dict[str, Any] = {
             PREFERENCE_STR: arch_preference,
-            DATA_SOURCE_NAME: _format_data_source_name(preference_name=preference),
+            DATA_SOURCE_NAME: f"{data_source_name}-{arch_suffix}"
+            if add_data_source_arch_suffix and arch_suffix
+            else data_source_name,
         }
 
         if preference == latest_os:
@@ -300,3 +302,24 @@ def generate_linux_instance_type_os_matrix(
 
         instance_types.append({arch_preference: preference_config})
     return instance_types
+
+
+def generate_latest_os_dict(os_matrix: list[dict[str, Any]]) -> dict[str, Any]:
+    """
+    Get latest os dict.
+
+    Args:
+        os_matrix (list): [<os-name>]_os_matrix - a list of dicts.
+
+    Returns:
+        dict: Latest supported OS dict (the os_values payload) or raises an exception.
+
+    Raises:
+        OsDictNotFoundError: If no os matched.
+    """
+    for matrix in os_matrix:
+        for os_values in matrix.values():
+            if os_values.get(LATEST_RELEASE_STR):
+                return os_values
+
+    raise OsDictNotFoundError(f"No OS is marked as '{LATEST_RELEASE_STR}': {os_matrix}")

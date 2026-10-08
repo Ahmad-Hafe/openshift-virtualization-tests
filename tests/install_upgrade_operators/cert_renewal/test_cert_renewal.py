@@ -10,7 +10,7 @@ from tests.install_upgrade_operators.constants import (
     HCO_CR_CERT_CONFIG_DURATION_KEY,
     HCO_CR_CERT_CONFIG_RENEW_BEFORE_KEY,
 )
-from utilities.constants import QUARANTINED
+from utilities.constants.pytest import QUARANTINED
 
 pytestmark = [pytest.mark.post_upgrade, pytest.mark.sno, pytest.mark.s390x]
 
@@ -35,6 +35,7 @@ class TestCertRotation:
     )
     def test_certificate_renewed_in_hco(
         self,
+        admin_client,
         hco_namespace,
         hyperconverged_resource_certconfig_change,
         tmpdir,
@@ -67,10 +68,12 @@ class TestCertRotation:
             initial_certificates_dates=initial_certificates_dates,
             secrets_to_skip=secrets_with_non_closed_bugs,
             tmpdir=tmpdir,
+            admin_client=admin_client,
         )
         wait_for_certificates_renewal(
             hco_namespace=hco_namespace,
             initial_certificates_dates=initial_certificates_dates,
             secrets_to_skip=secrets_with_non_closed_bugs,
             tmpdir=tmpdir,
+            admin_client=admin_client,
         )

@@ -60,6 +60,7 @@ def get_metadata():
 @pytest.fixture(scope="class")
 def multiple_json_patched(admin_client, hco_namespace, prometheus, hyperconverged_resource_scope_class):
     with ResourceEditorValidateHCOReconcile(
+        admin_client=admin_client,
         patches={
             hyperconverged_resource_scope_class: get_metadata(),
         },
@@ -91,7 +92,7 @@ class TestMultipleJsonPatch:
             admin_client=admin_client,
             hco_namespace=hco_namespace,
             expected_conditions={
-                **{"TaintedConfiguration": Resource.Condition.Status.TRUE},
+                "TaintedConfiguration": Resource.Condition.Status.TRUE,
             },
         )
         validate_cdi_json_patch(
@@ -110,13 +111,13 @@ class TestMultipleJsonPatch:
             )
             for component in [COMPONENT_CDI, COMPONENT_KUBEVIRT]
         }
-        for component_name in component_metrics_dict:
+        for component_name, previous_value in component_metrics_dict.items():
             LOGGER.info(f"Waiting for metrics: {QUERY_STRING} for component: {component_name}")
             wait_for_metrics_value_update(
                 prometheus=prometheus,
                 component_name=component_name,
                 query_string=QUERY_STRING,
-                previous_value=component_metrics_dict[component_name],
+                previous_value=previous_value,
             )
 
     @pytest.mark.polarion("CNV-8813")

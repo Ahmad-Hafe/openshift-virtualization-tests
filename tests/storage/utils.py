@@ -1,58 +1,56 @@
+from __future__ import annotations
+
 import ast
 import logging
 import shlex
+from collections.abc import Generator
 from contextlib import contextmanager
-from typing import Generator
+from typing import TYPE_CHECKING
 
+import pytest
 import requests
-from ocp_resources.cdi import CDI
+from kubernetes.dynamic import DynamicClient
 from ocp_resources.cluster_role import ClusterRole
 from ocp_resources.config_map import ConfigMap
 from ocp_resources.daemonset import DaemonSet
 from ocp_resources.datavolume import DataVolume
 from ocp_resources.hostpath_provisioner import HostPathProvisioner
-from ocp_resources.pod import Pod
 from ocp_resources.resource import Resource
 from ocp_resources.role_binding import RoleBinding
 from ocp_resources.route import Route
 from ocp_resources.service import Service
 from ocp_resources.storage_class import StorageClass
 from ocp_resources.storage_profile import StorageProfile
-from ocp_resources.template import Template
 from ocp_resources.upload_token_request import UploadTokenRequest
 from pyhelper_utils.shell import run_ssh_commands
 from pytest_testconfig import config as py_config
 from timeout_sampler import TimeoutExpiredError, TimeoutSampler
 
-from utilities.artifactory import (
-    cleanup_artifactory_secret_and_config_map,
-    get_artifactory_config_map,
-    get_artifactory_secret,
-    get_http_image_url,
-)
-from utilities.constants import (
-    CDI_UPLOADPROXY,
-    TIMEOUT_2MIN,
-    TIMEOUT_30MIN,
-    Images,
-)
-from utilities.hco import ResourceEditorValidateHCOReconcile
+from tests.storage.constants import BLANK_DV_SIZE, NO_STORAGE_CLASS_FAILURE_MESSAGE
+from utilities import console
+from utilities.constants import Images
+from utilities.constants.cluster import LS_COMMAND
+from utilities.constants.components import CDI_UPLOADPROXY
+from utilities.constants.timeouts import TIMEOUT_2MIN, TIMEOUT_5MIN, TIMEOUT_5SEC, TIMEOUT_20SEC, TIMEOUT_30MIN
+from utilities.exceptions import DataVolumeConditionMessageNotFoundError
 from utilities.infra import (
     get_pod_by_name_prefix,
 )
 from utilities.ssp import validate_os_info_vmi_vs_windows_os
 from utilities.storage import (
     PodWithPVC,
+    construct_datavolume_source_dict,
     create_dv,
     get_containers_for_pods_with_pvc,
 )
 from utilities.virt import (
     VirtualMachineForTests,
-    VirtualMachineForTestsFromTemplate,
-    running_vm,
     vm_instance_from_template,
     wait_for_windows_vm,
 )
+
+if TYPE_CHECKING:
+    from typing import Any
 
 LOGGER = logging.getLogger(__name__)
 
@@ -77,7 +75,7 @@ def import_image_to_dv(
             dv_name=dv_name,
             namespace=configmap.namespace,
             url=url,
-            cert_configmap=configmap.name,
+            cert_configmap_name=configmap.name,
             storage_class=py_config["default_storage_class"],
             client=client,
         ) as dv:
@@ -142,7 +140,10 @@ def upload_image(token, data, asynchronous=False, client=None):
     try:
         with open(data, "rb") as fd:
             fd_data = fd.read()
-    except OSError | IOError:
+    except OSError as error:
+        LOGGER.error(
+            f"Failed to read upload image (type={type(data).__name__}); treating input as raw data. error={error}"
+        )
         fd_data = data
 
     return requests.post(url=uploadproxy_url, data=fd_data, headers=headers, verify=False).status_code
@@ -170,12 +171,13 @@ def get_file_url_https_server(images_https_server, file_name):
 
 @contextmanager
 def create_cluster_role(
-    name: str, api_groups: list[str], verbs: list[str], permissions_to_resources: list[str]
+    client: DynamicClient, name: str, api_groups: list[str], verbs: list[str], permissions_to_resources: list[str]
 ) -> Generator:
     """
     Create cluster role
     """
     with ClusterRole(
+        client=client,
         name=name,
         rules=[
             {
@@ -190,6 +192,7 @@ def create_cluster_role(
 
 @contextmanager
 def create_role_binding(
+    client: DynamicClient,
     name: str,
     namespace: str,
     subjects_kind: str,
@@ -203,6 +206,7 @@ def create_role_binding(
     Create role binding
     """
     with RoleBinding(
+        client=client,
         name=name,
         namespace=namespace,
         subjects_kind=subjects_kind,
@@ -217,6 +221,7 @@ def create_role_binding(
 
 @contextmanager
 def set_permissions(
+    client: DynamicClient,
     role_name: str,
     role_api_groups: list[str],
     verbs: list[str],
@@ -229,12 +234,14 @@ def set_permissions(
     subjects_namespace: str | None = None,
 ) -> Generator:
     with create_cluster_role(
+        client=client,
         name=role_name,
         api_groups=role_api_groups,
         permissions_to_resources=permissions_to_resources,
         verbs=verbs,
     ) as cluster_role:
         with create_role_binding(
+            client=client,
             name=binding_name,
             namespace=namespace,
             subjects_kind=subjects_kind,
@@ -248,7 +255,7 @@ def set_permissions(
 
 
 def get_importer_pod(
-    dyn_client,
+    client,
     namespace,
 ):
     try:
@@ -256,7 +263,7 @@ def get_importer_pod(
             wait_timeout=30,
             sleep=1,
             func=get_pod_by_name_prefix,
-            dyn_client=dyn_client,
+            client=client,
             pod_prefix="importer",
             namespace=namespace,
         ):
@@ -267,47 +274,57 @@ def get_importer_pod(
         raise
 
 
-def wait_for_importer_container_message(importer_pod, msg):
-    LOGGER.info(f"Wait for {importer_pod.name} container to show message: {msg}")
-    try:
-        sampled_msg = TimeoutSampler(
-            wait_timeout=120,
-            sleep=5,
-            func=lambda: (
-                importer_container_status_reason(importer_pod) == Pod.Status.CRASH_LOOPBACK_OFF
-                and msg
-                in importer_pod.instance.status
-                .containerStatuses[0]
-                .get("lastState", {})
-                .get("terminated", {})
-                .get("message", "")
-            ),
-        )
-        for sample in sampled_msg:
-            if sample:
-                return
-    except TimeoutExpiredError:
-        LOGGER.error(f"{importer_pod.name} did not get message: {msg}")
-        raise
-
-
-def importer_container_status_reason(pod):
+def wait_for_dv_condition_message(dv: DataVolume, expected_message: str, timeout: int = TIMEOUT_5MIN) -> None:
     """
-    Get status for why importer pod container is waiting or terminated
-    (for container status running there is no 'reason' key)
+    Wait for DataVolume condition to contain expected message.
+
+    Uses substring matching (not exact match) because CDI messages
+    often include variable context like timestamps, pod names, or URLs.
+
+    Monitors ADDED and MODIFIED events. DELETED events cause immediate failure.
+    Other event types are logged and ignored.
+
+    Example:
+        Expected: "certificate signed by unknown authority"
+        Actual message: "Unable to connect: ... x509: certificate signed by unknown authority"
+
+    Args:
+        dv: DataVolume resource to monitor for condition messages
+        expected_message: Expected message substring to find in condition messages
+        timeout: Timeout in seconds for the operation, default is TIMEOUT_5MIN.
+
+    Raises:
+        DataVolumeConditionMessageNotFoundError: If expected message not found within timeout
+            or if the DataVolume is deleted during monitoring.
     """
-    container_state = pod.instance.status.containerStatuses[0].state
-    if container_state.waiting:
-        return container_state.waiting.reason
-    if container_state.terminated:
-        return container_state.terminated.reason
+    LOGGER.info(f"Watching {dv.name} for message: {expected_message} for up to {timeout} seconds.")
+    last_conditions: list[dict[str, str]] = []
+    deleted = False
+    for event in dv.watcher(timeout=timeout):
+        event_type = event["type"]
+        if event_type == "DELETED":
+            deleted = True
+            break
+        if event_type not in ("ADDED", "MODIFIED"):
+            LOGGER.info(f"Ignoring {event_type} event for DataVolume {dv.name}")
+            continue
+        last_conditions = (event["object"].status or {}).get("conditions", [])
+        if any(expected_message in condition.get("message", "") for condition in last_conditions):
+            LOGGER.info(f"Found expected message in {dv.name}: {expected_message}")
+            return
+
+    reason = f"DataVolume '{dv.name}' was deleted" if deleted else f"Timed out after {timeout} seconds"
+    LOGGER.error(f"{reason} while waiting for message: {expected_message}")
+    raise DataVolumeConditionMessageNotFoundError(
+        dv_name=dv.name, expected_message=expected_message, last_conditions=last_conditions
+    )
 
 
 def assert_pvc_snapshot_clone_annotation(pvc, storage_class):
     clone_type_annotation_str = f"{Resource.ApiGroup.CDI_KUBEVIRT_IO}/cloneType"
     clone_type_annotation = pvc.instance["metadata"].get("annotations").get(clone_type_annotation_str)
     # For snapshot capable storage, 'csi-clone' may be set in the StorageProfile
-    expected_clone_type_annotation = StorageProfile(name=storage_class).instance.status.cloneStrategy
+    expected_clone_type_annotation = StorageProfile(name=storage_class, client=pvc.client).instance.status.cloneStrategy
     assert clone_type_annotation == expected_clone_type_annotation, (
         f"{clone_type_annotation_str}: {clone_type_annotation}, expected: '{expected_clone_type_annotation}'"
     )
@@ -323,89 +340,14 @@ def is_hpp_cr_legacy(hostpath_provisioner):
     return not hostpath_provisioner.instance.spec.storagePools
 
 
-def get_hpp_daemonset(hco_namespace, hpp_cr_suffix):
+def get_hpp_daemonset(hco_namespace, hpp_cr_suffix, admin_client):
     daemonset = DaemonSet(
         name=f"{HostPathProvisioner.Name.HOSTPATH_PROVISIONER}{hpp_cr_suffix}",
         namespace=hco_namespace.name,
+        client=admin_client,
     )
     assert daemonset.exists, "hpp_daemonset does not exist"
     return daemonset
-
-
-@contextmanager
-def create_windows19_vm(dv_name, namespace, client, vm_name, cpu_model, storage_class):
-    artifactory_secret = get_artifactory_secret(namespace=namespace)
-    artifactory_config_map = get_artifactory_config_map(namespace=namespace)
-    dv = DataVolume(
-        name=dv_name,
-        namespace=namespace,
-        storage_class=storage_class,
-        source="http",
-        url=get_http_image_url(image_directory=Images.Windows.UEFI_WIN_DIR, image_name=Images.Windows.WIN2k19_IMG),
-        size=Images.Windows.DEFAULT_DV_SIZE,
-        client=client,
-        api_name="storage",
-        secret=artifactory_secret,
-        cert_configmap=artifactory_config_map.name,
-    )
-    dv.to_dict()
-    with VirtualMachineForTestsFromTemplate(
-        name=vm_name,
-        namespace=namespace,
-        client=client,
-        labels=Template.generate_template_labels(**py_config["latest_windows_os_dict"]["template_labels"]),
-        cpu_model=cpu_model,
-        data_volume_template={"metadata": dv.res["metadata"], "spec": dv.res["spec"]},
-    ) as vm:
-        running_vm(vm=vm)
-        yield vm
-    cleanup_artifactory_secret_and_config_map(
-        artifactory_secret=artifactory_secret, artifactory_config_map=artifactory_config_map
-    )
-
-
-@contextmanager
-def update_scratch_space_sc(cdi_config, new_sc, hco):
-    def _wait_for_sc_update():
-        samples = TimeoutSampler(
-            wait_timeout=30,
-            sleep=1,
-            func=lambda: cdi_config.scratch_space_storage_class_from_status == new_sc,
-        )
-        for sample in samples:
-            if sample:
-                return
-
-    with ResourceEditorValidateHCOReconcile(
-        patches={hco: {"spec": {"scratchSpaceStorageClass": new_sc}}},
-        list_resource_reconcile=[CDI],
-    ) as edited_cdi_config:
-        _wait_for_sc_update()
-
-        yield edited_cdi_config
-
-
-def create_cirros_dv(
-    namespace,
-    name,
-    storage_class,
-    access_modes=None,
-    volume_mode=None,
-    client=None,
-    dv_size=Images.Cirros.DEFAULT_DV_SIZE,
-):
-    with create_dv(
-        dv_name=f"dv-{name}",
-        namespace=namespace,
-        url=get_http_image_url(image_directory=Images.Cirros.DIR, image_name=Images.Cirros.QCOW2_IMG),
-        size=dv_size,
-        storage_class=storage_class,
-        access_modes=access_modes,
-        volume_mode=volume_mode,
-        client=client,
-    ) as dv:
-        dv.wait_for_dv_success()
-        yield dv
 
 
 def check_snapshot_indication(snapshot, is_online):
@@ -437,62 +379,189 @@ def get_file_url(url, file_name):
 
 
 def assert_num_files_in_pod(pod, expected_num_of_files):
-    num_of_file_in_pod = pod.execute(command=shlex.split("ls -1 /pvc")).count("\n")
-    assert num_of_file_in_pod == expected_num_of_files, (
-        f"Number of file in pod is {num_of_file_in_pod}, while the expected is {expected_num_of_files}"
+    files = [
+        line for line in pod.execute(command=shlex.split("ls -1 /pvc")).splitlines() if line and line != "lost+found"
+    ]
+    num_of_files_in_pod = len(files)
+    assert num_of_files_in_pod == expected_num_of_files, (
+        f"Number of files in pod is {num_of_files_in_pod}, while the expected is {expected_num_of_files}"
     )
 
 
 def assert_use_populator(pvc, storage_class, cluster_csi_drivers_names):
     expected_use_populator_value = (
-        StorageClass(name=storage_class).instance.get("provisioner") in cluster_csi_drivers_names
+        StorageClass(name=storage_class, client=pvc.client).instance.get("provisioner") in cluster_csi_drivers_names
     )
     assert pvc.use_populator == expected_use_populator_value
-
-
-def wait_for_processes_exit_successfully(processes, timeout):
-    try:
-        for object_name in processes:
-            process = processes[object_name]
-            process.join(timeout)
-            if process.exception:
-                raise process.exception
-            assert process.exitcode == 0, f"The object {object_name} wasn't created in the given time"
-    except Exception as e:
-        LOGGER.error(f"failed with the exception - {e}")
-        raise
-
-
-def clean_up_multiprocess(processes, object_list):
-    # deleting objects and closing processes
-    for obj in object_list:
-        obj.clean_up()
-    for object_name in processes:
-        process = processes[object_name]
-        try:
-            if process.is_alive():
-                process.kill()
-        except Exception as e:
-            print(f"Error killing process {process}, associated with {object_name}: {e}")
-        finally:
-            process.close()
 
 
 def assert_windows_directory_existence(
     expected_result: bool, windows_vm: VirtualMachineForTests, directory_path: str
 ) -> None:
     cmd = shlex.split(f'powershell -command "Test-Path -Path {directory_path}"')
-    out = run_ssh_commands(host=windows_vm.ssh_exec, commands=cmd)[0].strip()
+    out = run_ssh_commands(host=windows_vm.ssh_exec, commands=cmd, wait_timeout=TIMEOUT_2MIN, sleep=TIMEOUT_5SEC)[
+        0
+    ].strip()
     assert expected_result == ast.literal_eval(out), f"Directory exist: {out}, expected result: {expected_result}"
 
 
 def create_windows_directory(windows_vm: VirtualMachineForTests, directory_path: str) -> None:
     cmd = shlex.split(
-        f'powershell -command "New-Item -Path {directory_path} -ItemType Directory"',
+        f'powershell -command "New-Item -Path {directory_path} -ItemType Directory -Force"',
     )
-    run_ssh_commands(host=windows_vm.ssh_exec, commands=cmd)
+    run_ssh_commands(host=windows_vm.ssh_exec, commands=cmd, wait_timeout=TIMEOUT_2MIN, sleep=TIMEOUT_5SEC)
     assert_windows_directory_existence(
         expected_result=True,
         windows_vm=windows_vm,
         directory_path=directory_path,
     )
+
+
+def expected_hotplug_serials(count: int, serial: str) -> list[str]:
+    """Build the expected serial list for hotplugged disks.
+
+    Single-disk uses the bare serial; multi-disk appends an index suffix to distinguish disks,
+    matching the indexed assignment done in the hotplugged_dvs_scope_class fixture.
+
+    Args:
+        count: Number of hotplugged disks.
+        serial: Base serial string.
+
+    Returns:
+        List of expected serial strings.
+    """
+    if count == 1:
+        return [serial]
+    return [f"{serial}-{idx}" for idx in range(count)]
+
+
+def assert_disk_bus(vm: VirtualMachineForTests, volume: DataVolume, expected_bus: str) -> None:
+    """Assert that a hotplugged volume has the expected disk bus type.
+
+    Args:
+        vm: Virtual machine instance.
+        volume: DataVolume expected to be hotplugged.
+        expected_bus: Expected bus type (e.g., "virtio", "scsi")
+
+    Raises:
+        AssertionError: If disk is not found or bus type does not match.
+    """
+    disk = next(
+        (
+            disk_entry
+            for disk_entry in vm.vmi.instance.spec.domain.devices.disks
+            if disk_entry.get("name") == volume.name
+        ),
+        None,
+    )
+    assert disk is not None, f"Disk {volume.name} not found in VM {vm.name}"
+    actual_bus = disk.get("disk", {}).get("bus")
+    assert actual_bus == expected_bus, f"Disk {volume.name} has bus '{actual_bus}' but expected '{expected_bus}'"
+
+
+def check_file_in_vm(
+    vm: VirtualMachineForTests,
+    file_name: str,
+    file_content: str,
+    username: str | None = None,
+    password: str | None = None,
+) -> None:
+    """
+    Check that a file exists in a VM with expected content.
+    VM must be running before calling this function.
+
+    Args:
+        vm: VirtualMachine instance
+        file_name: Name of the file to check
+        file_content: Expected content in the file
+        username: Optional username for console login (defaults to vm.username)
+        password: Optional password for console login (defaults to vm.password)
+    """
+    LOGGER.info(f"Verifying file {file_name} exists in VM {vm.name}")
+    with console.Console(vm=vm, username=username, password=password) as vm_console:
+        LOGGER.info(f"Checking file contents for {file_name} in VM {vm.name}")
+        vm_console.sendline(LS_COMMAND)
+        vm_console.expect(pattern=file_name, timeout=TIMEOUT_20SEC)
+        vm_console.sendline(f"cat {file_name}")
+        vm_console.expect(pattern=file_content, timeout=TIMEOUT_20SEC)
+
+
+def get_storage_class_for_storage_migration(storage_class: str, cluster_storage_classes_names: list[str]) -> str:
+    """Validate that the requested storage class exists in the cluster.
+
+    Args:
+        storage_class: Name of the storage class to validate.
+        cluster_storage_classes_names: List of available storage class names in the cluster.
+
+    Returns:
+        The validated storage class name if it exists.
+
+    Raises:
+        pytest.Failed: If the storage class is not found in the cluster.
+    """
+    if storage_class in cluster_storage_classes_names:
+        return storage_class
+
+    pytest.fail(
+        NO_STORAGE_CLASS_FAILURE_MESSAGE.format(
+            storage_class=storage_class, cluster_storage_classes_names=cluster_storage_classes_names
+        )
+    )
+
+
+def blank_dv_template(name: str, namespace: str, storage_class_name: str) -> dict[str, Any]:
+    """Build a blank DataVolume template dict suitable for VM dataVolumeTemplates.
+
+    Args:
+        name: DataVolume name.
+        namespace: Target namespace (stripped from the returned dict for template use).
+        storage_class_name: Storage class for the blank PVC.
+
+    Returns:
+        Mutable DataVolume resource dict with namespace removed, ready for use in
+        VM dataVolumeTemplates.
+    """
+    data_volume = DataVolume(
+        name=name,
+        namespace=namespace,
+        source_dict=construct_datavolume_source_dict(source="blank"),
+        size=BLANK_DV_SIZE,
+        storage_class=storage_class_name,
+        api_name="storage",
+    )
+    data_volume.to_dict()
+    del data_volume.res["metadata"]["namespace"]
+    return data_volume.res
+
+
+class VMWithSeveralBlankDisks(VirtualMachineForTests):
+    """VM that injects blank data disks at creation time to avoid post-creation PATCH calls."""
+
+    def __init__(self, blank_disk_storage_class_name: str, num_blank_disks: int, **kwargs: Any) -> None:
+        super().__init__(**kwargs)
+        self.blank_disk_storage_class_name = blank_disk_storage_class_name
+        self.num_blank_disks = num_blank_disks
+
+    def to_dict(self) -> None:
+        """Build the VM resource dict and add blank disk entries to it.
+
+        Note:
+            Do not call more than once. Each call appends the blank disks to the resource dict,
+            so a second call will result in duplicate disks.
+        """
+        super().to_dict()
+        template_spec = self.res["spec"]["template"]["spec"]
+        disks = template_spec["domain"]["devices"]["disks"]
+        volumes = template_spec["volumes"]
+        dv_templates = self.res["spec"]["dataVolumeTemplates"]
+
+        for disk_index in range(self.num_blank_disks):
+            dv_name = f"{self.name}-blank-{disk_index}"
+            template = blank_dv_template(
+                name=dv_name,
+                namespace=self.namespace,
+                storage_class_name=self.blank_disk_storage_class_name,
+            )
+            dv_templates.append(template)
+            disks.append({"disk": {"bus": self.disk_type}, "name": dv_name})
+            volumes.append({"name": dv_name, "dataVolume": {"name": dv_name}})

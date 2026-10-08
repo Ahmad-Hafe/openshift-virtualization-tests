@@ -11,9 +11,10 @@ import shlex
 import pytest
 from pyhelper_utils.shell import run_ssh_commands
 
-from tests.os_params import WINDOWS_10, WINDOWS_LATEST, WINDOWS_LATEST_LABELS
+from tests.os_params import WINDOWS_11, WINDOWS_LATEST, WINDOWS_LATEST_LABELS
 from tests.virt.cluster.common_templates.utils import check_vm_xml_tablet_device, set_vm_tablet_device_dict
-from utilities.constants import TCP_TIMEOUT_30SEC, VIRTIO
+from utilities.constants.timeouts import TCP_TIMEOUT_30SEC, TIMEOUT_2MIN
+from utilities.constants.virt import VIRTIO
 
 pytestmark = [
     pytest.mark.special_infra,
@@ -32,6 +33,7 @@ def check_windows_vm_tablet_device(vm, driver_state):
         host=vm.ssh_exec,
         commands=shlex.split("%systemroot%\\\\system32\\\\driverquery /fo list /v"),
         tcp_timeout=TCP_TIMEOUT_30SEC,
+        wait_timeout=TIMEOUT_2MIN,
     )[0]
 
     assert re.search(
@@ -49,6 +51,7 @@ def check_windows_vm_tablet_device(vm, driver_state):
     [pytest.param({"os_dict": WINDOWS_LATEST})],
     indirect=True,
 )
+@pytest.mark.windows
 class TestWindowsTabletDevice:
     @pytest.mark.parametrize(
         "tablet_device_vm",
@@ -64,11 +67,11 @@ class TestWindowsTabletDevice:
         ],
         indirect=True,
     )
-    def test_tablet_usb_tablet_device(self, tablet_device_vm):
+    def test_tablet_usb_tablet_device(self, admin_client, tablet_device_vm):
         LOGGER.info("Test tablet device - USB bus.")
 
         check_windows_vm_tablet_device(vm=tablet_device_vm, driver_state="Running")
-        check_vm_xml_tablet_device(vm=tablet_device_vm)
+        check_vm_xml_tablet_device(vm=tablet_device_vm, admin_client=admin_client)
 
     @pytest.mark.parametrize(
         "tablet_device_vm",
@@ -84,7 +87,7 @@ class TestWindowsTabletDevice:
         ],
         indirect=True,
     )
-    def test_tablet_virtio_tablet_device(self, tablet_device_vm):
+    def test_tablet_virtio_tablet_device(self, admin_client, tablet_device_vm):
         """Verify that when a Windows VM is configured with virtio tablet input
         device(virtio drivers do not support tablet device), the VM is running.
         """
@@ -92,7 +95,7 @@ class TestWindowsTabletDevice:
         LOGGER.info("Test tablet device - virtio bus.")
 
         check_windows_vm_tablet_device(vm=tablet_device_vm, driver_state="Stopped")
-        check_vm_xml_tablet_device(vm=tablet_device_vm)
+        check_vm_xml_tablet_device(vm=tablet_device_vm, admin_client=admin_client)
 
     @pytest.mark.parametrize(
         "tablet_device_vm",
@@ -107,7 +110,7 @@ class TestWindowsTabletDevice:
         ],
         indirect=True,
     )
-    def test_windows_server_default_tablet_device(self, tablet_device_vm):
+    def test_windows_server_default_tablet_device(self, admin_client, tablet_device_vm):
         """Verify that when a Windows Server VM is configured by default with
         tablet device
         """
@@ -115,7 +118,7 @@ class TestWindowsTabletDevice:
         LOGGER.info("Test Windows Server tablet device - default table device.")
 
         check_windows_vm_tablet_device(vm=tablet_device_vm, driver_state="Running")
-        check_vm_xml_tablet_device(vm=tablet_device_vm)
+        check_vm_xml_tablet_device(vm=tablet_device_vm, admin_client=admin_client)
 
     @pytest.mark.parametrize(
         "tablet_device_vm",
@@ -123,14 +126,14 @@ class TestWindowsTabletDevice:
             pytest.param(
                 {
                     "vm_name": "windows-desktop-default-tablet-device",
-                    "template_labels": WINDOWS_10.get("template_labels"),
+                    "template_labels": WINDOWS_11.get("template_labels"),
                 },
                 marks=pytest.mark.polarion("CNV-4150"),
             ),
         ],
         indirect=True,
     )
-    def test_windows_desktop_default_tablet_device(self, tablet_device_vm):
+    def test_windows_desktop_default_tablet_device(self, admin_client, tablet_device_vm):
         """Verify that when a Desktop Windows VM is configured by default with
         tablet device
         """
@@ -138,4 +141,4 @@ class TestWindowsTabletDevice:
         LOGGER.info("Test Windows Desktop tablet device - default table device.")
 
         check_windows_vm_tablet_device(vm=tablet_device_vm, driver_state="Running")
-        check_vm_xml_tablet_device(vm=tablet_device_vm)
+        check_vm_xml_tablet_device(vm=tablet_device_vm, admin_client=admin_client)

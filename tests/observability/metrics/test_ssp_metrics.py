@@ -7,12 +7,12 @@ from tests.observability.metrics.utils import (
     validate_metric_value_with_round_down,
     validate_metric_value_within_range,
 )
-from tests.observability.utils import validate_metrics_value
-from utilities.constants import (
+from utilities.constants.components import (
     SSP_OPERATOR,
     VIRT_TEMPLATE_VALIDATOR,
 )
 from utilities.hco import ResourceEditorValidateHCOReconcile
+from utilities.monitoring import validate_metrics_value
 from utilities.virt import VirtualMachineForTests
 
 KUBEVIRT_SSP_OPERATOR_UP = "kubevirt_ssp_operator_up"
@@ -24,7 +24,8 @@ KUBEVIRT_SSP_OPERATOR_RECONCILE_SUCCEEDED_AGGREGATED = "kubevirt_ssp_operator_re
 @pytest.fixture()
 def template_modified(admin_client, base_templates):
     with ResourceEditorValidateHCOReconcile(
-        patches={base_templates[0]: {"metadata": {"annotations": {"description": "New Description"}}}}
+        admin_client=admin_client,
+        patches={base_templates[0]: {"metadata": {"annotations": {"description": "New Description"}}}},
     ):
         yield
 

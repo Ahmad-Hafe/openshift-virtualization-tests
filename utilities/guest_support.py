@@ -1,17 +1,38 @@
+from __future__ import annotations
+
 import json
+import logging
 import shlex
 from typing import TYPE_CHECKING
 
+from kubernetes.dynamic import DynamicClient
 from pyhelper_utils.shell import run_ssh_commands
 from timeout_sampler import TimeoutSampler
 
-from utilities.constants import HYPERV_FEATURES_LABELS_DOM_XML, TCP_TIMEOUT_30SEC, TIMEOUT_15SEC, TIMEOUT_90SEC
+from utilities.constants.timeouts import (
+    TCP_TIMEOUT_30SEC,
+    TIMEOUT_15SEC,
+    TIMEOUT_90SEC,
+)
+from utilities.constants.virt import OS_PROC_NAME, SPINLOCKS_EXPECTED_RETRIES
+from utilities.virt import (
+    VirtualMachineForTests,
+    fetch_pid_from_windows_vm,
+    pause_unpause_vm_and_check_connectivity,
+    start_and_fetch_processid_on_windows_vm,
+)
 
 if TYPE_CHECKING:
-    from utilities.virt import VirtualMachineForTests
+    from typing import Any
+
+LOGGER = logging.getLogger(__name__)
+
+YAML_TO_XML_FEATURE_NAMES: dict[str, str] = {
+    "synictimer": "stimer",
+}
 
 
-def assert_windows_efi(vm: "VirtualMachineForTests") -> None:
+def assert_windows_efi(vm: VirtualMachineForTests) -> None:
     """
     Verify guest OS is using EFI.
 
@@ -29,40 +50,101 @@ def assert_windows_efi(vm: "VirtualMachineForTests") -> None:
     assert "\\EFI\\Microsoft\\Boot\\bootmgfw.efi" in out, f"EFI boot not found in path. bcdedit output:\n{out}"
 
 
-def check_vm_xml_hyperv(vm: "VirtualMachineForTests") -> None:
-    """
-    Verify HyperV values in VMI XML configuration.
+def _collect_hyperv_feature_failures(
+    expected_features: dict[str, Any],
+    actual_features: dict[str, Any],
+) -> list[str]:
+    """Compare expected hyperv features against actual VMI XML features.
+
+    Walks the expected features dict (VM yaml format) and verifies each feature
+    and its sub-features have ``@state == "on"`` in the actual XML. For spinlocks,
+    also verifies the retries value matches.
 
     Args:
-        vm (VirtualMachineForTests): Virtual machine instance to check for HyperV configuration.
+        expected_features: Expected hyperv features dict in VM yaml format.
+            Feature names are automatically mapped from yaml to XML naming
+            (e.g., synictimer → stimer).
+        actual_features: Actual hyperv features dict from VMI XML.
+
+    Returns:
+        List of failure descriptions for features not matching expected state.
+    """
+    failures: list[str] = []
+
+    for yaml_name, expected_value in expected_features.items():
+        xml_name = YAML_TO_XML_FEATURE_NAMES.get(yaml_name, yaml_name)
+
+        if xml_name not in actual_features:
+            failures.append(f"Feature '{xml_name}' not found in VM XML")
+            continue
+
+        actual_feature = actual_features[xml_name]
+
+        if actual_feature.get("@state") != "on":
+            failures.append(f"Feature '{xml_name}' state is '{actual_feature.get('@state')}', expected 'on'")
+
+        if xml_name == "spinlocks":
+            expected_retries = (
+                expected_value.get("spinlocks", SPINLOCKS_EXPECTED_RETRIES)
+                if isinstance(expected_value, dict)
+                else SPINLOCKS_EXPECTED_RETRIES
+            )
+            actual_retries = int(actual_feature.get("@retries", 0))
+            if actual_retries != expected_retries:
+                failures.append(f"Spinlocks retries is {actual_retries}, expected {expected_retries}")
+
+        if isinstance(expected_value, dict):
+            for sub_name, sub_value in expected_value.items():
+                if not isinstance(sub_value, dict):
+                    continue
+
+                if sub_name not in actual_feature:
+                    failures.append(f"Sub-feature '{xml_name}.{sub_name}' not found in VM XML")
+                    continue
+
+                if actual_feature[sub_name].get("@state") != "on":
+                    failures.append(
+                        f"Sub-feature '{xml_name}.{sub_name}' state is"
+                        f" '{actual_feature[sub_name].get('@state')}', expected 'on'"
+                    )
+
+    return failures
+
+
+def check_vm_xml_hyperv(
+    vm: VirtualMachineForTests,
+    admin_client: DynamicClient,
+    expected_hyperv_features: dict[str, Any],
+) -> None:
+    """Verify HyperV values in VMI XML configuration.
+
+    Compares the expected hyperv features against the actual VMI XML. Each listed
+    feature and its sub-features are verified to have ``@state == "on"``, and
+    spinlocks retries are validated.
+
+    Args:
+        vm: Virtual machine instance to check for HyperV configuration.
+        admin_client: Privileged client for XML dict access.
+        expected_hyperv_features: Expected hyperv features dict in VM yaml format.
+            Keys are feature names (e.g., "relaxed", "synictimer"), values are dicts
+            of sub-features (e.g., ``{"direct": {}}``). Feature names are automatically
+            mapped from yaml to XML naming (synictimer → stimer).
 
     Raises:
-        AssertionError: If any HyperV flags are not set correctly in the VM spec, including:
-            - Features from HYPERV_FEATURES_LABELS_DOM_XML not in "on" state
-            - Spinlocks retries value not equal to 8191
-            - Stimer direct feature not in "on" state
+        AssertionError: If any HyperV flags are not set correctly in the VM spec.
     """
-    hyperv_features = vm.privileged_vmi.xml_dict["domain"]["features"]["hyperv"]
-    failed_hyperv_features = [
-        hyperv_features[feature]
-        for feature in HYPERV_FEATURES_LABELS_DOM_XML
-        if hyperv_features[feature]["@state"] != "on"
-    ]
-    spinlocks_retries_value = hyperv_features["spinlocks"]["@retries"]
-    if int(spinlocks_retries_value) != 8191:
-        failed_hyperv_features.append(spinlocks_retries_value)
-
-    stimer_direct_feature = hyperv_features["stimer"]["direct"]
-    if stimer_direct_feature["@state"] != "on":
-        failed_hyperv_features.append(hyperv_features["stimer"])
-
-    assert not failed_hyperv_features, (
-        f"The following hyperV flags are not set correctly in VM spec: {failed_hyperv_features},"
-        f"hyperV features in VM spec: {hyperv_features}"
+    hyperv_features = vm.vmi.get_xml_dict(privileged_client=admin_client)["domain"]["features"]["hyperv"]
+    failures = _collect_hyperv_feature_failures(
+        expected_features=expected_hyperv_features,
+        actual_features=hyperv_features,
+    )
+    assert not failures, (
+        f"The following hyperV flags are not set correctly in VM spec: {failures},"
+        f" hyperV features in VM spec: {hyperv_features}"
     )
 
 
-def check_windows_vm_hvinfo(vm: "VirtualMachineForTests") -> None:
+def check_windows_vm_hvinfo(vm: VirtualMachineForTests) -> None:
     """
     Verify HyperV values in Windows VM using hvinfo.exe tool.
 
@@ -72,7 +154,7 @@ def check_windows_vm_hvinfo(vm: "VirtualMachineForTests") -> None:
     Raises:
         AssertionError: If any HyperV flags are not set correctly in the guest, including:
             - Missing HyperV recommendations (RelaxedTiming, MSRAPICRegisters, etc.)
-            - Incorrect spinlock retries value (not 8191)
+            - Incorrect spinlock retries value
             - Missing HyperV privileges (AccessVpRunTimeReg, AccessSynicRegs, etc.)
             - Missing HyperV features (TimerFrequenciesQuery)
             - HyperVsupport flag not enabled
@@ -96,7 +178,7 @@ def check_windows_vm_hvinfo(vm: "VirtualMachineForTests") -> None:
             failed_recommendations.extend(failed_vm_recommendations)
 
         spinlocks = vm_recommendations_dict["SpinlockRetries"]
-        if int(spinlocks) != 8191:
+        if int(spinlocks) != SPINLOCKS_EXPECTED_RETRIES:
             failed_recommendations.append(f"SpinlockRetries: {spinlocks}")
 
         return failed_recommendations
@@ -144,3 +226,20 @@ def check_windows_vm_hvinfo(vm: "VirtualMachineForTests") -> None:
         f"The following hyperV flags are not set correctly in the guest: {failed_windows_hyperv_list}\n"
         f"VM hvinfo dict:{hvinfo_dict}"
     )
+
+
+def validate_pause_unpause_windows_vm(vm: VirtualMachineForTests, pre_pause_pid: int | None = None) -> None:
+    proc_name = OS_PROC_NAME["windows"]
+    if pre_pause_pid is None:
+        pre_pause_pid = start_and_fetch_processid_on_windows_vm(vm=vm, process_name=proc_name)
+    pause_unpause_vm_and_check_connectivity(vm=vm)
+    post_pause_pid = fetch_pid_from_windows_vm(vm=vm, process_name=proc_name)
+    kill_processes_by_name_windows(vm=vm, process_name=proc_name)
+    assert post_pause_pid == pre_pause_pid, (
+        f"PID mismatch!\nPre pause PID is: {pre_pause_pid}\nPost pause PID is: {post_pause_pid}"
+    )
+
+
+def kill_processes_by_name_windows(vm: VirtualMachineForTests, process_name: str) -> None:
+    cmd = shlex.split(f"taskkill /F /IM {process_name}")
+    run_ssh_commands(host=vm.ssh_exec, commands=cmd, tcp_timeout=TCP_TIMEOUT_30SEC)

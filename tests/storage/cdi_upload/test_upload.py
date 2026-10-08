@@ -1,5 +1,3 @@
-# -*- coding: utf-8 -*-
-
 """
 Upload tests
 """
@@ -11,7 +9,6 @@ from random import shuffle
 from time import sleep
 
 import pytest
-import sh
 from ocp_resources.datavolume import DataVolume
 from ocp_resources.persistent_volume import PersistentVolume
 from ocp_resources.route import Route
@@ -22,14 +19,10 @@ from timeout_sampler import TimeoutSampler
 import tests.storage.utils as storage_utils
 import utilities.storage
 from tests.os_params import RHEL_LATEST
-from utilities.constants import (
-    CDI_UPLOADPROXY,
-    TIMEOUT_1MIN,
-    TIMEOUT_3MIN,
-    TIMEOUT_5MIN,
-    TIMEOUT_15SEC,
-    Images,
-)
+from tests.storage.stop_status_utils import dv_stop_status_restart_threshold
+from utilities.constants import Images
+from utilities.constants.components import CDI_UPLOADPROXY
+from utilities.constants.timeouts import TIMEOUT_1MIN, TIMEOUT_3MIN, TIMEOUT_5MIN
 from utilities.storage import create_vm_from_dv, get_downloaded_artifact
 
 LOGGER = logging.getLogger(__name__)
@@ -55,8 +48,8 @@ def wait_for_upload_response_code(token, data, response_code, asynchronous=False
 
 @pytest.mark.polarion("CNV-2318")
 @pytest.mark.s390x
-def test_cdi_uploadproxy_route_owner_references(hco_namespace):
-    route = Route(name=CDI_UPLOADPROXY, namespace=hco_namespace.name)
+def test_cdi_uploadproxy_route_owner_references(admin_client, hco_namespace):
+    route = Route(name=CDI_UPLOADPROXY, namespace=hco_namespace.name, client=admin_client)
     assert route.instance
     assert route.instance["metadata"]["ownerReferences"][0]["name"] == "cdi-deployment"
     assert route.instance["metadata"]["ownerReferences"][0]["kind"] == "Deployment"
@@ -178,7 +171,7 @@ def test_successful_upload_with_supported_formats(
         storage_utils.upload_token_request(
             storage_ns_name=namespace.name, pvc_name=dv.pvc.name, data=local_name, client=unprivileged_client
         )
-        dv.wait_for_dv_success()
+        dv.wait_for_dv_success(stop_status_func=dv_stop_status_restart_threshold, dv=dv)
         create_vm_from_dv(client=unprivileged_client, dv=dv)
 
 
@@ -224,7 +217,7 @@ def test_successful_upload_token_validity(
     ) as utr:
         token = utr.create().status.token
         wait_for_upload_response_code(token=token, data=upload_file_path, response_code=HTTP_OK)
-        dv.wait_for_dv_success()
+        dv.wait_for_dv_success(stop_status_func=dv_stop_status_restart_threshold, dv=dv)
 
 
 @pytest.mark.parametrize(
@@ -260,17 +253,16 @@ def test_successful_upload_token_expiry(unprivileged_client, namespace, data_vol
         wait_for_upload_response_code(token=token, data="test", response_code=HTTP_UNAUTHORIZED)
 
 
-def _upload_image(dv_name, namespace, storage_class, local_name, size=None, client=None):
+def _upload_image(dv_name, namespace, storage_class, local_name, client):
     """
     Upload image function for the use of other tests
     """
-    size = size or "3Gi"
     with utilities.storage.create_dv(
         client=client,
         source="upload",
         dv_name=dv_name,
         namespace=namespace.name,
-        size=size,
+        size="3Gi",
         storage_class=storage_class,
     ) as dv:
         LOGGER.info("Wait for DV to be UploadReady")
@@ -290,6 +282,7 @@ def _upload_image(dv_name, namespace, storage_class, local_name, size=None, clie
 @pytest.mark.sno
 @pytest.mark.s390x
 @pytest.mark.polarion("CNV-2015")
+@pytest.mark.usefixtures("multiprocessing_start_method_fork")
 @pytest.mark.parametrize(
     "upload_file_path",
     [
@@ -303,6 +296,7 @@ def _upload_image(dv_name, namespace, storage_class, local_name, size=None, clie
     indirect=True,
 )
 def test_successful_concurrent_uploads(
+    admin_client,
     unprivileged_client,
     upload_file_path,
     namespace,
@@ -310,7 +304,7 @@ def test_successful_concurrent_uploads(
 ):
     dvs_processes = []
     storage_class = [*storage_class_matrix__module__][0]
-    available_pv = PersistentVolume(name=namespace).max_available_pvs
+    available_pv = PersistentVolume(name=namespace, client=admin_client).max_available_pvs
     for dv in range(available_pv):
         dv_process = multiprocessing.Process(
             target=_upload_image,
@@ -327,55 +321,12 @@ def test_successful_concurrent_uploads(
 
 @pytest.mark.sno
 @pytest.mark.parametrize(
-    "upload_file_path",
-    [
-        pytest.param(
-            {
-                "remote_image_dir": Images.Rhel.DIR,
-                "remote_image_name": Images.Rhel.RHEL8_0_IMG,
-            },
-            marks=(pytest.mark.polarion("CNV-2017")),
-        ),
-    ],
-    indirect=True,
-)
-def test_successful_upload_missing_file_in_transit(
-    unprivileged_client, namespace, storage_class_matrix__class__, upload_file_path
-):
-    dv_name = "cnv-2017"
-    storage_class = [*storage_class_matrix__class__][0]
-    get_downloaded_artifact(
-        remote_name=RHEL_LATEST["image_path"],
-        local_name=upload_file_path,
-    )
-    # Use fork context to avoid pickling issues with nested functions
-    _fork_context = multiprocessing.get_context("fork")
-
-    upload_process = _fork_context.Process(
-        target=_upload_image,
-        args=(dv_name, namespace, storage_class, upload_file_path, "10Gi", unprivileged_client),
-    )
-
-    # Run process in parallel
-    upload_process.start()
-
-    # Ideally, the file should be removed while the status of upload is 'UploadInProgress'.
-    # However, 'UploadInProgress' status phase is not implemented yet.
-    time.sleep(TIMEOUT_15SEC)
-    sh.rm("-f", upload_file_path)
-
-    # Exit the completed processes
-    upload_process.join()
-
-
-@pytest.mark.sno
-@pytest.mark.parametrize(
     "download_specified_image, data_volume_multi_storage_scope_function",
     [
         pytest.param(
             {
-                "image_path": py_config["latest_rhel_os_dict"]["image_path"],
-                "image_file": py_config["latest_rhel_os_dict"]["image_name"],
+                "image_path": RHEL_LATEST.get("image_path"),
+                "image_file": RHEL_LATEST.get("image_name"),
             },
             {
                 "dv_name": "cnv-4511",

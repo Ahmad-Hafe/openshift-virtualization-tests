@@ -1,14 +1,14 @@
-# -*- coding: utf-8 -*-
-
-"""
-Network Migration - masquerade connectivity after migration
-"""
+from __future__ import annotations
 
 import logging
+from collections.abc import Generator
+from typing import TYPE_CHECKING
 
 import pytest
 from timeout_sampler import TimeoutSampler
 
+from libs.net.vmspec import lookup_iface_status
+from tests.network.libs.connectivity import build_ping_command
 from utilities.virt import (
     VirtualMachineForTests,
     fedora_vm_body,
@@ -16,6 +16,9 @@ from utilities.virt import (
     vm_console_run_commands,
     wait_for_console,
 )
+
+if TYPE_CHECKING:
+    from kubernetes.dynamic import DynamicClient
 
 LOGGER = logging.getLogger(__name__)
 
@@ -57,16 +60,22 @@ def running_vm_for_migration(
 
 
 @pytest.fixture()
-def migrated_vmi(running_vm_for_migration):
+def migrated_vmi(admin_client: DynamicClient, running_vm_for_migration: VirtualMachineForTests) -> Generator[None]:
     LOGGER.info(f"Migrating {running_vm_for_migration.name}. Current node: {running_vm_for_migration.vmi.node.name}")
 
-    ip_before = running_vm_for_migration.vmi.interfaces[0]["ipAddress"]
-    migrated_vmi = migrate_vm_and_verify(vm=running_vm_for_migration, wait_for_migration_success=False)
+    iface_name = running_vm_for_migration.vmi.interfaces[0].name
+    ip_addresses_before = lookup_iface_status(vm=running_vm_for_migration, iface_name=iface_name)["ipAddresses"]
+    migrated_vmi = migrate_vm_and_verify(
+        vm=running_vm_for_migration, client=admin_client, wait_for_migration_success=False
+    )
 
     for sample in TimeoutSampler(
         wait_timeout=60,
         sleep=1,
-        func=lambda: ip_before != running_vm_for_migration.vmi.interfaces[0]["ipAddress"],
+        func=lambda: (
+            ip_addresses_before
+            != lookup_iface_status(vm=running_vm_for_migration, iface_name=iface_name)["ipAddresses"]
+        ),
     ):
         if sample:
             break
@@ -86,8 +95,9 @@ def vm_console_connection_ready(running_vm_for_migration):
 @pytest.mark.polarion("CNV-6733")
 @pytest.mark.s390x
 @pytest.mark.single_nic
-# Not marked as `conformance`; requires NMState
+# conformance candidate
 def test_connectivity_after_migration(
+    subtests,
     namespace,
     running_vm_static,
     running_vm_for_migration,
@@ -96,7 +106,8 @@ def test_connectivity_after_migration(
 ):
     """
     test for connectivity of a migrated vm with masquerade.
-    using console to ping from migrated_vmi to running_vm_static.
+    Tests all available IP families (IPv4 and IPv6 if configured).
+    Using console to ping from migrated_vmi to running_vm_static.
     It is important to connect using console and not ssh because connecting
     through ssh hides the bug.
     The ping should take place right after running_vm_for_migration is migrated to
@@ -104,11 +115,15 @@ def test_connectivity_after_migration(
     the ping command include '-c 10 -w 10' so that in case there is a packet
     loss the exit code will be 1 and not 0.
     """
-    LOGGER.info(f"pinging from migrated {running_vm_for_migration.name} to {running_vm_static.name}")
-    static_vm_ip = running_vm_static.vmi.interfaces[0]["ipAddress"]
-
-    vm_console_run_commands(
-        vm=running_vm_for_migration,
-        commands=[f"ping {static_vm_ip} -c 10 -w 10"],
-        timeout=10,
-    )
+    target_vm_iface_name = running_vm_static.vmi.interfaces[0].name
+    target_vm_ip_addresses = lookup_iface_status(vm=running_vm_static, iface_name=target_vm_iface_name)["ipAddresses"]
+    for target_vm_ip in target_vm_ip_addresses:
+        with subtests.test(
+            msg=f"Testing connectivity from migrated {running_vm_for_migration.name} "
+            f"to {running_vm_static.name} IP address: {target_vm_ip}"
+        ):
+            vm_console_run_commands(
+                vm=running_vm_for_migration,
+                commands=[build_ping_command(dst_ip=target_vm_ip, count=10, timeout=10)],
+                timeout=20,
+            )

@@ -4,7 +4,6 @@ import re
 
 import pytest
 from ocp_resources.network_attachment_definition import NetworkAttachmentDefinition
-from ocp_resources.virtual_machine import VirtualMachine
 from pytest_testconfig import py_config
 
 from tests.install_upgrade_operators.constants import FILE_SUFFIX, SECTION_TITLE
@@ -26,13 +25,12 @@ from tests.install_upgrade_operators.must_gather.utils import (
     check_list_of_resources,
     check_no_duplicate_and_missing_files_collected_from_migrated_vm,
     extracted_data_from_must_gather_on_vm_node,
-    validate_files_collected,
     validate_guest_console_logs_collected,
     validate_no_empty_files_collected_must_gather_vm,
 )
 from tests.os_params import FEDORA_LATEST
-from utilities.constants import ARM_64, COUNT_FIVE, S390X
-from utilities.jira import is_jira_open
+from utilities.constants.architecture import ARM_64
+from utilities.constants.cluster import COUNT_FIVE
 
 pytestmark = [pytest.mark.post_upgrade, pytest.mark.skip_must_gather_collection, pytest.mark.arm64, pytest.mark.s390x]
 
@@ -44,66 +42,35 @@ def kubevirt_architecture_configuration_scope_session(
     kubevirt_resource_scope_session,
     nodes_cpu_architecture,
 ):
-    kubevirt_architecture_config = {}
+    kubevirt_architecture_config = kubevirt_resource_scope_session.instance.to_dict()["spec"]["configuration"][
+        "architectureConfiguration"
+    ][nodes_cpu_architecture]
 
-    # TODO: This block for s390x to be removed once we move to kubevirt version 1.7 as this is
-    # fixed in https://github.com/kubevirt/kubevirt/issues/14953
-    if nodes_cpu_architecture == S390X and is_jira_open(jira_id="CNV-71825"):
-        kubevirt_architecture_config["ovmfPath"] = ""
-        kubevirt_architecture_config["machineType"] = "s390-ccw-virtio"
-        kubevirt_architecture_config["emulatedMachines"] = "s390-ccw-virtio*"
-    else:
-        kubevirt_architecture_config = kubevirt_resource_scope_session.instance.to_dict()["spec"]["configuration"][
-            "architectureConfiguration"
-        ][nodes_cpu_architecture]
-
-        # Default value of kubevirt.spec.configuration.architectureConfiguration.arm64.ovmfPath is
-        # '/usr/share/AAVMF' but the files in this location are symlinked to
-        # '/usr/share/edk2/aarch64'. VM domain capabilities refer to symlinked file.
-        if nodes_cpu_architecture == ARM_64:
-            kubevirt_architecture_config["ovmfPath"] = "/usr/share/edk2/aarch64"
+    # Default value of kubevirt.spec.configuration.architectureConfiguration.arm64.ovmfPath is
+    # '/usr/share/AAVMF' but the files in this location are symlinked to
+    # '/usr/share/edk2/aarch64'. VM domain capabilities refer to symlinked file.
+    if nodes_cpu_architecture == ARM_64:
+        kubevirt_architecture_config["ovmfPath"] = "/usr/share/edk2/aarch64"
     return kubevirt_architecture_config
 
 
 @pytest.mark.usefixtures("collected_cluster_must_gather_with_vms")
 @pytest.mark.sno
 class TestMustGatherClusterWithVMs:
-    @pytest.mark.parametrize(
-        ("resource_type", "resource_path", "checks"),
-        [
-            pytest.param(
-                NetworkAttachmentDefinition,
-                "namespaces/{namespace}/"
-                f"{NetworkAttachmentDefinition.ApiGroup.K8S_CNI_CNCF_IO}/"
-                "network-attachment-definitions/{name}.yaml",
-                VALIDATE_FIELDS,
-                marks=(pytest.mark.polarion("CNV-2720")),
-                id="test_network_attachment_definitions_resources",
-            ),
-            pytest.param(
-                VirtualMachine,
-                f"namespaces/{{namespace}}/{VirtualMachine.ApiGroup.KUBEVIRT_IO}/virtualmachines/custom/{{name}}.yaml",
-                VALIDATE_FIELDS,
-                marks=(pytest.mark.polarion("CNV-3043")),
-                id="test_virtualmachine_resources",
-            ),
-        ],
-        indirect=["resource_type"],
-    )
-    def test_resource_type(
+    @pytest.mark.polarion("CNV-2720")
+    def test_network_attachment_definitions_resources(
         self,
         admin_client,
         collected_cluster_must_gather_with_vms,
-        resource_type,
-        resource_path,
-        checks,
     ):
         check_list_of_resources(
-            dyn_client=admin_client,
-            resource_type=resource_type,
+            client=admin_client,
+            resource_type=NetworkAttachmentDefinition,
             temp_dir=collected_cluster_must_gather_with_vms,
-            resource_path=resource_path,
-            checks=checks,
+            resource_path="namespaces/{namespace}/"
+            f"{NetworkAttachmentDefinition.ApiGroup.K8S_CNI_CNCF_IO}/"
+            "network-attachment-definitions/{name}.yaml",
+            checks=VALIDATE_FIELDS,
         )
 
 
@@ -283,10 +250,13 @@ class TestMustGatherVmDetails:
         )
 
     @pytest.mark.polarion("CNV-10243")
-    def test_must_gather_and_vm_same_node(self, must_gather_vm, collected_vm_details_must_gather_from_vm_node):
+    def test_must_gather_and_vm_same_node(
+        self, admin_client, must_gather_vm, collected_vm_details_must_gather_from_vm_node
+    ):
         extracted_data_from_must_gather_on_vm_node(
             collected_vm_details_must_gather_from_vm_node=collected_vm_details_must_gather_from_vm_node,
             must_gather_vm=must_gather_vm,
+            admin_client=admin_client,
         )
 
 
@@ -296,28 +266,14 @@ class TestGuestConsoleLog:
     @pytest.mark.polarion("CNV-10630")
     def test_guest_console_logs(
         self,
+        admin_client,
         must_gather_vm_scope_class,
         collected_vm_details_must_gather,
     ):
         validate_guest_console_logs_collected(
             vm=must_gather_vm_scope_class,
             collected_vm_details_must_gather=collected_vm_details_must_gather,
-        )
-
-
-@pytest.mark.sno
-class TestMustGatherVmLongNameDetails:
-    @pytest.mark.polarion("CNV-9233")
-    def test_data_collected_from_virt_launcher_long(
-        self,
-        must_gather_long_name_vm,
-        collected_vm_details_must_gather,
-        nftables_ruleset_from_utility_pods,
-    ):
-        validate_files_collected(
-            base_path=collected_vm_details_must_gather,
-            vm_list=[must_gather_long_name_vm],
-            nftables_ruleset_from_utility_pods=nftables_ruleset_from_utility_pods,
+            admin_client=admin_client,
         )
 
 

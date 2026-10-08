@@ -1,39 +1,31 @@
 from typing import Any
 
-import utilities.constants
-from utilities.constants import (
+from utilities.constants.architecture import S390X
+from utilities.constants.images import OS_FLAVOR_FEDORA
+from utilities.constants.instance_types import (
+    CENTOS_STREAM9_PREFERENCE,
     EXPECTED_CLUSTER_INSTANCE_TYPE_LABELS,
     PREFERENCE_STR,
-    S390X,
+    RHEL9_PREFERENCE,
 )
-from utilities.infra import get_latest_os_dict_list
-from utilities.os_utils import generate_linux_instance_type_os_matrix, generate_os_matrix_dict
 
 global config
 
 
 EXPECTED_CLUSTER_INSTANCE_TYPE_LABELS[PREFERENCE_STR] = f"rhel.9.{S390X}"
 
-rhel_os_matrix = generate_os_matrix_dict(
-    os_name="rhel",
-    supported_operating_systems=[
-        "rhel-8-10",
-        "rhel-9-6",
-    ],
-)
-fedora_os_matrix = generate_os_matrix_dict(os_name="fedora", supported_operating_systems=["fedora-42"])
-centos_os_matrix = generate_os_matrix_dict(os_name="centos", supported_operating_systems=["centos-stream-9"])
 
-instance_type_rhel_os_matrix = generate_linux_instance_type_os_matrix(
-    os_name="rhel", preferences=[utilities.constants.RHEL9_PREFERENCE], arch_suffix=S390X
-)
+rhel_os_list = ["rhel-8-10", "rhel-9-6"]
+fedora_os_list = ["fedora-42"]
+centos_os_list = ["centos-stream-9"]
 
-latest_rhel_os_dict, latest_fedora_os_dict, latest_centos_os_dict = get_latest_os_dict_list(
-    os_list=[rhel_os_matrix, fedora_os_matrix, centos_os_matrix]
-)
+instance_type_rhel_os_list = [RHEL9_PREFERENCE]
+instance_type_fedora_os_list = [OS_FLAVOR_FEDORA]
+instance_type_centos_os_list = [CENTOS_STREAM9_PREFERENCE]
+
 
 for _dir in dir():
-    if not config:  # noqa: F821
+    if not config:
         config: dict[str, Any] = {}
     val = locals()[_dir]
     if type(val) not in [bool, list, dict, str]:
@@ -42,4 +34,4 @@ for _dir in dir():
     if _dir in ["encoding", "py_file"]:
         continue
 
-    config[_dir] = locals()[_dir]  # noqa: F821
+    config[_dir] = locals()[_dir]

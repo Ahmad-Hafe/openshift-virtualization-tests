@@ -1,4 +1,7 @@
+from __future__ import annotations
+
 import logging
+from typing import TYPE_CHECKING
 
 import pytest
 from ocp_resources.config_map import ConfigMap
@@ -9,9 +12,14 @@ from ocp_resources.virtual_machine_cluster_preference import (
     VirtualMachineClusterPreference,
 )
 
-from tests.os_params import WINDOWS_10
-from utilities.constants import OS_FLAVOR_WINDOWS, TIMEOUT_3MIN, VIRTIO_WIN
+from tests.os_params import WINDOWS_11
+from utilities.constants.components import VIRTIO_WIN
+from utilities.constants.images import OS_FLAVOR_WINDOWS
+from utilities.constants.timeouts import TIMEOUT_3MIN
 from utilities.virt import VirtualMachineForTests, migrate_vm_and_verify, running_vm
+
+if TYPE_CHECKING:
+    from kubernetes.dynamic import DynamicClient
 
 pytestmark = [pytest.mark.special_infra, pytest.mark.high_resource_vm]
 
@@ -50,8 +58,8 @@ class WindowsVMWithGuestTools(VirtualMachineForTests):
         })
 
 
-def verify_cdrom_in_xml(vm):
-    vmi_devices = vm.privileged_vmi.xml_dict["domain"]["devices"]
+def verify_cdrom_in_xml(vm, admin_client):
+    vmi_devices = vm.vmi.get_xml_dict(privileged_client=admin_client)["domain"]["devices"]
     for device_dict in vmi_devices["disk"]:
         for entry in device_dict.items():
             if entry == ("@device", "cdrom"):
@@ -62,7 +70,7 @@ def verify_cdrom_in_xml(vm):
 
 @pytest.fixture(scope="session")
 def virtio_win_image(hco_namespace):
-    virtio_win_cm = ConfigMap(name=VIRTIO_WIN, namespace=hco_namespace.name)
+    virtio_win_cm = ConfigMap(client=hco_namespace.client, name=VIRTIO_WIN, namespace=hco_namespace.name)
     return virtio_win_cm.instance.data["virtio-win-image"]
 
 
@@ -75,7 +83,7 @@ def hco_csv_win_virtio_image(csv_scope_session):
 
 @pytest.fixture(scope="class")
 def vm_with_guest_tools(
-    cluster_modern_cpu_model_scope_class,
+    modern_cpu_for_migration,
     namespace,
     unprivileged_client,
     golden_image_data_volume_template_for_test_scope_class,
@@ -86,13 +94,14 @@ def vm_with_guest_tools(
         name="windows-vm-wth-guest-tools",
         namespace=namespace.name,
         client=unprivileged_client,
-        vm_instance_type=VirtualMachineClusterInstancetype(name="u1.large"),
-        vm_preference=VirtualMachineClusterPreference(name="windows.10"),
+        vm_instance_type=VirtualMachineClusterInstancetype(client=unprivileged_client, name="u1.large"),
+        vm_preference=VirtualMachineClusterPreference(client=unprivileged_client, name="windows.11"),
         data_volume_template=golden_image_data_volume_template_for_test_scope_class,
         termination_grace_period=TIMEOUT_3MIN,
         os_flavor=OS_FLAVOR_WINDOWS,
         disk_type=None,
         virtio_image=virtio_win_image,
+        cpu_model=modern_cpu_for_migration,
     ) as vm:
         running_vm(vm=vm)
         yield vm
@@ -100,9 +109,11 @@ def vm_with_guest_tools(
 
 @pytest.fixture(scope="class")
 def migrated_vm_with_guest_tools(
-    vm_with_guest_tools,
-):
-    migrate_vm_and_verify(vm=vm_with_guest_tools)
+    admin_client: DynamicClient,
+    vm_with_guest_tools: VirtualMachineForTests,
+) -> VirtualMachineForTests:
+    migrate_vm_and_verify(vm=vm_with_guest_tools, client=admin_client)
+    return vm_with_guest_tools
 
 
 @pytest.mark.polarion("CNV-9794")
@@ -114,19 +125,21 @@ def test_win_virtio_image(virtio_win_image, hco_csv_win_virtio_image):
 
 @pytest.mark.parametrize(
     "golden_image_data_source_for_test_scope_class",
-    [pytest.param({"os_dict": WINDOWS_10})],
+    [pytest.param({"os_dict": WINDOWS_11})],
     indirect=True,
 )
+@pytest.mark.windows
 class TestWindowsGuestTools:
     @pytest.mark.polarion("CNV-6517")
     @pytest.mark.dependency(name=f"{TESTS_CLASS_NAME}::vm_with_guest_tools")
-    def test_vm_with_windows_guest_tools(self, vm_with_guest_tools):
+    def test_vm_with_windows_guest_tools(self, admin_client, vm_with_guest_tools):
         LOGGER.info("Test VM with Windows guest tools")
-        verify_cdrom_in_xml(vm=vm_with_guest_tools)
+        verify_cdrom_in_xml(vm=vm_with_guest_tools, admin_client=admin_client)
 
     @pytest.mark.rwx_default_storage
     @pytest.mark.polarion("CNV-6518")
     @pytest.mark.dependency(depends=[f"{TESTS_CLASS_NAME}::vm_with_guest_tools"])
-    def test_migrate_vm_with_windows_guest_tools(self, vm_with_guest_tools, migrated_vm_with_guest_tools):
+    @pytest.mark.usefixtures("migrated_vm_with_guest_tools")
+    def test_migrate_vm_with_windows_guest_tools(self, admin_client, vm_with_guest_tools):
         LOGGER.info("Test migration of a VM with Windows guest tools")
-        verify_cdrom_in_xml(vm=vm_with_guest_tools)
+        verify_cdrom_in_xml(vm=vm_with_guest_tools, admin_client=admin_client)

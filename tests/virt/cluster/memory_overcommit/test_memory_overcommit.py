@@ -11,11 +11,12 @@ VM_MEMORY = "2Gi"
 
 
 @pytest.fixture()
-def vm_for_memory_overcommit(request, namespace):
+def vm_for_memory_overcommit(request, unprivileged_client, namespace):
     name = request.param["vm_name"]
     with VirtualMachineForTests(
         name=name,
         namespace=namespace.name,
+        client=unprivileged_client,
         body=fedora_vm_body(name=name),
         memory_guest=VM_MEMORY,
         memory_requests=request.param.get("memory_requests"),
@@ -50,10 +51,11 @@ class TestMemoryOvercommit:
     )
     def test_vm_memory_overcommit(
         self,
+        admin_client,
         vm_for_memory_overcommit,
         expected_less_memory,
     ):
-        pod_instance = vm_for_memory_overcommit.vmi.virt_launcher_pod.instance
+        pod_instance = vm_for_memory_overcommit.vmi.get_virt_launcher_pod(privileged_client=admin_client).instance
         pod_memory = pod_instance.spec.containers[0].resources.requests["memory"]
         assert (
             bitmath.parse_string_unsafe(pod_memory) < bitmath.parse_string_unsafe(VM_MEMORY)

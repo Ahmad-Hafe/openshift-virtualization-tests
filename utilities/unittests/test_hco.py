@@ -39,22 +39,29 @@ if "utilities.hco" in sys.modules:
     del sys.modules["utilities.hco"]
 
 # Import after setting up mocks to avoid circular dependency
-from utilities.hco import (  # noqa: E402
+from utilities.hco import (
+    CDI,
     DEFAULT_HCO_PROGRESSING_CONDITIONS,
     HCO_JSONPATCH_ANNOTATION_COMPONENT_DICT,
+    KubeVirt,
+    Resource,
     ResourceEditorValidateHCOReconcile,
     add_labels_to_nodes,
     apply_np_changes,
     disable_common_boot_image_import_hco_spec,
     enable_common_boot_image_import_spec_wait_for_data_import_cron,
     enabled_aaq_in_hco,
+    get_hco_feature_gates,
     get_hco_namespace,
     get_hco_spec,
     get_hco_version,
     get_installed_hco_csv,
     get_json_patch_annotation_values,
     hco_cr_jsonpatch_annotations_dict,
+    hco_feature_gates_patch,
+    is_feature_gate_enabled,
     is_hco_tainted,
+    parse_hco_fg_phases,
     update_common_boot_image_import_spec,
     update_hco_annotations,
     update_hco_templates_spec,
@@ -235,14 +242,17 @@ class TestGetHcoSpec:
 
         mock_hco = MagicMock()
         mock_hco.instance.to_dict.return_value = {
-            "spec": {"infra": {}, "workloads": {}, "featureGates": {"enableCommonBootImageImport": True}}
+            "spec": {
+                "deployment": {"nodePlacements": {"infra": {}, "workload": {}}},
+                "featureGates": [{"name": "downwardMetrics"}],
+            }
         }
         mock_get_hco.return_value = mock_hco
 
         result = get_hco_spec(mock_admin_client, mock_namespace)
 
-        assert "infra" in result
-        assert "workloads" in result
+        assert "deployment" in result
+        assert result["deployment"]["nodePlacements"]["infra"] == {}
         assert "featureGates" in result
         mock_get_hco.assert_called_once_with(client=mock_admin_client, hco_ns_name="openshift-cnv")
 
@@ -498,7 +508,6 @@ class TestWaitForHcoConditions:
     @patch("utilities.hco.Namespace")
     def test_wait_for_hco_conditions_with_dependent_crs(self, mock_namespace_class, mock_wait_conditions):
         """Test wait_for_hco_conditions with dependent CRs"""
-        from utilities.hco import CDI, KubeVirt
 
         mock_admin_client = MagicMock()
         mock_namespace = MagicMock()
@@ -536,7 +545,9 @@ class TestApplyNpChanges:
         mock_hco = MagicMock()
         mock_namespace = MagicMock()
 
-        mock_hco.instance.to_dict.return_value = {"spec": {"infra": None, "workloads": None}}
+        mock_hco.instance.to_dict.return_value = {
+            "spec": {"deployment": {"nodePlacements": {"infra": None, "workload": None}}}
+        }
 
         new_infra_placement = {"nodeSelector": {"node-role.kubernetes.io/worker": ""}}
 
@@ -555,7 +566,9 @@ class TestApplyNpChanges:
         mock_namespace = MagicMock()
 
         existing_placement = {"nodeSelector": {"node-role.kubernetes.io/worker": ""}}
-        mock_hco.instance.to_dict.return_value = {"spec": {"infra": existing_placement, "workloads": None}}
+        mock_hco.instance.to_dict.return_value = {
+            "spec": {"deployment": {"nodePlacements": {"infra": existing_placement, "workload": None}}}
+        }
 
         apply_np_changes(mock_admin_client, mock_hco, mock_namespace, infra_placement=existing_placement)
 
@@ -567,12 +580,10 @@ class TestApplyNpChanges:
 class TestResourceEditorValidateHCOReconcile:
     """Test cases for ResourceEditorValidateHCOReconcile class"""
 
-    @patch("utilities.hco.get_client")
     @patch("utilities.hco.Namespace")
-    def test_resource_editor_init(self, mock_namespace_class, mock_get_client):
+    def test_resource_editor_init(self, mock_namespace_class):
         """Test ResourceEditorValidateHCOReconcile initialization"""
         mock_client = MagicMock()
-        mock_get_client.return_value = mock_client
 
         mock_namespace = MagicMock()
         mock_namespace_class.return_value = mock_namespace
@@ -581,22 +592,26 @@ class TestResourceEditorValidateHCOReconcile:
         patches = {mock_resource: {"spec": {"test": "value"}}}
 
         editor = ResourceEditorValidateHCOReconcile(
-            patches=patches, hco_namespace="openshift-cnv", consecutive_checks_count=5
+            admin_client=mock_client, patches=patches, hco_namespace="openshift-cnv", consecutive_checks_count=5
         )
 
+        assert editor.admin_client == mock_client
         assert editor.hco_namespace == mock_namespace
         assert editor._consecutive_checks_count == 5
         assert editor.list_resource_reconcile == []
+        mock_namespace_class.assert_called_once_with(client=mock_client, name="openshift-cnv")
 
     @patch("utilities.hco.wait_for_hco_conditions")
-    @patch("utilities.hco.get_client")
-    @patch("utilities.hco.Namespace")
-    def test_resource_editor_update_without_reconcile(self, mock_namespace_class, mock_get_client, mock_wait_hco):
+    @patch("utilities.hco.Namespace", new=MagicMock())
+    def test_resource_editor_update_without_reconcile(self, mock_wait_hco):
         """Test ResourceEditorValidateHCOReconcile update without wait_for_reconcile_post_update"""
+        mock_client = MagicMock()
         mock_resource = MagicMock()
         patches = {mock_resource: {"spec": {"test": "value"}}}
 
-        editor = ResourceEditorValidateHCOReconcile(patches=patches, wait_for_reconcile_post_update=False)
+        editor = ResourceEditorValidateHCOReconcile(
+            admin_client=mock_client, patches=patches, wait_for_reconcile_post_update=False
+        )
 
         with patch("utilities.hco.ResourceEditor.update") as mock_parent_update:
             editor.update(backup_resources=True)
@@ -604,14 +619,16 @@ class TestResourceEditorValidateHCOReconcile:
             mock_wait_hco.assert_not_called()
 
     @patch("utilities.hco.wait_for_hco_conditions")
-    @patch("utilities.hco.get_client")
-    @patch("utilities.hco.Namespace")
-    def test_resource_editor_update_with_reconcile(self, mock_namespace_class, mock_get_client, mock_wait_hco):
+    @patch("utilities.hco.Namespace", new=MagicMock())
+    def test_resource_editor_update_with_reconcile(self, mock_wait_hco):
         """Test ResourceEditorValidateHCOReconcile update with wait_for_reconcile_post_update"""
+        mock_client = MagicMock()
         mock_resource = MagicMock()
         patches = {mock_resource: {"spec": {"test": "value"}}}
 
-        editor = ResourceEditorValidateHCOReconcile(patches=patches, wait_for_reconcile_post_update=True)
+        editor = ResourceEditorValidateHCOReconcile(
+            admin_client=mock_client, patches=patches, wait_for_reconcile_post_update=True
+        )
 
         with patch("utilities.hco.ResourceEditor.update") as mock_parent_update:
             editor.update(backup_resources=False)
@@ -619,14 +636,14 @@ class TestResourceEditorValidateHCOReconcile:
             mock_wait_hco.assert_called_once()
 
     @patch("utilities.hco.wait_for_hco_conditions")
-    @patch("utilities.hco.get_client")
-    @patch("utilities.hco.Namespace")
-    def test_resource_editor_restore(self, mock_namespace_class, mock_get_client, mock_wait_hco):
+    @patch("utilities.hco.Namespace", new=MagicMock())
+    def test_resource_editor_restore(self, mock_wait_hco):
         """Test ResourceEditorValidateHCOReconcile restore"""
+        mock_client = MagicMock()
         mock_resource = MagicMock()
         patches = {mock_resource: {"spec": {"test": "value"}}}
 
-        editor = ResourceEditorValidateHCOReconcile(patches=patches)
+        editor = ResourceEditorValidateHCOReconcile(admin_client=mock_client, patches=patches)
 
         with patch("utilities.hco.ResourceEditor.restore") as mock_parent_restore:
             editor.restore()
@@ -639,7 +656,6 @@ class TestModuleConstants:
 
     def test_default_hco_progressing_conditions(self):
         """Test DEFAULT_HCO_PROGRESSING_CONDITIONS constant"""
-        from utilities.hco import Resource
 
         assert "Progressing" in DEFAULT_HCO_PROGRESSING_CONDITIONS
         assert DEFAULT_HCO_PROGRESSING_CONDITIONS[Resource.Condition.PROGRESSING] == Resource.Condition.Status.TRUE
@@ -749,7 +765,7 @@ class TestDisableCommonBootImageImportHcoSpec:
         """Test disabling common boot image import when it's enabled"""
         mock_admin_client = MagicMock()
         mock_hco = MagicMock()
-        mock_hco.instance.spec = {"enableCommonBootImageImport": True}
+        mock_hco.instance.spec.workloadSources.enableCommonBootImageImport = True
         mock_namespace = MagicMock()
         mock_dics = [MagicMock()]
 
@@ -765,7 +781,41 @@ class TestDisableCommonBootImageImportHcoSpec:
         except StopIteration:
             pass
 
-        mock_enable_spec.assert_called_once()
+        mock_enable_spec.assert_called_once_with(
+            hco_resource=mock_hco,
+            admin_client=mock_admin_client,
+            namespace=mock_namespace,
+            exclude_data_source_names=None,
+        )
+
+    @patch("utilities.hco.enable_common_boot_image_import_spec_wait_for_data_import_cron")
+    @patch("utilities.hco.wait_for_deleted_data_import_crons")
+    @patch("utilities.hco.update_common_boot_image_import_spec")
+    def test_disable_propagates_exclude_data_source_names(self, mock_update_spec, mock_wait_deleted, mock_enable_spec):
+        """Test that exclude_data_source_names is forwarded to the teardown call"""
+        mock_admin_client = MagicMock()
+        mock_hco = MagicMock()
+        mock_hco.instance.spec.workloadSources.enableCommonBootImageImport = True
+        mock_namespace = MagicMock()
+        mock_dics = [MagicMock()]
+        exclude_names = {"custom-datasource"}
+
+        gen = disable_common_boot_image_import_hco_spec(
+            mock_admin_client, mock_hco, mock_namespace, mock_dics, exclude_data_source_names=exclude_names
+        )
+        next(gen)
+
+        try:
+            next(gen)
+        except StopIteration:
+            pass
+
+        mock_enable_spec.assert_called_once_with(
+            hco_resource=mock_hco,
+            admin_client=mock_admin_client,
+            namespace=mock_namespace,
+            exclude_data_source_names=exclude_names,
+        )
 
     @patch("utilities.hco.enable_common_boot_image_import_spec_wait_for_data_import_cron")
     @patch("utilities.hco.wait_for_deleted_data_import_crons")
@@ -774,7 +824,7 @@ class TestDisableCommonBootImageImportHcoSpec:
         """Test context manager when common boot image import is already disabled"""
         mock_admin_client = MagicMock()
         mock_hco = MagicMock()
-        mock_hco.instance.spec = {"enableCommonBootImageImport": False}
+        mock_hco.instance.spec.workloadSources.enableCommonBootImageImport = False
         mock_namespace = MagicMock()
         mock_dics = [MagicMock()]
 
@@ -801,8 +851,10 @@ class TestEnableCommonBootImageImportSpecWaitForDataImportCron:
     @patch("utilities.hco.wait_for_at_least_one_auto_update_data_import_cron")
     @patch("utilities.hco.update_common_boot_image_import_spec")
     @patch("utilities.hco.Namespace")
+    @patch("utilities.hco.verify_boot_sources_reimported", return_value=True)
     def test_enable_spec(
         self,
+        mock_verify_boot,
         mock_namespace_class,
         mock_update_spec,
         mock_wait_dic,
@@ -821,6 +873,45 @@ class TestEnableCommonBootImageImportSpecWaitForDataImportCron:
         mock_wait_dic.assert_called_once()
         mock_wait_ssp.assert_called_once()
         mock_wait_hco.assert_called_once()
+        mock_verify_boot.assert_called_once_with(
+            admin_client=mock_admin_client,
+            namespace=mock_namespace.name,
+            consecutive_checks_count=1,
+            exclude_data_source_names=None,
+        )
+
+    @patch("utilities.hco.wait_for_hco_conditions")
+    @patch("utilities.hco.wait_for_ssp_conditions")
+    @patch("utilities.hco.wait_for_at_least_one_auto_update_data_import_cron")
+    @patch("utilities.hco.update_common_boot_image_import_spec")
+    @patch("utilities.hco.Namespace")
+    @patch("utilities.hco.verify_boot_sources_reimported", return_value=True)
+    def test_enable_spec_propagates_exclude_data_source_names(
+        self,
+        mock_verify_boot,
+        mock_namespace_class,
+        mock_update_spec,
+        mock_wait_dic,
+        mock_wait_ssp,
+        mock_wait_hco,
+    ):
+        """Test that exclude_data_source_names is forwarded to verify_boot_sources_reimported"""
+        mock_hco = MagicMock()
+        mock_hco.namespace = "openshift-cnv"
+        mock_admin_client = MagicMock()
+        mock_namespace = MagicMock()
+        exclude_names = {"custom-datasource"}
+
+        enable_common_boot_image_import_spec_wait_for_data_import_cron(
+            mock_hco, mock_admin_client, mock_namespace, exclude_data_source_names=exclude_names
+        )
+
+        mock_verify_boot.assert_called_once_with(
+            admin_client=mock_admin_client,
+            namespace=mock_namespace.name,
+            consecutive_checks_count=1,
+            exclude_data_source_names=exclude_names,
+        )
 
 
 class TestUpdateCommonBootImageImportSpec:
@@ -831,7 +922,7 @@ class TestUpdateCommonBootImageImportSpec:
     def test_update_spec_enable(self, mock_editor_class, mock_sampler):
         """Test enabling common boot image import spec"""
         mock_hco = MagicMock()
-        mock_hco.instance.spec = {"enableCommonBootImageImport": True}
+        mock_hco.instance.spec.workloadSources.enableCommonBootImageImport = True
 
         mock_editor = MagicMock()
         mock_editor_class.return_value = mock_editor
@@ -850,7 +941,7 @@ class TestUpdateCommonBootImageImportSpec:
     def test_update_spec_timeout(self, mock_editor_class, mock_sampler):
         """Test timeout when spec doesn't update"""
         mock_hco = MagicMock()
-        mock_hco.instance.spec = {"enableCommonBootImageImport": False}
+        mock_hco.instance.spec.workloadSources.enableCommonBootImageImport = False
 
         mock_editor = MagicMock()
         mock_editor_class.return_value = mock_editor
@@ -877,7 +968,9 @@ class TestUpdateHcoAnnotations:
         mock_editor.__exit__ = MagicMock(return_value=None)
         mock_editor_class.return_value = mock_editor
 
+        mock_client = MagicMock()
         with update_hco_annotations(
+            admin_client=mock_client,
             resource=mock_hco,
             path="machineType",
             value="pc-q35-rhel8.4.0",
@@ -885,6 +978,7 @@ class TestUpdateHcoAnnotations:
             pass
 
         mock_editor_class.assert_called_once()
+        assert mock_editor_class.call_args.kwargs["admin_client"] == mock_client
 
     @patch("utilities.hco.ResourceEditorValidateHCOReconcile")
     def test_update_annotations_with_existing(self, mock_editor_class):
@@ -898,7 +992,9 @@ class TestUpdateHcoAnnotations:
         mock_editor.__exit__ = MagicMock(return_value=None)
         mock_editor_class.return_value = mock_editor
 
+        mock_client = MagicMock()
         with update_hco_annotations(
+            admin_client=mock_client,
             resource=mock_hco,
             path="machineType",
             value="pc-q35-rhel8.4.0",
@@ -907,6 +1003,7 @@ class TestUpdateHcoAnnotations:
             pass
 
         mock_editor_class.assert_called_once()
+        assert mock_editor_class.call_args.kwargs["admin_client"] == mock_client
 
     @patch("utilities.hco.ResourceEditorValidateHCOReconcile")
     def test_update_annotations_overwrite(self, mock_editor_class):
@@ -919,7 +1016,9 @@ class TestUpdateHcoAnnotations:
         mock_editor.__exit__ = MagicMock(return_value=None)
         mock_editor_class.return_value = mock_editor
 
+        mock_client = MagicMock()
         with update_hco_annotations(
+            admin_client=mock_client,
             resource=mock_hco,
             path="machineType",
             value="pc-q35-rhel8.4.0",
@@ -928,6 +1027,118 @@ class TestUpdateHcoAnnotations:
             pass
 
         mock_editor_class.assert_called_once()
+        assert mock_editor_class.call_args.kwargs["admin_client"] == mock_client
+
+        mock_editor_class.assert_called_once()
+
+    @patch("utilities.hco.LOGGER")
+    @patch("utilities.hco.ResourceEditorValidateHCOReconcile")
+    def test_update_annotations_empty_array_existing(self, mock_editor_class, mock_logger):
+        """Test that existing '[]' annotation is not appended to — produces fresh patch, not '[,{...}]'"""
+        mock_hco = MagicMock()
+        mock_hco.instance.metadata = {"annotations": {"kubevirt.kubevirt.io/jsonpatch": "[]"}}
+
+        mock_editor = MagicMock()
+        mock_editor.__enter__ = MagicMock(return_value=mock_editor)
+        mock_editor.__exit__ = MagicMock(return_value=None)
+        mock_editor_class.return_value = mock_editor
+
+        with update_hco_annotations(
+            admin_client=MagicMock(),
+            resource=mock_hco,
+            path="migrations",
+            value={"disableTLS": True},
+        ):
+            pass
+
+        patches = mock_editor_class.call_args.kwargs["patches"]
+        annotation_value = patches[mock_hco]["metadata"]["annotations"]["kubevirt.kubevirt.io/jsonpatch"]
+        parsed = json.loads(annotation_value)
+        assert len(parsed) == 1
+        assert parsed[0]["path"] == "/spec/configuration/migrations"
+        mock_logger.warning.assert_not_called()
+
+    @patch("utilities.hco.LOGGER")
+    @patch("utilities.hco.ResourceEditorValidateHCOReconcile")
+    def test_update_annotations_invalid_json_existing(self, mock_editor_class, mock_logger):
+        """Test that invalid existing annotation produces warning and fresh patch"""
+        mock_hco = MagicMock()
+        mock_hco.instance.metadata = {"annotations": {"kubevirt.kubevirt.io/jsonpatch": "[,{invalid}"}}
+
+        mock_editor = MagicMock()
+        mock_editor.__enter__ = MagicMock(return_value=mock_editor)
+        mock_editor.__exit__ = MagicMock(return_value=None)
+        mock_editor_class.return_value = mock_editor
+
+        with update_hco_annotations(
+            admin_client=MagicMock(),
+            resource=mock_hco,
+            path="migrations",
+            value={"disableTLS": True},
+        ):
+            pass
+
+        patches = mock_editor_class.call_args.kwargs["patches"]
+        annotation_value = patches[mock_hco]["metadata"]["annotations"]["kubevirt.kubevirt.io/jsonpatch"]
+        parsed = json.loads(annotation_value)
+        assert len(parsed) == 1
+        mock_logger.warning.assert_called_once()
+
+    @patch("utilities.hco.ResourceEditorValidateHCOReconcile")
+    def test_update_annotations_valid_existing_merges_correctly(self, mock_editor_class):
+        """Test that valid non-empty existing annotation is merged via JSON list concat, not string slicing"""
+        mock_hco = MagicMock()
+        existing = json.dumps([{"op": "add", "path": "/spec/configuration/cpuModel", "value": "Haswell"}])
+        mock_hco.instance.metadata = {"annotations": {"kubevirt.kubevirt.io/jsonpatch": existing}}
+
+        mock_editor = MagicMock()
+        mock_editor.__enter__ = MagicMock(return_value=mock_editor)
+        mock_editor.__exit__ = MagicMock(return_value=None)
+        mock_editor_class.return_value = mock_editor
+
+        with update_hco_annotations(
+            admin_client=MagicMock(),
+            resource=mock_hco,
+            path="migrations",
+            value={"disableTLS": True},
+        ):
+            pass
+
+        patches = mock_editor_class.call_args.kwargs["patches"]
+        annotation_value = patches[mock_hco]["metadata"]["annotations"]["kubevirt.kubevirt.io/jsonpatch"]
+        parsed = json.loads(annotation_value)
+        assert len(parsed) == 2
+        assert parsed[0]["path"] == "/spec/configuration/cpuModel"
+        assert parsed[1]["path"] == "/spec/configuration/migrations"
+
+    @patch("utilities.hco.LOGGER")
+    @patch("utilities.hco.ResourceEditorValidateHCOReconcile")
+    def test_update_annotations_dict_existing(self, mock_editor_class, mock_logger):
+        """Test that existing annotation with valid JSON but non-list type (dict) produces warning and fresh patch"""
+        mock_hco = MagicMock()
+        mock_hco.instance.metadata = {
+            "annotations": {"kubevirt.kubevirt.io/jsonpatch": '{"op": "add", "path": "/spec/configuration/migrations"}'}
+        }
+
+        mock_editor = MagicMock()
+        mock_editor.__enter__ = MagicMock(return_value=mock_editor)
+        mock_editor.__exit__ = MagicMock(return_value=None)
+        mock_editor_class.return_value = mock_editor
+
+        with update_hco_annotations(
+            admin_client=MagicMock(),
+            resource=mock_hco,
+            path="migrations",
+            value={"disableTLS": True},
+        ):
+            pass
+
+        patches = mock_editor_class.call_args.kwargs["patches"]
+        annotation_value = patches[mock_hco]["metadata"]["annotations"]["kubevirt.kubevirt.io/jsonpatch"]
+        parsed = json.loads(annotation_value)
+        assert len(parsed) == 1
+        assert parsed[0]["path"] == "/spec/configuration/migrations"
+        mock_logger.warning.assert_called_once()
 
 
 class TestWaitForAutoBootConfigStabilization:
@@ -1052,7 +1263,7 @@ class TestEnabledAaqInHco:
         call_args = mock_editor_class.call_args
         patches = call_args[1]["patches"]
         assert mock_hco in patches
-        assert patches[mock_hco]["spec"]["enableApplicationAwareQuota"] is True
+        assert patches[mock_hco]["spec"]["deployment"]["applicationAwareConfig"]["enable"] is True
 
     @patch("utilities.hco.TimeoutSampler")
     @patch("utilities.hco.utilities.infra.get_pod_by_name_prefix")
@@ -1079,8 +1290,9 @@ class TestEnabledAaqInHco:
         # Verify ACRQ support is included
         call_args = mock_editor_class.call_args
         patches = call_args[1]["patches"]
-        assert patches[mock_hco]["spec"]["applicationAwareConfig"] == {
-            "allowApplicationAwareClusterResourceQuota": True
+        assert patches[mock_hco]["spec"]["deployment"]["applicationAwareConfig"] == {
+            "enable": True,
+            "allowApplicationAwareClusterResourceQuota": True,
         }
 
     @patch("utilities.hco.TimeoutSampler")
@@ -1104,5 +1316,193 @@ class TestEnabledAaqInHco:
         mock_sampler.return_value = mock_sampler_instance
 
         with pytest.raises(TimeoutExpiredError):
-            with enabled_aaq_in_hco(mock_client, mock_namespace, mock_hco):
+            with enabled_aaq_in_hco(
+                client=mock_client,
+                hco_namespace=mock_namespace,
+                hyperconverged_resource=mock_hco,
+            ):
                 pass
+
+    @patch("utilities.hco.LOGGER")
+    @patch("utilities.hco.TimeoutSampler")
+    @patch("utilities.hco.utilities.infra.get_pod_by_name_prefix")
+    @patch("utilities.hco.ResourceEditorValidateHCOReconcile")
+    def test_enable_aaq_handles_resource_not_found(self, mock_editor_class, mock_get_pod, mock_sampler, mock_logger):
+        mock_client = MagicMock()
+        mock_namespace = MagicMock()
+        mock_namespace.name = "openshift-cnv"
+        mock_hco = MagicMock()
+
+        mock_editor = MagicMock()
+        mock_editor.__enter__ = MagicMock(return_value=mock_editor)
+        mock_editor.__exit__ = MagicMock(return_value=None)
+        mock_editor_class.return_value = mock_editor
+
+        mock_sampler_instance = MagicMock()
+        mock_sampler_instance.__iter__ = MagicMock(side_effect=ResourceNotFoundError("not found"))
+        mock_sampler.return_value = mock_sampler_instance
+
+        with enabled_aaq_in_hco(
+            client=mock_client,
+            hco_namespace=mock_namespace,
+            hyperconverged_resource=mock_hco,
+        ):
+            pass
+
+        mock_logger.info.assert_called_with("AAQ system PODs removed.")
+
+
+_SAMPLE_FG_DESCRIPTION = """
+A list of FeatureGates.
+
+* GA: the feature is graduated and is always enabled.
+* deprecated: the feature is no longer supported.
+
+Feature-Gate list:
+* decentralizedLiveMigration:
+  DecentralizedLiveMigration enables cross-cluster migration.
+  Phase: beta
+
+* downwardMetrics:
+  Allow to expose a limited set of host metrics to guests.
+  Phase: alpha
+
+* autoResourceLimits:
+  Deprecated: this feature gate is ignored.
+  Phase: deprecated
+"""
+
+
+class TestGetHcoFeatureGates:
+    def test_missing_feature_gates_returns_empty_list(self):
+        mock_hco = MagicMock()
+        mock_hco.instance.to_dict.return_value = {"spec": {}}
+        assert get_hco_feature_gates(hco=mock_hco) == []
+
+    def test_none_feature_gates_returns_empty_list(self):
+        mock_hco = MagicMock()
+        mock_hco.instance.to_dict.return_value = {"spec": {"featureGates": None}}
+        assert get_hco_feature_gates(hco=mock_hco) == []
+
+    def test_list_passthrough(self):
+        gates = [{"name": "downwardMetrics"}]
+        mock_hco = MagicMock()
+        mock_hco.instance.to_dict.return_value = {"spec": {"featureGates": gates}}
+        assert get_hco_feature_gates(hco=mock_hco) == gates
+
+    def test_non_list_raises_type_error(self):
+        mock_hco = MagicMock()
+        mock_hco.instance.to_dict.return_value = {"spec": {"featureGates": {"downwardMetrics": True}}}
+        with pytest.raises(TypeError, match="must be a list"):
+            get_hco_feature_gates(hco=mock_hco)
+
+
+class TestParseHcoFgPhases:
+    def _phases_from_description(self, description: str) -> dict[str, str]:
+        mock_crd = MagicMock()
+        mock_crd.instance.to_dict.return_value = {
+            "spec": {
+                "versions": [
+                    {
+                        "name": Resource.ApiVersion.V1,
+                        "schema": {
+                            "openAPIV3Schema": {
+                                "properties": {"spec": {"properties": {"featureGates": {"description": description}}}}
+                            }
+                        },
+                    }
+                ]
+            }
+        }
+        with patch("utilities.hco.CustomResourceDefinition", return_value=mock_crd):
+            return parse_hco_fg_phases(admin_client=MagicMock())
+
+    def test_parses_phases_after_feature_gate_list_header(self):
+        phases = self._phases_from_description(description=_SAMPLE_FG_DESCRIPTION)
+        assert phases["decentralizedLiveMigration"] == "beta"
+        assert phases["downwardMetrics"] == "alpha"
+        assert phases["autoResourceLimits"] == "deprecated"
+        assert "GA" not in phases
+        assert "deprecated" not in phases
+
+    def test_empty_description_raises(self):
+        with pytest.raises(ValueError, match="Failed to parse feature gate phases"):
+            self._phases_from_description(description="no gates here")
+
+
+class TestIsFeatureGateEnabled:
+    def _hco_with_gates(self, gates):
+        mock_hco = MagicMock()
+        mock_hco.instance.to_dict.return_value = {"spec": {"featureGates": gates}}
+        return mock_hco
+
+    def test_present_enabled_omitted_state(self):
+        mock_hco = self._hco_with_gates(gates=[{"name": "downwardMetrics"}])
+        assert is_feature_gate_enabled(hco_resource=mock_hco, name="downwardMetrics") is True
+
+    def test_present_disabled(self):
+        mock_hco = self._hco_with_gates(gates=[{"name": "declarativeHotplugVolumes", "state": "Disabled"}])
+        assert is_feature_gate_enabled(hco_resource=mock_hco, name="declarativeHotplugVolumes") is False
+
+    @patch("utilities.hco.parse_hco_fg_phases", return_value={"videoConfig": "beta"})
+    def test_absent_beta_is_enabled(self, mock_parse_phases):
+        mock_hco = self._hco_with_gates(gates=[])
+        assert is_feature_gate_enabled(hco_resource=mock_hco, name="videoConfig") is True
+        mock_parse_phases.assert_called_once()
+
+    @patch("utilities.hco.parse_hco_fg_phases", return_value={"downwardMetrics": "alpha"})
+    def test_absent_alpha_is_disabled(self, mock_parse_phases):
+        mock_hco = self._hco_with_gates(gates=[])
+        assert is_feature_gate_enabled(hco_resource=mock_hco, name="downwardMetrics") is False
+
+    @patch("utilities.hco.parse_hco_fg_phases", return_value={"autoResourceLimits": "deprecated"})
+    def test_absent_deprecated_is_disabled(self, mock_parse_phases):
+        mock_hco = self._hco_with_gates(gates=[])
+        assert is_feature_gate_enabled(hco_resource=mock_hco, name="autoResourceLimits") is False
+
+    @patch("utilities.hco.parse_hco_fg_phases", return_value={"videoConfig": "beta"})
+    def test_unknown_name_raises_key_error(self, mock_parse_phases):
+        mock_hco = self._hco_with_gates(gates=[])
+        with pytest.raises(KeyError, match="notARealGate"):
+            is_feature_gate_enabled(hco_resource=mock_hco, name="notARealGate")
+
+    @patch("utilities.hco.parse_hco_fg_phases", return_value={"weirdGate": "ga"})
+    def test_unknown_phase_raises_value_error(self, mock_parse_phases):
+        mock_hco = self._hco_with_gates(gates=[])
+        with pytest.raises(ValueError, match="Unknown feature gate phase"):
+            is_feature_gate_enabled(hco_resource=mock_hco, name="weirdGate")
+
+
+class TestHcoFeatureGatesPatch:
+    def _hco_with_gates(self, gates):
+        mock_hco = MagicMock()
+        mock_hco.instance.to_dict.return_value = {"spec": {"featureGates": gates}}
+        return mock_hco
+
+    def test_enable_omits_state(self):
+        mock_hco = self._hco_with_gates(gates=[])
+        patch = hco_feature_gates_patch(hco_resource=mock_hco, enable=["downwardMetrics"])
+        assert patch == {"spec": {"featureGates": [{"name": "downwardMetrics"}]}}
+
+    def test_disable_sets_disabled_state(self):
+        mock_hco = self._hco_with_gates(gates=[])
+        patch = hco_feature_gates_patch(hco_resource=mock_hco, disable=["declarativeHotplugVolumes"])
+        assert patch == {"spec": {"featureGates": [{"name": "declarativeHotplugVolumes", "state": "Disabled"}]}}
+
+    def test_read_modify_write_keeps_unrelated_entries(self):
+        mock_hco = self._hco_with_gates(gates=[{"name": "downwardMetrics"}])
+        patch = hco_feature_gates_patch(hco_resource=mock_hco, disable=["videoConfig"])
+        assert patch["spec"]["featureGates"] == [
+            {"name": "downwardMetrics"},
+            {"name": "videoConfig", "state": "Disabled"},
+        ]
+
+    def test_enable_replaces_existing_entry_for_same_gate(self):
+        mock_hco = self._hco_with_gates(gates=[{"name": "downwardMetrics", "state": "Disabled"}])
+        patch = hco_feature_gates_patch(hco_resource=mock_hco, enable=["downwardMetrics"])
+        assert patch == {"spec": {"featureGates": [{"name": "downwardMetrics"}]}}
+
+    def test_empty_enable_and_disable_raises(self):
+        mock_hco = self._hco_with_gates(gates=[])
+        with pytest.raises(ValueError, match="At least one gate"):
+            hco_feature_gates_patch(hco_resource=mock_hco)

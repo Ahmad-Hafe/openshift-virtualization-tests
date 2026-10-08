@@ -9,12 +9,13 @@ import re
 import secrets
 import shlex
 from collections import defaultdict
+from collections.abc import Generator
 from contextlib import contextmanager
+from copy import deepcopy
+from functools import cache
 from json import JSONDecodeError
-from subprocess import run
-from typing import TYPE_CHECKING, Any, Dict, List, Optional
+from typing import TYPE_CHECKING, Any
 
-import bitmath
 import jinja2
 import pexpect
 import yaml
@@ -22,13 +23,15 @@ from benedict import benedict
 from kubernetes.client import ApiException
 from kubernetes.dynamic import DynamicClient
 from kubernetes.dynamic.exceptions import NotFoundError
+from kubernetes.utils.quantity import parse_quantity
 from ocp_resources.daemonset import DaemonSet
+from ocp_resources.data_source import DataSource
 from ocp_resources.datavolume import DataVolume
 from ocp_resources.kubevirt import KubeVirt
 from ocp_resources.namespace import Namespace
 from ocp_resources.node import Node
 from ocp_resources.pod import Pod
-from ocp_resources.resource import Resource, ResourceEditor, get_client
+from ocp_resources.resource import Resource, ResourceEditor
 from ocp_resources.service import Service
 from ocp_resources.storage_profile import StorageProfile
 from ocp_resources.template import Template
@@ -47,27 +50,42 @@ from timeout_sampler import TimeoutExpiredError, TimeoutSampler
 
 import utilities.cpu
 import utilities.data_utils
+import utilities.hco
 import utilities.infra
+from libs.net.cluster import is_ipv6_single_stack_cluster
+from utilities.artifactory import get_test_artifact_server_url
+from utilities.cluster import cache_admin_client
 from utilities.console import Console
-from utilities.constants import (
-    CLOUD_INIT_DISK_NAME,
-    CLOUD_INIT_NO_CLOUD,
-    CNV_VM_SSH_KEY_PATH,
+from utilities.constants import Images
+from utilities.constants.architecture import (
+    LINUX_AMD_64,
+    MULTIARCH,
+)
+from utilities.constants.components import (
+    VIRT_API,
+    VIRT_HANDLER,
+    VIRT_LAUNCHER,
+    VIRT_OPERATOR,
+)
+from utilities.constants.hco import (
     DATA_SOURCE_NAME,
     DATA_SOURCE_NAMESPACE,
     DEFAULT_KUBEVIRT_CONDITIONS,
-    DV_DISK,
-    EVICTIONSTRATEGY,
-    IP_FAMILY_POLICY_PREFER_DUAL_STACK,
-    LINUX_AMD_64,
-    LINUX_STR,
+)
+from utilities.constants.images import (
     OS_FLAVOR_ALPINE,
     OS_FLAVOR_CIRROS,
     OS_FLAVOR_FEDORA,
     OS_FLAVOR_WINDOWS,
-    OS_PROC_NAME,
-    ROOTDISK,
+    ArchImages,
+)
+from utilities.constants.instance_types import LINUX_STR
+from utilities.constants.networking import (
+    IP_FAMILY_POLICY_PREFER_DUAL_STACK,
     SSH_PORT_22,
+)
+from utilities.constants.os_matrix import DATA_SOURCE_STR
+from utilities.constants.timeouts import (
     TCP_TIMEOUT_30SEC,
     TIMEOUT_1MIN,
     TIMEOUT_1SEC,
@@ -83,14 +101,32 @@ from utilities.constants import (
     TIMEOUT_12MIN,
     TIMEOUT_25MIN,
     TIMEOUT_30MIN,
-    VIRT_HANDLER,
-    VIRT_LAUNCHER,
-    VIRTCTL,
-    Images,
 )
-from utilities.data_collector import collect_vnc_screenshot_for_vms
-from utilities.hco import wait_for_hco_conditions
-from utilities.storage import get_default_storage_class
+from utilities.constants.virt import (
+    CLOUD_INIT_DISK_NAME,
+    CLOUD_INIT_NO_CLOUD,
+    CNV_VM_SSH_KEY_PATH,
+    DESCHEDULER_PREFER_NO_EVICTION_ANNOTATION,
+    DV_DISK,
+    ES_LIVE_MIGRATE_IF_POSSIBLE,
+    ES_NONE,
+    EVICTIONSTRATEGY,
+    OS_PROC_NAME,
+    ROOTDISK,
+    VIRTCTL,
+)
+from utilities.data_collector import collect_must_gather_for_vm, collect_vnc_screenshot_for_vms
+from utilities.exceptions import MigrationFailedError, MigrationStuckSchedulingError, ResourceValueError
+from utilities.network import (
+    cloud_init_network_data,
+)
+from utilities.storage import (
+    create_dv,
+    create_or_update_data_source,
+    data_volume_template_with_source_ref_dict,
+    get_default_storage_class,
+    get_storage_class_dict_from_matrix,
+)
 
 if TYPE_CHECKING:
     from libs.vm.vm import BaseVirtualMachine
@@ -273,6 +309,8 @@ class VirtualMachineForTests(VirtualMachine):
         hugepages_page_size=None,
         vm_affinity=None,
         annotations=None,
+        label=None,
+        exclude_from_descheduler: bool = False,
     ):
         """
         Virtual machine creation
@@ -354,6 +392,10 @@ class VirtualMachineForTests(VirtualMachine):
             hugepages_page_size (str, optional) defines the size of huge pages,Valid values are 2 Mi and 1 Gi
             vm_affinity (dict, optional): If affinity is specifies, obey all the affinity rules
             annotations (dict, optional): annotations to be added to the VM
+            label (dict, optional): labels to be added to VM metadata (not the VMI template)
+            exclude_from_descheduler (bool, optional): if True, exclude the VM from the descheduler.
+                Non-migratable VMs (eviction_strategy "None" or "LiveMigrateIfPossible") are always
+                excluded. Defaults to False.
         """
         # Sets VM unique name - replaces "." with "-" in the name to handle valid values.
 
@@ -367,6 +409,7 @@ class VirtualMachineForTests(VirtualMachine):
             node_selector=node_selector,
             node_selector_labels=node_selector_labels,
             yaml_file=yaml_file,
+            label=label,
         )
         self.body = body
         self.interfaces = interfaces or []
@@ -433,6 +476,7 @@ class VirtualMachineForTests(VirtualMachine):
         self.hugepages_page_size = hugepages_page_size
         self.vm_affinity = vm_affinity
         self.annotations = annotations
+        self.exclude_from_descheduler = exclude_from_descheduler
 
         # Must be here to apply on existing VMs
         self.set_login_params()
@@ -500,6 +544,15 @@ class VirtualMachineForTests(VirtualMachine):
                     template_spec = self.enable_ssh_in_cloud_init_data(template_spec=template_spec)
                 if self.ssh_secret:
                     template_spec = self.update_vm_ssh_secret_configuration(template_spec=template_spec)
+
+        self._set_descheduler_exclusion()
+
+    def _set_descheduler_exclusion(self) -> None:
+        effective_eviction_strategy = self.res["spec"]["template"]["spec"].get(EVICTIONSTRATEGY)
+        if self.exclude_from_descheduler or effective_eviction_strategy in (ES_NONE, ES_LIVE_MIGRATE_IF_POSSIBLE):
+            LOGGER.info(f"Setting descheduler exclusion annotation on VM {self.name}")
+            template_annotations = self.res["spec"]["template"].setdefault("metadata", {}).setdefault("annotations", {})
+            template_annotations[DESCHEDULER_PREFER_NO_EVICTION_ANNOTATION] = "true"
 
     def set_hugepages_page_size(self, template_spec):
         if self.hugepages_page_size:
@@ -692,10 +745,15 @@ class VirtualMachineForTests(VirtualMachine):
         if self.body:
             if self.body.get("metadata"):
                 # We must set name in Template, since we use a unique name here we override it.
-                self.res["metadata"] = self.body["metadata"]
+                # deepcopy so label/annotation merges do not mutate the caller-owned body.
+                self.res["metadata"] = deepcopy(self.body["metadata"])
                 self.res["metadata"]["name"] = self.name
 
             self.res["spec"] = self.body["spec"]
+
+            # body metadata replaces self.res["metadata"]; re-apply caller-provided root metadata.
+            if self.label:
+                self.res["metadata"].setdefault("labels", {}).update(self.label)
 
             if self.annotations:
                 self.res["metadata"].setdefault("annotations", {}).update(self.annotations)
@@ -720,7 +778,7 @@ class VirtualMachineForTests(VirtualMachine):
             LOGGER.warning(
                 "Setting both memory.guest and requests.memory values! (Users should set VM memory via memory.guest!)"
             )
-            if bitmath.parse_string_unsafe(self.memory_guest) > bitmath.parse_string_unsafe(self.memory_requests):
+            if parse_quantity(self.memory_guest) > parse_quantity(self.memory_requests):
                 LOGGER.warning(
                     "Setting memory.guest bigger then requests.memory! (This might cause unpredictable issues!)"
                 )
@@ -771,7 +829,94 @@ class VirtualMachineForTests(VirtualMachine):
 
         return template_spec
 
+    def _apply_ipv6_masquerade_cloud_init(self) -> None:
+        """Apply default IPv6 cloud-init network configuration for the masquerade interface.
+
+        Configures both eth0 and enp1s0 with a fixed IPv6 address and gateway to enable
+        SSH on IPv6 single-stack clusters. Both interface names are configured since
+        naming is not predictable across VMs. If networkData already exists in
+        cloud_init_data, the masquerade interfaces are merged without overriding
+        user-defined eth0 or enp1s0 values.
+        """
+        if not self.cloud_init_data:
+            self.cloud_init_data = {}
+
+        primary_interface_data = {
+            "addresses": ["fd10:0:2::2/120"],
+            "gateway6": "fd10:0:2::1",
+            "dhcp4": False,
+            "dhcp6": False,
+        }
+
+        # Configure both interface names to ensure network configuration is applied as naming is not predictable
+        ipv6_interfaces = {
+            "eth0": {"match": {"name": "eth0"}, **primary_interface_data},
+            "enp1s0": {"match": {"name": "enp1s0"}, **primary_interface_data},
+        }
+
+        if "networkData" in self.cloud_init_data:
+            existing_ethernets = self.cloud_init_data["networkData"].get("ethernets", {})
+            merged_ethernets = {**ipv6_interfaces, **existing_ethernets}
+            self.cloud_init_data["networkData"]["ethernets"] = merged_ethernets
+
+            if "version" not in self.cloud_init_data["networkData"]:
+                self.cloud_init_data["networkData"]["version"] = 2
+        else:
+            self.cloud_init_data.update(cloud_init_network_data(data={"ethernets": ipv6_interfaces}))
+
     def update_vm_cloud_init_data(self, template_spec):
+        """Update the VM template spec with cloud-init data.
+
+        On IPv6 single-stack clusters, applies default IPv6 network
+        configuration before merging any user-provided cloud-init data.
+
+        If the template spec already contains cloud-init data, userData is
+        appended and networkData is replaced. Otherwise the generated cloud-init
+        data is set directly.
+
+        Args:
+            template_spec (dict): The VM template spec to update.
+
+        Returns:
+            dict: The updated template spec.
+
+        Example:
+            IPv6 single-stack cluster result (networkData injected automatically)::
+
+                - cloudInitNoCloud:
+                    networkData: |
+                      ethernets:
+                        enp1s0: &id001
+                          addresses:
+                          - fd10:0:2::2/120
+                          dhcp4: false
+                          dhcp6: false
+                          gateway6: fd10:0:2::1
+                        eth0: *id001
+                      version: 2
+                    userData: |-
+                      #cloud-config
+                      chpasswd:
+                        expire: false
+                      password: password
+                      user: fedora
+                  name: cloudinitdisk
+
+            Non-IPv6-only cluster result (userData only, no networkData injected)::
+
+                - cloudInitNoCloud:
+                    userData: |-
+                      #cloud-config
+                      chpasswd:
+                        expire: false
+                      password: password
+                      user: fedora
+                  name: cloudinitdisk
+        """
+        if is_ipv6_single_stack_cluster():
+            LOGGER.info(f"IPv6 single-stack cluster detected, applying default IPv6 cloud-init for VM {self.name}")
+            self._apply_ipv6_masquerade_cloud_init()
+
         if self.cloud_init_data:
             cloud_init_volume = vm_cloud_init_volume(vm_spec=template_spec)
             cloud_init_volume_type = self.cloud_init_type or CLOUD_INIT_NO_CLOUD
@@ -779,9 +924,12 @@ class VirtualMachineForTests(VirtualMachine):
             existing_cloud_init_data = cloud_init_volume.get(cloud_init_volume_type)
             # If spec already contains cloud init data
             if existing_cloud_init_data:
-                cloud_init_volume[cloud_init_volume_type]["userData"] += generated_cloud_init["userData"].strip(
-                    "#cloud-config"
-                )
+                if "userData" in generated_cloud_init:
+                    cloud_init_volume[cloud_init_volume_type]["userData"] += generated_cloud_init[
+                        "userData"
+                    ].removeprefix("#cloud-config\n")
+                if "networkData" in generated_cloud_init:
+                    cloud_init_volume[cloud_init_volume_type]["networkData"] = generated_cloud_init["networkData"]
             else:
                 cloud_init_volume[cloud_init_volume_type] = generated_cloud_init
 
@@ -857,7 +1005,7 @@ class VirtualMachineForTests(VirtualMachine):
     def update_vm_cpu_configuration(self, template_spec):
         # cpu settings
         if self.cpu_flags:
-            template_spec.setdefault("domain", {})["cpu"] = self.cpu_flags
+            template_spec.setdefault("domain", {})["cpu"] = deepcopy(self.cpu_flags)
 
         if self.cpu_limits:
             template_spec.setdefault("domain", {}).setdefault("resources", {}).setdefault("limits", {})
@@ -995,6 +1143,7 @@ class VirtualMachineForTests(VirtualMachine):
         To use the service: custom_service.service_ip() and custom_service.service_port
         """
         self.custom_service = ServiceForVirtualMachineForTests(
+            client=self.client,
             name=f"{service_name}-{self.name}"[:63],
             namespace=self.namespace,
             vm=self,
@@ -1015,8 +1164,9 @@ class VirtualMachineForTests(VirtualMachine):
                 sc_name = self.vm_preference.instance.spec.get("volumes", {}).get("preferredStorageClassName")
                 if sc_name:
                     return sc_name
-            else:
-                return get_default_storage_class().name
+            default_sc = get_default_storage_class(client=self.client).name
+            LOGGER.info(f"Using default storage class: {default_sc} for access mode field")
+            return default_sc
 
         api_name = "pvc" if self.data_volume_template and self.data_volume_template["spec"].get("pvc") else "storage"
         return (
@@ -1025,7 +1175,9 @@ class VirtualMachineForTests(VirtualMachine):
             else self.pvc.instance.spec.accessModes
             if self.pvc
             else self.data_volume_template["spec"][api_name].get("accessModes")
-            or StorageProfile(name=_sc_name_for_storage_api()).instance.status["claimPropertySets"][0]["accessModes"]
+            or StorageProfile(client=self.client, name=_sc_name_for_storage_api()).instance.status["claimPropertySets"][
+                0
+            ]["accessModes"]
         )
 
     @property
@@ -1094,10 +1246,6 @@ class VirtualMachineForTests(VirtualMachine):
             LOGGER.error(f"Status of {self.kind} {self.name} is {status}")
             raise
 
-    @property
-    def privileged_vmi(self):
-        return VirtualMachineInstance(client=get_client(), name=self.name, namespace=self.namespace)
-
     def wait_for_agent_connected(self, timeout: int = TIMEOUT_5MIN):
         self.vmi.wait_for_condition(
             condition=VirtualMachineInstance.Condition.Type.AGENT_CONNECTED,
@@ -1112,6 +1260,7 @@ class VirtualMachineForTestsFromTemplate(VirtualMachineForTests):
         name,
         namespace,
         client,
+        admin_client=None,
         eviction_strategy=None,
         labels=None,
         data_source=None,
@@ -1164,11 +1313,13 @@ class VirtualMachineForTestsFromTemplate(VirtualMachineForTests):
         tpm_params=None,
         additional_labels=None,
         vm_affinity=None,
+        exclude_from_descheduler: bool = False,
     ):
-        """
-        VM creation using common templates.
+        """VM creation using common templates.
 
         Args:
+            admin_client (Client, optional): Admin client to use for processing templates.
+                Can be used in multi-cluster (CCLM) tests.
             eviction_strategy (str, optional): valid options("None", "LiveMigrate", "LiveMigrateIfPossible", "External")
                 Default value None here is same as Null and not the string "None" which is one of the valid options
             data_source (obj `DataSource`): DS object points to a golden image PVC.
@@ -1185,8 +1336,6 @@ class VirtualMachineForTestsFromTemplate(VirtualMachineForTests):
             non_existing_pvc(bool, default=False): If True, referenced PVC in DataSource is missing
             data_volume_template_from_vm_spec (bool, default=False): Use (and don't manipulate) VM's DataVolumeTemplates
             vm_affinity (dict, optional): Affinity rules for scheduling the VM on specific nodes
-        Returns:
-            obj `VirtualMachine`: VM resource
         """
         # Must be set here to set VM flavor (used to set username and password)
         self.template_labels = labels
@@ -1238,7 +1387,9 @@ class VirtualMachineForTestsFromTemplate(VirtualMachineForTests):
             additional_labels=additional_labels,
             vm_affinity=vm_affinity,
             os_flavor=self.os_flavor,
+            exclude_from_descheduler=exclude_from_descheduler,
         )
+        self.admin_client = admin_client
         self.data_source = data_source
         self.data_volume_template = data_volume_template
         self.existing_data_volume = existing_data_volume
@@ -1317,9 +1468,13 @@ class VirtualMachineForTestsFromTemplate(VirtualMachineForTests):
         # To apply this logic, self.access_modes should be available.
         if not self.sno_cluster and (not self.eviction_strategy and not (self.diskless_vm or self.non_existing_pvc)):
             if not self.access_modes:
-                self.access_modes = get_default_storage_class().storage_profile.first_claim_property_set_access_modes()
+                self.access_modes = get_default_storage_class(
+                    client=self.client
+                ).storage_profile.first_claim_property_set_access_modes()
             if DataVolume.AccessMode.RWX not in self.access_modes:
                 spec[EVICTIONSTRATEGY] = "None"
+
+        self._set_descheduler_exclusion()
 
     def _update_vm_storage_config(self, spec, name):
         # volume name should be updated
@@ -1368,7 +1523,10 @@ class VirtualMachineForTestsFromTemplate(VirtualMachineForTests):
         if self.template_params:
             template_kwargs.update(self.template_params)
 
-        resources_list = template_object.process(client=get_client(), **template_kwargs)
+        # Processing a Template (server-side substitution, nothing persisted) requires "create" on
+        # processedtemplates in the template's own namespace (e.g. "openshift"), which self.client
+        # (e.g. unprivileged_client) may not have. The VM object itself is still created with self.client.
+        resources_list = template_object.process(client=self.admin_client or cache_admin_client(), **template_kwargs)
         for resource in resources_list:
             if resource["kind"] == VirtualMachine.kind and resource["metadata"]["name"] == self.name:
                 return resource
@@ -1396,8 +1554,8 @@ def vm_console_run_commands(
         Dict of the commands outputs, where the key is the command and the value is the output as a list of lines.
     """
     output = {}
-    # Source: https://www.tutorialspoint.com/how-can-i-remove-the-ansi-escape-sequences-from-a-string-in-python
-    ansi_escape = re.compile(r"(\x9B|\x1B\[)[0-?]*[ -\/]*[@-~]")
+    # Strip CSI (ESC[…) and OSC (ESC]…BEL/ST) terminal escape sequences
+    ansi_escape = re.compile(r"(\x9B|\x1B\[)[0-?]*[ -\/]*[@-~]|\x1B\][^\x07\x1B]*(?:\x07|\x1B\\)")
     prompt = r"\$ "
     with Console(vm=vm, prompt=prompt) as vmc:
         for command in commands:
@@ -1423,26 +1581,33 @@ def vm_console_run_commands(
 def fedora_vm_body(name: str) -> dict[str, Any]:
     pull_secret = utilities.infra.generate_openshift_pull_secret_file()
 
-    # Make sure we can find the file even if utilities was installed via pip.
-    yaml_file = os.path.abspath("utilities/manifests/vm-fedora.yaml")
-
-    with open(yaml_file) as fd:
-        data = fd.read()
-
-    image = Images.Fedora.FEDORA_CONTAINER_IMAGE
+    image = getattr(ArchImages, py_config["cpu_arch"].upper()).Fedora.FEDORA_CONTAINER_IMAGE
     image_info = get_oc_image_info(
         image=image,
         pull_secret=pull_secret,
-        architecture=utilities.cpu.get_nodes_cpu_architecture(
-            nodes=list(Node.get(dyn_client=get_client())),
-        ),
+        architecture=py_config["cpu_arch"],
     )
     image_digest = image_info["digest"]
-    return generate_dict_from_yaml_template(
-        stream=io.StringIO(data),
-        name=name,
-        image=f"{image}@{image_digest}",
-    )
+
+    # TODO: Move to jinja2 template
+    if py_config["cluster_type"] == MULTIARCH:
+        with open(os.path.abspath("utilities/manifests/vm-fedora-multiarch.yaml")) as fd:
+            data = fd.read()
+
+        return generate_dict_from_yaml_template(
+            stream=io.StringIO(data),
+            name=name,
+            image=f"{image}@{image_digest}",
+            arch=py_config["cpu_arch"],
+        )
+    else:
+        with open(os.path.abspath("utilities/manifests/vm-fedora.yaml")) as fd:
+            data = fd.read()
+        return generate_dict_from_yaml_template(
+            stream=io.StringIO(data),
+            name=name,
+            image=f"{image}@{image_digest}",
+        )
 
 
 def kubernetes_taint_exists(node):
@@ -1454,6 +1619,7 @@ def kubernetes_taint_exists(node):
 class ServiceForVirtualMachineForTests(Service):
     def __init__(
         self,
+        client,
         name,
         namespace,
         vm,
@@ -1466,6 +1632,7 @@ class ServiceForVirtualMachineForTests(Service):
         dry_run=None,
     ):
         super().__init__(
+            client=client,
             name=name,
             namespace=namespace,
             teardown=teardown,
@@ -1492,7 +1659,20 @@ class ServiceForVirtualMachineForTests(Service):
         if self.ip_families:
             self.res["spec"]["ipFamilies"] = self.ip_families
 
-    def service_ip(self, ip_family=None):
+    def service_ip(self, admin_client: DynamicClient, ip_family: str | None = None) -> str:
+        """
+        Get the IP address of the service.
+
+        Args:
+            admin_client (DynamicClient): admin client to be used for the service.
+            ip_family (str | None): IP family to be used for the service.
+
+        Returns:
+            str: IP address of the service.
+
+        Raises:
+            ResourceValueError: If the service IP cannot be retrieved.
+        """
         if self.service_type == Service.Type.CLUSTER_IP:
             if ip_family:
                 cluster_ips = [
@@ -1505,11 +1685,8 @@ class ServiceForVirtualMachineForTests(Service):
 
             return self.instance.spec.clusterIP
 
-        vm_node = Node(
-            client=get_client(),
-            name=self.vmi.instance.status.nodeName,
-        )
         if self.service_type == Service.Type.NODE_PORT:
+            vm_node = self.vm.vmi.get_node(privileged_client=admin_client)
             if ip_family:
                 internal_ips = [
                     internal_ip
@@ -1520,6 +1697,10 @@ class ServiceForVirtualMachineForTests(Service):
                 return internal_ips[0]
 
             return self.target_ip or vm_node.internal_ip
+
+        raise ResourceValueError(
+            f"Could not get service IP for service {self.vm.custom_service.name} with type {self.service_type}"
+        )
 
     @property
     def service_port(self):
@@ -1538,7 +1719,7 @@ def wait_for_ssh_connectivity(
 
     for sample in TimeoutSampler(
         wait_timeout=timeout,
-        sleep=5,
+        sleep=TIMEOUT_5SEC,
         func=vm.ssh_exec.run_command,
         command=["exit"],
         tcp_timeout=tcp_timeout,
@@ -1569,7 +1750,7 @@ def generate_dict_from_yaml_template(stream, **kwargs):
     # Find all template variables
     template_vars = [i.split()[1] for i in re.findall(r"{{ .* }}", data)]
     for var in template_vars:
-        if var not in kwargs.keys():
+        if var not in kwargs:
             raise MissingTemplateVariables(var=var, template=data)
     template = jinja2.Template(data)
     out = template.render(**kwargs)
@@ -1676,6 +1857,9 @@ def wait_for_running_vm(
     """
     Wait for the VMI to be in Running state.
 
+    On timeout, collects a VNC screenshot and a VM-incident must-gather
+    archive before re-raising the exception.
+
     Args:
         vm (VirtualMachine): VM object.
         wait_until_running_timeout (int): how much time to wait for VMI to reach Running state
@@ -1684,7 +1868,8 @@ def wait_for_running_vm(
         ssh_timeout (int): how much time to wait for SSH connectivity
 
     Raises:
-        TimeoutExpiredError: After timeout is reached for any of the steps
+        TimeoutExpiredError: After timeout is reached for any of the steps.
+            VNC screenshot and must-gather artifacts are collected before re-raising.
     """
     assert_vm_not_error_status(vm=vm)
     try:
@@ -1696,7 +1881,8 @@ def wait_for_running_vm(
         if check_ssh_connectivity:
             wait_for_ssh_connectivity(vm=vm, timeout=ssh_timeout)
     except TimeoutExpiredError:
-        collect_vnc_screenshot_for_vms(vm_name=vm.name, vm_namespace=vm.namespace)  # type: ignore[arg-type]
+        collect_vnc_screenshot_for_vms(vm=vm)
+        collect_must_gather_for_vm(vm=vm)
         raise
 
 
@@ -1786,19 +1972,19 @@ def wait_for_cloud_init_complete(vm, timeout=TIMEOUT_4MIN):
 
 def migrate_vm_and_verify(
     vm: VirtualMachineForTests | BaseVirtualMachine,
-    client: DynamicClient | None = None,
+    client: DynamicClient,
     timeout: int = TIMEOUT_12MIN,
     wait_for_interfaces: bool = True,
     check_ssh_connectivity: bool = False,
     wait_for_migration_success: bool = True,
 ) -> VirtualMachineInstanceMigration | None:
-    """
-    Create a migration instance. You may choose to wait for migration
-    success or not.
+    """Migrate VM and verify migration success.
 
     Args:
         vm (VirtualMachine): VM to be migrated.
-        client (DynamicClient, default=None): Client to use for migration.
+        client (DynamicClient): Client to use for migration.
+            Note: Only Cluster Admin (admin_client) can migrate VM.
+            Namespace Admin (unprivileged_client) cannot migrate VM (unless assigned kubevirt.io:migrate RoleBinding).
         timeout (int, default=12 minutes): Maximum time to wait for the migration to finish.
         wait_for_interfaces (bool, default=True): Wait for VM network interfaces after migration completes.
         check_ssh_connectivity (bool, default=False): Verify SSH connectivity to the VM after migration completes.
@@ -1822,54 +2008,96 @@ def migrate_vm_and_verify(
     ) as migration:
         if not wait_for_migration_success:
             return migration
-        wait_for_migration_finished(namespace=vm.namespace, migration=migration, timeout=timeout)
+        wait_for_migration_finished(migration=migration, timeout=timeout)
 
     verify_vm_migrated(
         vm=vm,
         node_before=node_before,
         wait_for_interfaces=wait_for_interfaces,
         check_ssh_connectivity=check_ssh_connectivity,
+        admin_client=client,
     )
     return None
 
 
-def wait_for_migration_finished(namespace, migration, timeout=TIMEOUT_12MIN):
+def set_vm_affinity(vm: VirtualMachineForTests, affinity: dict[str, Any]) -> None:
+    """Update the VM template node affinity in-place via a strategic merge patch.
+
+    Args:
+        vm (VirtualMachineForTests): The VM whose template affinity should be replaced.
+        affinity (dict[str, Any]): Kubernetes affinity dict to apply (e.g. RHCOS9_AFFINITY or RHCOS10_AFFINITY).
+    """
+    ResourceEditor(patches={vm: {"spec": {"template": {"spec": {"affinity": affinity}}}}}).update()
+
+
+def wait_for_migration_finished(migration: VirtualMachineInstanceMigration, timeout: int = TIMEOUT_12MIN) -> None:
+    """
+    Wait for migration to finish.
+    If migration is stuck in Scheduling state, abort the migration and collect data.
+
+    Args:
+        migration (VirtualMachineInstanceMigration): Migration object.
+        timeout (int): Maximum time to wait for the migration to finish.
+
+    Raises:
+        MigrationFailedError: If the migration reaches terminal Failed phase.
+        MigrationStuckSchedulingError: If the migration is stuck in Scheduling state.
+        TimeoutExpiredError: If the migration does not finish within the timeout.
+    """
+
     sleep = TIMEOUT_10SEC
-    samples = TimeoutSampler(wait_timeout=timeout, sleep=sleep, func=lambda: migration.instance.status.phase)
+    samples = TimeoutSampler(
+        wait_timeout=timeout,
+        sleep=sleep,
+        func=lambda: (status := migration.instance.status) and status.phase,
+    )
     counter = 0
     sample = None
     try:
         for sample in samples:
             if sample == migration.Status.SUCCEEDED:
                 break
-            elif sample == "Scheduling":
+            if sample == VirtualMachineInstanceMigration.Status.FAILED:
+                log_failed_pod_events(migration=migration)
+                raise MigrationFailedError(migration_name=migration.name)
+            if sample == VirtualMachineInstanceMigration.Status.SCHEDULING:
                 counter += 1
                 # If migration stuck in Scheduling state for more than 4 minutes - most likely it will be failed
                 # Need to collect data before 5 min timeout reached and target POD is removed
                 if counter >= TIMEOUT_4MIN / sleep:
-                    # Get status/events for PODs in non-running or failed state
-                    for pod in utilities.infra.get_pod_by_name_prefix(
-                        dyn_client=get_client(),
-                        pod_prefix=VIRT_LAUNCHER,
-                        namespace=namespace,
-                        get_all=True,
-                    ):
-                        if pod.status not in (Pod.Status.RUNNING, Pod.Status.COMPLETED, Pod.Status.SUCCEEDED):
-                            pod_events = [
-                                event["raw_object"]["message"]
-                                for event in pod.events(timeout=TIMEOUT_5SEC, field_selector="type==Warning")
-                            ]
-                            LOGGER.error(
-                                f"POD Conditions:\n {pod.instance.status.conditions[0]}\n"
-                                f"POD Events:\n {', '.join(pod_events)}"
-                            )
-                    raise TimeoutExpiredError(
-                        f"VMIM {migration.name} stuck in Scheduling state and probably will be failed"
-                    )
+                    log_failed_pod_events(migration=migration)
+                    raise MigrationStuckSchedulingError(migration_name=migration.name)
     except TimeoutExpiredError:
         if sample:
             LOGGER.error(f"Status of VMIM {migration.name} is {sample}")
         raise
+
+
+def log_failed_pod_events(migration: VirtualMachineInstanceMigration) -> None:
+    """
+    Log failed pod events for a migration.
+
+    Args:
+        migration (VirtualMachineInstanceMigration): Migration object.
+    """
+    try:
+        for pod in utilities.infra.get_pod_by_name_prefix(
+            client=migration.client, pod_prefix=VIRT_LAUNCHER, namespace=migration.namespace, get_all=True
+        ):
+            # Get status/events for PODs in non-running or failed state
+            if pod.status not in {Pod.Status.RUNNING, Pod.Status.COMPLETED, Pod.Status.SUCCEEDED}:
+                pod_events = [
+                    event["raw_object"]["message"]
+                    for event in pod.events(timeout=TIMEOUT_5SEC, field_selector="type==Warning")
+                ]
+                conditions = pod.instance.status.conditions
+                LOGGER.error(
+                    f"POD Name: {pod.name}\n"
+                    f"POD Conditions:\n {conditions[0] if conditions else 'N/A'}\n"
+                    f"POD Events:\n {', '.join(pod_events)}"
+                )
+    except Exception:
+        LOGGER.warning(f"Failed to collect pod events for migration {migration.name}", exc_info=True)
 
 
 def verify_vm_migrated(
@@ -1877,7 +2105,29 @@ def verify_vm_migrated(
     node_before,
     wait_for_interfaces=True,
     check_ssh_connectivity=False,
+    admin_client: DynamicClient | None = None,
 ):
+    """Verify that a VM migrated to a different node.
+
+    Asserts the VMI is on a new node and that migration completed, then
+    optionally waits for network interfaces and SSH connectivity.
+
+    On timeout, collects a VNC screenshot and a VM-incident must-gather
+    archive before re-raising the exception.
+
+    Args:
+        vm: VM object whose migration is being verified.
+        node_before: Node the VM was running on before migration.
+        wait_for_interfaces (bool): Wait for VM interfaces to appear after migration.
+        check_ssh_connectivity (bool): Wait for SSH connectivity after migration.
+        admin_client (DynamicClient | None): Cluster admin client for must-gather
+            collection on timeout. Falls back to cache_admin_client() when None.
+
+    Raises:
+        AssertionError: If the VM is still on the original node or migration did not complete.
+        TimeoutExpiredError: If waiting for interfaces or SSH times out.
+            VNC screenshot and must-gather artifacts are collected before re-raising.
+    """
     vmi_name = vm.vmi.name
     vmi_node_name = vm.vmi.node.name
     assert vmi_node_name != node_before.name, f"VMI: {vmi_name} still running on the same node: {vmi_node_name}"
@@ -1885,11 +2135,16 @@ def verify_vm_migrated(
     assert vm.vmi.instance.status.migrationState.completed, (
         f"VMI {vmi_name} migration state is: {vm.vmi.instance.status.migrationState}"
     )
-    if wait_for_interfaces:
-        wait_for_vm_interfaces(vmi=vm.vmi)
+    try:
+        if wait_for_interfaces:
+            wait_for_vm_interfaces(vmi=vm.vmi)
 
-    if check_ssh_connectivity:
-        wait_for_ssh_connectivity(vm=vm)
+        if check_ssh_connectivity:
+            wait_for_ssh_connectivity(vm=vm)
+    except TimeoutExpiredError:
+        collect_vnc_screenshot_for_vms(vm=vm)
+        collect_must_gather_for_vm(vm=vm, admin_client=admin_client)
+        raise
 
 
 def vm_cloud_init_volume(vm_spec):
@@ -1989,7 +2244,10 @@ def vm_instance_from_template(
         vhostmd=params.get("vhostmd"),
         machine_type=params.get("machine_type"),
         eviction_strategy=params.get("eviction_strategy"),
+        exclude_from_descheduler=params.get("exclude_from_descheduler", False),
         vm_affinity=vm_affinity,
+        tpm_params=params.get("tpm_params"),
+        efi_params=params.get("efi_params"),
     ) as vm:
         if params.get("start_vm", True):
             running_vm(
@@ -2000,20 +2258,150 @@ def vm_instance_from_template(
         yield vm
 
 
+def get_or_create_golden_image_data_source(
+    admin_client: DynamicClient, golden_images_namespace: Namespace, os_dict: dict[str, Any]
+) -> Generator[DataSource]:
+    """Retrieves or creates a DataSource object in golden image namespace specified in the OS matrix.
+
+    Args:
+        admin_client (DynamicClient): Kubernetes dynamic client.
+        golden_images_namespace (Namespace): Namespace where golden images are stored.
+        os_dict (dict[str, Any]): dict of os params
+
+    Yields:
+        DataSource: DataSource object.
+    """
+
+    data_source_name = os_dict.get(DATA_SOURCE_STR, "dummy")
+
+    data_source = DataSource(client=admin_client, name=data_source_name, namespace=golden_images_namespace.name)
+    if data_source.exists and data_source.source.exists:
+        LOGGER.info(f"DataSource {data_source_name} already exists and has a source pvc/snapshot.")
+        yield data_source
+    else:
+        LOGGER.warning(f"No DataSource {data_source_name} found or it doesn't have a source pvc/snapshot.")
+
+        with create_dv(
+            dv_name=data_source_name,
+            namespace=golden_images_namespace.name,
+            source="http",
+            storage_class=py_config["default_storage_class"],
+            url=f"{get_test_artifact_server_url()}{os_dict['image_path']}",
+            size=os_dict["dv_size"],
+            client=admin_client,
+            use_artifactory=True,
+        ) as dv:
+            dv.wait_for_dv_success(timeout=TIMEOUT_30MIN)
+            yield from create_or_update_data_source(admin_client=admin_client, dv=dv)
+
+
+def get_data_volume_template_dict_with_default_storage_class(
+    data_source: DataSource, storage_class: str | None = None
+) -> dict[str, dict]:
+    """
+    Generates a dataVolumeTemplate dict with the py_config based storage class.
+
+    Args:
+        data_source (DataSource): The data source object used to create the data volume template.
+        storage_class (str, optional): Storage class name.
+
+    Returns:
+        dict[str, dict]: A dict representing the dataVolumeTemplate to be used in VM spec.
+    """
+    data_volume_template = data_volume_template_with_source_ref_dict(data_source=data_source)
+
+    # access modes is needed to correctly set eviction strategy in VMs from template
+    # (see to_dict method in VirtualMachineForTestsFromTemplate class)
+    # TODO: remove access modes after the logic in VirtualMachineForTestsFromTemplate is updated
+    if storage_class:
+        data_volume_template["spec"]["storage"]["storageClassName"] = storage_class
+        data_volume_template["spec"]["storage"]["accessModes"] = [
+            get_storage_class_dict_from_matrix(storage_class=storage_class)[storage_class]["access_mode"]
+        ]
+    else:
+        data_volume_template["spec"]["storage"]["storageClassName"] = py_config["default_storage_class"]
+        data_volume_template["spec"]["storage"]["accessModes"] = [py_config["default_access_mode"]]
+    return data_volume_template
+
+
+def _uncordon_and_stabilize(admin_client: DynamicClient, node: Node, hco_namespace: Namespace) -> None:
+    """
+    Uncordon a node and wait for KubeVirt to stabilize.
+
+    Args:
+        admin_client: Admin Kubernetes client
+        node: Node to uncordon
+        hco_namespace: HCO namespace
+    """
+    LOGGER.info(f"Uncordon node {node.name}")
+    run_command(command=shlex.split(f"oc adm uncordon {node.name}"))
+    wait_for_node_schedulable_status(node=node, status=True)
+    wait_for_kv_stabilize(admin_client=admin_client, hco_namespace=hco_namespace)
+
+
 @contextmanager
-def node_mgmt_console(node, node_mgmt):
+def cordon_node(admin_client: DynamicClient, node: Node) -> Generator[None]:
+    """
+    Cordon a node and uncordon it on exit.
+
+    Args:
+        admin_client: Admin Kubernetes client
+        node: Node to cordon
+
+    Yields:
+        None: Control returns while node is cordoned, uncordon happens on exit.
+    """
+    hco_namespace = utilities.hco.get_hco_namespace(admin_client=admin_client)
     try:
-        LOGGER.info(f"{node_mgmt.capitalize()} the node {node.name}")
-        extra_opts = "--delete-emptydir-data --ignore-daemonsets=true --force" if node_mgmt == "drain" else ""
-        run(
-            f"nohup oc adm {node_mgmt} {node.name} {extra_opts} &",
-            shell=True,
-        )
+        LOGGER.info(f"Cordon the node {node.name}")
+        run_command(command=shlex.split(f"oc adm cordon {node.name}"))
         yield
     finally:
-        LOGGER.info(f"Uncordon node {node.name}")
-        run(f"oc adm uncordon {node.name}", shell=True)
-        wait_for_node_schedulable_status(node=node, status=True)
+        _uncordon_and_stabilize(admin_client=admin_client, node=node, hco_namespace=hco_namespace)
+
+
+@contextmanager
+def drain_node(
+    admin_client: DynamicClient, node: Node, hco_namespace: Namespace, compact_cluster: bool = False
+) -> Generator[None]:
+    """
+    Drain a node and uncordon it on exit.
+
+    On compact clusters, relocates virt-api and virt-operator pods before drain to avoid
+    webhook race conditions and virt-handler cert rotation cascades.
+
+    Args:
+        admin_client: Admin Kubernetes client
+        node: Node to drain
+        hco_namespace: HCO namespace
+        compact_cluster: If True, relocate virt-api and virt-operator pods before drain.
+    """
+    if compact_cluster:
+        pods_to_relocate = []
+        for component in (VIRT_API, VIRT_OPERATOR):
+            for pod in utilities.infra.get_pods(
+                client=admin_client,
+                namespace=hco_namespace,
+                label=f"{Pod.ApiGroup.KUBEVIRT_IO}={component}",
+            ):
+                if pod.node.name == node.name:
+                    pods_to_relocate.append(pod)
+        if pods_to_relocate:
+            with cordon_node(admin_client=admin_client, node=node):
+                for pod in pods_to_relocate:
+                    LOGGER.info(f"Compact cluster: deleting {pod.name} from {node.name} before drain")
+                    pod.delete(wait=True)
+                wait_for_kv_stabilize(admin_client=admin_client, hco_namespace=hco_namespace)
+
+    try:
+        LOGGER.info(f"Drain the node {node.name}")
+        cmd = f"nohup oc adm drain {node.name} --delete-emptydir-data --ignore-daemonsets=true --force &>/dev/null &"
+        run_command(command=["/bin/bash", "-c", cmd])
+        yield
+    finally:
+        LOGGER.info("Terminate drain process")
+        run_command(command=shlex.split('pkill -f "oc adm drain"'), check=False, verify_stderr=False)
+        _uncordon_and_stabilize(admin_client=admin_client, node=node, hco_namespace=hco_namespace)
 
 
 @contextmanager
@@ -2028,6 +2416,7 @@ def create_vm_cloning_job(
     annotation_filters=None,
     new_mac_addresses=None,
     new_smbios_serial=None,
+    volume_name_policy=None,
 ):
     """
     Create VirtualMachineClone object.
@@ -2053,6 +2442,7 @@ def create_vm_cloning_job(
         annotation_filters=annotation_filters,
         new_mac_addresses=new_mac_addresses,
         new_smbios_serial=new_smbios_serial,
+        volume_name_policy=volume_name_policy,
     ) as vmc:
         vmc.wait_for_status(status=VirtualMachineClone.Status.SUCCEEDED)
         yield vmc
@@ -2076,7 +2466,7 @@ def wait_for_node_schedulable_status(node, status, timeout=60):
 
 def get_hyperconverged_kubevirt(admin_client, hco_namespace):
     for kv in KubeVirt.get(
-        dyn_client=admin_client,
+        client=admin_client,
         namespace=hco_namespace.name,
         name="kubevirt-kubevirt-hyperconverged",
     ):
@@ -2089,17 +2479,21 @@ def get_kubevirt_hyperconverged_spec(admin_client, hco_namespace):
     ]
 
 
-def get_hyperconverged_ovs_annotations(hyperconverged):
-    return (hyperconverged.instance.to_dict()["metadata"].get("annotations", {})).get("deployOVS")
+def get_base_templates_list(client: DynamicClient) -> list[Template]:
+    """
+    Return base templates list.
 
+    Args:
+        client (DynamicClient): Client to use for getting base templates list.
 
-def get_base_templates_list(client):
-    """Return SSP base templates"""
+    Returns:
+        list[Template]: List of base templates.
+    """
     common_templates_list = list(
         Template.get(
-            dyn_client=client,
+            client=client,
             singular_name=Template.singular_name,
-            label_selector=Template.Labels.BASE,
+            label_selector=f"{Template.Labels.BASE},{Template.Labels.ARCHITECTURE}={py_config['cpu_arch']}",
         )
     )
     return [
@@ -2110,12 +2504,15 @@ def get_base_templates_list(client):
 
 
 def get_template_by_labels(admin_client, template_labels):
+    selector_labels = [label for label in template_labels if OS_FLAVOR_FEDORA not in label]
+    if cpu_arch := py_config.get("cpu_arch"):
+        selector_labels.append(f"{Template.Labels.ARCHITECTURE}={cpu_arch}")
     template = list(
         Template.get(
-            dyn_client=admin_client,
+            client=admin_client,
             singular_name=Template.singular_name,
             namespace="openshift",
-            label_selector=",".join([f"{label}=true" for label in template_labels if OS_FLAVOR_FEDORA not in label]),
+            label_selector=",".join(selector_labels),
         ),
     )
     if any(
@@ -2168,7 +2565,7 @@ def wait_for_updated_kv_value(admin_client, hco_namespace, path, value, timeout=
         LOGGER.error(f"KV CR is not updated, path: {path}, expected value: {value}, HCO annotations: {hco_annotations}")
         raise
     # After updating KV need to be sure HCO is stable
-    wait_for_hco_conditions(
+    utilities.hco.wait_for_hco_conditions(
         admin_client=admin_client,
         hco_namespace=hco_namespace,
     )
@@ -2176,13 +2573,30 @@ def wait_for_updated_kv_value(admin_client, hco_namespace, path, value, timeout=
 
 # function waits when VMIM resource created by cluster automatically (e.g. after node drain OR hotplug)
 def get_created_migration_job(vm, timeout=TIMEOUT_1MIN, client=None):
+    """Poll for a VirtualMachineInstanceMigration created automatically by the cluster.
+
+    Waits until a VMIM resource appears for the given VM's VMI (e.g. after a node
+    drain or hotplug operation).
+
+    Args:
+        vm: VirtualMachine whose VMI migration job is expected.
+        timeout: Maximum time in seconds to wait for the migration job to appear.
+        client: Optional DynamicClient to use for API queries. Falls back to default
+            client when not provided.
+
+    Returns:
+        VirtualMachineInstanceMigration: The first migration job found for the VM's VMI.
+
+    Raises:
+        TimeoutExpiredError: If no migration job is created within the timeout.
+    """
     sampler = TimeoutSampler(
         wait_timeout=timeout,
         sleep=TIMEOUT_5SEC,
         func=VirtualMachineInstanceMigration.get,
         namespace=vm.namespace,
         vmi_name=vm.vmi.name,
-        dyn_client=client,
+        client=client,
     )
     try:
         for sample in sampler:
@@ -2195,20 +2609,36 @@ def get_created_migration_job(vm, timeout=TIMEOUT_1MIN, client=None):
         raise
 
 
-def check_migration_process_after_node_drain(dyn_client, vm):
-    """
-    Wait for migration process to succeed and verify that VM indeed moved to new node.
+def check_migration_process_after_node_drain(client, vm, admin_client):
+    """Wait for a drain-triggered migration to succeed and verify the VM moved to a new node.
+
+    Waits for the source node to become unschedulable, polls for the
+    cluster-created migration job, waits for it to finish, and then asserts
+    that the VM landed on a different node with the same VMI UID (live migration,
+    not recreation).
+
+    Args:
+        client: DynamicClient used to query the migration job.
+        vm: VirtualMachine being migrated.
+        admin_client: Privileged DynamicClient used for node and pod queries.
+
+    Raises:
+        TimeoutExpiredError: If the migration job does not appear or the
+            migration does not finish within its timeout.
+        MigrationFailedError: If the migration reaches the Failed phase.
+        MigrationStuckSchedulingError: If the migration is stuck in the
+            Scheduling state.
+        AssertionError: If the VM remains on the source node or the VMI UID
+            changed (indicating recreation instead of live migration).
     """
     vmi_old_uid = vm.vmi.instance.metadata.uid
-    source_node = vm.privileged_vmi.virt_launcher_pod.node
+    source_node = vm.vmi.get_node(privileged_client=admin_client)
     LOGGER.info(f"The VMI was running on {source_node.name}")
     wait_for_node_schedulable_status(node=source_node, status=False)
-    vmim = get_created_migration_job(vm=vm, client=dyn_client, timeout=TIMEOUT_5MIN)
-    wait_for_migration_finished(
-        namespace=vm.namespace, migration=vmim, timeout=TIMEOUT_30MIN if "windows" in vm.name else TIMEOUT_10MIN
-    )
+    vmim = get_created_migration_job(vm=vm, client=client, timeout=TIMEOUT_5MIN)
+    wait_for_migration_finished(migration=vmim, timeout=TIMEOUT_30MIN if "windows" in vm.name else TIMEOUT_10MIN)
 
-    target_pod = vm.privileged_vmi.virt_launcher_pod
+    target_pod = vm.vmi.get_virt_launcher_pod(privileged_client=admin_client)
     target_pod.wait_for_status(status=Pod.Status.RUNNING, timeout=TIMEOUT_3MIN)
     target_node = target_pod.node
     LOGGER.info(f"The VMI is currently running on {target_node.name}")
@@ -2256,31 +2686,23 @@ def wait_for_kubevirt_conditions(
     )
 
 
-def get_all_virt_pods_with_running_status(dyn_client, hco_namespace):
-    virt_pods_with_status = {
-        pod.name: pod.status
-        for pod in Pod.get(
-            dyn_client=dyn_client,
-            namespace=hco_namespace.name,
-        )
-        if pod.name.startswith("virt")
-    }
-    assert all(pod_status == Pod.Status.RUNNING for pod_status in virt_pods_with_status.values()), (
-        f"All virt pods were expected to be in running state.Here are all virt pods:{virt_pods_with_status}"
-    )
-    return virt_pods_with_status
-
-
 def wait_for_kv_stabilize(admin_client, hco_namespace):
     wait_for_kubevirt_conditions(admin_client=admin_client, hco_namespace=hco_namespace)
-    wait_for_hco_conditions(admin_client=admin_client, hco_namespace=hco_namespace)
+    utilities.hco.wait_for_hco_conditions(admin_client=admin_client, hco_namespace=hco_namespace)
 
 
+@cache
 def get_oc_image_info(  # type: ignore[return]
     image: str, pull_secret: str | None = None, architecture: str = LINUX_AMD_64
 ) -> dict[str, Any]:
-    def _get_image_json(cmd: str) -> dict[str, Any]:
-        return json.loads(run_command(command=shlex.split(cmd), check=False)[1])
+
+    def _get_image_json(cmd: str) -> dict[str, Any] | None:
+        _, out, err = run_command(command=shlex.split(cmd), check=False)
+        if err:
+            LOGGER.error("Failed to get image info from quay", extra={"image": image, "error": err})
+            return None
+
+        return json.loads(out)
 
     base_command = f"oc image -o json info {image} --filter-by-os {architecture}"
     if pull_secret:
@@ -2296,6 +2718,7 @@ def get_oc_image_info(  # type: ignore[return]
         ):
             if sample:
                 return sample
+
     except TimeoutExpiredError:
         LOGGER.error(f"Failed to parse {base_command}")
         raise
@@ -2341,6 +2764,7 @@ def fetch_pid_from_linux_vm(vm, process_name):
     cmd_res = run_ssh_commands(
         host=vm.ssh_exec,
         commands=shlex.split(f"pgrep {process_name} -x || true"),
+        wait_timeout=TIMEOUT_2MIN,
     )[0].strip()
     assert cmd_res, f"VM {vm.name}, '{process_name}' process not found"
     return int(cmd_res)
@@ -2363,6 +2787,7 @@ def fetch_pid_from_windows_vm(vm, process_name):
         host=vm.ssh_exec,
         commands=shlex.split(f"powershell -Command (Get-Process -Name {process_name.removesuffix('.exe')}).Id"),
         tcp_timeout=TCP_TIMEOUT_30SEC,
+        wait_timeout=TIMEOUT_2MIN,
     )[0].strip()
     assert cmd_res, f"Process '{process_name}' not in output: {cmd_res}"
     return int(cmd_res)
@@ -2442,12 +2867,12 @@ def wait_for_vmi_relocation_and_running(initial_node, vm, timeout=TIMEOUT_5MIN):
 
 
 def check_qemu_guest_agent_installed(ssh_exec: Host) -> bool:
-    ssh_exec.sudo = True
-    return ssh_exec.package_manager.exist(package="qemu-guest-agent")
+    rc, _, _ = ssh_exec.executor().run_cmd(cmd=shlex.split("rpm -q qemu-guest-agent"))
+    return rc == 0
 
 
-def validate_libvirt_persistent_domain(vm):
-    domain = vm.privileged_vmi.virt_launcher_pod.execute(
+def validate_libvirt_persistent_domain(vm, admin_client):
+    domain = vm.vmi.get_virt_launcher_pod(privileged_client=admin_client).execute(
         command=shlex.split("virsh list --persistent"), container="compute"
     )
     assert vm.vmi.Status.RUNNING.lower() in domain
@@ -2469,7 +2894,7 @@ def pause_unpause_vm_and_check_connectivity(vm: VirtualMachineForTests) -> None:
     vm.vmi.pause(wait=True)
     vm.vmi.unpause(wait=True)
     LOGGER.info("Verify VM is running and ready after unpause")
-    wait_for_ssh_connectivity(vm=vm, timeout=TIMEOUT_2MIN)
+    wait_for_ssh_connectivity(vm=vm)
 
 
 def validate_pause_unpause_linux_vm(vm: VirtualMachineForTests, pre_pause_pid: int | None = None) -> None:
@@ -2484,14 +2909,14 @@ def validate_pause_unpause_linux_vm(vm: VirtualMachineForTests, pre_pause_pid: i
     )
 
 
-def check_vm_xml_smbios(vm: VirtualMachineForTests, cm_values: Dict[str, str]) -> None:
+def check_vm_xml_smbios(vm: VirtualMachineForTests, cm_values: dict[str, str], admin_client: DynamicClient) -> None:
     """
     Verify SMBIOS on VM XML [sysinfo type=smbios][system] match kubevirt-config
     config map.
     """
 
     LOGGER.info("Verify VM XML - SMBIOS values.")
-    smbios_vm = vm.privileged_vmi.xml_dict["domain"]["sysinfo"]["system"]["entry"]
+    smbios_vm = vm.vmi.get_xml_dict(privileged_client=admin_client)["domain"]["sysinfo"]["system"]["entry"]
     smbios_vm_dict = {entry["@name"]: entry["#text"] for entry in smbios_vm}
     assert smbios_vm, "VM XML missing SMBIOS values."
     results = {
@@ -2499,33 +2924,11 @@ def check_vm_xml_smbios(vm: VirtualMachineForTests, cm_values: Dict[str, str]) -
         "product": smbios_vm_dict["product"] == cm_values["product"],
         "family": smbios_vm_dict["family"] == cm_values["family"],
         "version": smbios_vm_dict["version"] == cm_values["version"],
-        "sku": smbios_vm_dict["sku"] == cm_values["sku"],
         "serial": smbios_vm_dict.get("serial"),
         "uuid": smbios_vm_dict.get("uuid"),
     }
     LOGGER.info(f"Results: {results}")
     assert all(results.values())
-
-
-def assert_vm_xml_efi(vm: VirtualMachineForTests, secure_boot_enabled: bool = True) -> None:
-    LOGGER.info("Verify VM XML - EFI secureBoot values.")
-    xml_dict_os = vm.privileged_vmi.xml_dict["domain"]["os"]
-    ovmf_path = "/usr/share/OVMF"
-    efi_path = f"{ovmf_path}/OVMF_CODE.secboot.fd"
-    # efi vars path when secure boot is enabled: /usr/share/OVMF/OVMF_VARS.secboot.fd
-    # efi vars path when secure boot is disabled: /usr/share/OVMF/OVMF_VARS.fd
-    efi_vars_path = f"{ovmf_path}/OVMF_VARS.{'secboot.' if secure_boot_enabled else ''}fd"
-    vmi_xml_efi_path = xml_dict_os["loader"]["#text"]
-    vmi_xml_efi_vars_path = xml_dict_os["nvram"]["@template"]
-    vmi_xml_os_secure = xml_dict_os["loader"]["@secure"]
-    os_secure = "yes" if secure_boot_enabled else "no"
-    assert vmi_xml_efi_path == efi_path, f"EFIPath value {vmi_xml_efi_path} does not match expected {efi_path} value"
-    assert vmi_xml_os_secure == os_secure, (
-        f"EFI secure value {vmi_xml_os_secure} does not seem to be set as {os_secure}"
-    )
-    assert vmi_xml_efi_vars_path == efi_vars_path, (
-        f"EFIVarsPath value {vmi_xml_efi_vars_path} does not match expected {efi_vars_path} value"
-    )
 
 
 def update_vm_efi_spec_and_restart(
@@ -2537,13 +2940,14 @@ def update_vm_efi_spec_and_restart(
     restart_vm_wait_for_running_vm(vm=vm, wait_for_interfaces=wait_for_interfaces)
 
 
-def delete_guestosinfo_keys(data: Dict[str, Any]) -> Dict[str, Any]:
+def delete_guestosinfo_keys(data: dict[str, Any]) -> dict[str, Any]:
     """
     supportedCommands - removed as the data is used for internal guest agent validations
     fsInfo, userList - checked in validate_fs_info_virtctl_vs_linux_os / validate_user_info_virtctl_vs_linux_os
     fsFreezeStatus - removed as it is not related to GA validations
+    load - present in virtctl/cnv guest-agent output but not in libvirt/linux
     """
-    removed_keys = ["supportedCommands", "fsInfo", "userList", "fsFreezeStatus"]
+    removed_keys = ["supportedCommands", "fsInfo", "userList", "fsFreezeStatus", "load"]
     [data.pop(key, None) for key in removed_keys]
 
     return data
@@ -2608,7 +3012,7 @@ def get_vm_boot_time(vm: VirtualMachineForTests) -> str:
         if "windows" in vm.name  # type: ignore[operator]
         else "who -b"
     )
-    return run_ssh_commands(host=vm.ssh_exec, commands=shlex.split(boot_command))[0]
+    return run_ssh_commands(host=vm.ssh_exec, commands=shlex.split(boot_command), wait_timeout=TIMEOUT_2MIN)[0]
 
 
 def username_password_from_cloud_init(vm_volumes: list[dict[str, Any]]) -> tuple[str, str]:
@@ -2658,12 +3062,12 @@ def guest_reboot(vm: VirtualMachineForTests, os_type: str) -> None:
     run_os_command(vm=vm, command=commands["reboot"][os_type])
 
 
-def run_os_command(vm: VirtualMachineForTests, command: str) -> Optional[str]:
+def run_os_command(vm: VirtualMachineForTests, command: str) -> str | None:
     try:
         return run_ssh_commands(
             host=vm.ssh_exec,
             commands=shlex.split(command),
-            timeout=5,
+            timeout=15,
             tcp_timeout=TCP_TIMEOUT_30SEC,
         )[0]
     except ProxyCommandFailure:
@@ -2687,9 +3091,9 @@ def wait_for_user_agent_down(vm: VirtualMachineForTests, timeout: int) -> None:
             break
 
 
-def get_virt_handler_pods(client: DynamicClient, namespace: Namespace) -> List[Pod]:
+def get_virt_handler_pods(client: DynamicClient, namespace: Namespace) -> list[Pod]:
     return utilities.infra.get_pods(
-        dyn_client=client,
+        client=client,
         namespace=namespace,
         label=f"{Pod.ApiGroup.KUBEVIRT_IO}={VIRT_HANDLER}",
     )
@@ -2697,7 +3101,7 @@ def get_virt_handler_pods(client: DynamicClient, namespace: Namespace) -> List[P
 
 def check_virt_handler_pods_for_migration_network(
     client: DynamicClient, namespace: Namespace, network_name: str, migration_network: bool = True
-) -> List[Pod]:
+) -> list[Pod]:
     """
     Checks whether virt-handler pods have migration network.
 

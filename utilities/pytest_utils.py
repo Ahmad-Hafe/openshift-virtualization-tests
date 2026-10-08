@@ -1,12 +1,30 @@
 import getpass
+import hashlib
 import importlib
 import json
 import logging
 import os
+import pathlib
 import re
 import shutil
 import socket
 import sys
+import tempfile
+from collections import defaultdict
+from typing import TYPE_CHECKING, Any
+
+import paramiko.pkey
+
+if TYPE_CHECKING:
+    from typing import TypedDict
+
+    class _FailureInfoDict(TypedDict):
+        message: str
+        log_message: str
+        return_code: int
+
+
+from xml.etree import ElementTree
 
 import pytest
 from kubernetes.dynamic import DynamicClient
@@ -15,13 +33,23 @@ from ocp_resources.namespace import Namespace
 from ocp_resources.resource import ResourceEditor
 from pytest_testconfig import config as py_config
 
+from utilities.architecture import get_cluster_architecture
 from utilities.bitwarden import get_cnv_tests_secret_by_name
-from utilities.constants import (
+from utilities.constants.architecture import (
+    AMD_64,
+    MULTIARCH,
+    SUPPORTED_CPU_ARCHITECTURES,
+    SUPPORTED_MULTIARCH_OPTIONS,
+)
+from utilities.constants.cluster import (
     CNV_TEST_RUN_IN_PROGRESS,
     CNV_TEST_RUN_IN_PROGRESS_NS,
     CNV_TESTS_CONTAINER,
     POD_SECURITY_NAMESPACE_LABELS,
-    SANITY_TESTS_FAILURE,
+)
+from utilities.constants.pytest import SANITY_TESTS_FAILURE
+from utilities.constants.storage import StorageClassNames
+from utilities.constants.timeouts import (
     TIMEOUT_2MIN,
     TIMEOUT_5MIN,
 )
@@ -30,9 +58,89 @@ from utilities.data_collector import (
     get_data_collector_base_directory,
     write_to_file,
 )
-from utilities.exceptions import MissingEnvironmentVariableError
+from utilities.exceptions import MissingEnvironmentVariableError, UnsupportedCPUArchitectureError
+from utilities.os_utils import (
+    generate_latest_os_dict,
+    generate_linux_instance_type_os_matrix,
+    generate_os_matrix_dict,
+)
 
 LOGGER = logging.getLogger(__name__)
+
+
+_failure_info: _FailureInfoDict | None = None
+
+
+def _inject_failure_junit(session: pytest.Session) -> None:
+    """Inject a synthetic error testcase into JUnit XML for pytest exit failures.
+
+    When exit_pytest_execution aborts the session, the exit reason may not appear
+    in the JUnit XML report. CI systems can miss the failure — either because the
+    report is empty (no tests ran) or because the exit reason is not captured as a
+    testcase. This function re-opens the XML file after LogXML writes it and adds
+    a synthetic error testcase to ensure the exit failure is always reported.
+
+    Note:
+        Must be called during pytest_sessionfinish, after LogXML has written the
+        XML file. Pluggy calls hooks in LIFO (last-in-first-out) registration
+        order: conftest is registered before the junitxml plugin, so the
+        conftest hook runs after LogXML has written its output.
+
+    Args:
+        session: The pytest session object, used to access the junitxml file path.
+    """
+    if _failure_info is None:
+        return
+
+    xml_path = getattr(session.config.option, "xmlpath", None)
+    if not xml_path or not os.path.exists(xml_path):
+        LOGGER.info("No JUnit XML file found, skipping synthetic testcase injection")
+        return
+
+    return_code = _failure_info["return_code"]
+    log_message = _failure_info["log_message"]
+
+    sanitized_name = re.sub(r"[^a-z0-9_]", "", _failure_info["message"].lower().replace(" ", "_"))
+    sanitized_name = re.sub(r"_+", "_", sanitized_name).strip("_")[:80]
+    name = sanitized_name or "execution_failure"
+
+    tree = ElementTree.parse(xml_path)
+    root = tree.getroot()
+
+    testsuite = root.find("testsuite")
+    if testsuite is None:
+        LOGGER.warning("No <testsuite> element found in JUnit XML, skipping injection")
+        return
+
+    testcase = ElementTree.SubElement(
+        testsuite,
+        "testcase",
+        attrib={"classname": "pytest_exit", "name": name, "time": "0.000"},
+    )
+    error_node = ElementTree.SubElement(
+        testcase,
+        "error",
+        attrib={"message": f"Pytest execution failed (exit code: {return_code})"},
+    )
+    # Strip XML 1.0 illegal control characters — ElementTree passes them through, corrupting the file.
+    error_node.text = re.sub(r"[^\x09\x0A\x0D\x20-\uD7FF\uE000-\uFFFD\U00010000-\U0010FFFF]", "\ufffd", log_message)
+
+    current_errors = int(testsuite.get("errors", "0"))
+    testsuite.set("errors", str(current_errors + 1))
+    current_tests = int(testsuite.get("tests", "0"))
+    testsuite.set("tests", str(current_tests + 1))
+
+    xml_dir = os.path.dirname(os.path.abspath(xml_path))
+    fd, tmp_path = tempfile.mkstemp(dir=xml_dir, suffix=".xml")
+    try:
+        with os.fdopen(fd, mode="w") as tmp_file:
+            tree.write(tmp_file, encoding="unicode", xml_declaration=True)
+        os.replace(tmp_path, xml_path)
+    except BaseException:
+        os.unlink(tmp_path)
+        raise
+
+    LOGGER.info(f"Injected synthetic failure testcase into JUnit XML (exit code: {return_code})")
 
 
 def get_base_matrix_name(matrix_name):
@@ -95,6 +203,46 @@ def get_matrix_params(pytest_config, matrix_name):
     return _matrix_params if isinstance(_matrix_params, list) else [_matrix_params]
 
 
+def _validate_storage_class_options(
+    cmd_default_storage_class: str | None = None,
+    cmdline_storage_class_matrix: list[str] | None = None,
+) -> None:
+    """Validates that storage class CLI options reference existing storage classes.
+
+    Args:
+        cmd_default_storage_class: Value from --default-storage-class CLI option.
+        cmdline_storage_class_matrix: Parsed values from --storage-class-matrix CLI option.
+
+    Raises:
+        ValueError: If any storage class name is not found in py_config["system_storage_class_matrix"].
+    """
+    available_sc_names = [sc_name for sc in py_config["system_storage_class_matrix"] for sc_name in sc]
+
+    if cmdline_storage_class_matrix:
+        # Verify storage classes passed via --storage-class-matrix are supported
+        if invalid_sc_names := set(cmdline_storage_class_matrix) - set(available_sc_names):
+            raise ValueError(
+                f"Storage class(es) {sorted(invalid_sc_names)} from --storage-class-matrix not found. "
+                f"Available storage classes: {available_sc_names}"
+            )
+
+        # Verify default storage class passed via --default-storage-class exists in --storage-class-matrix
+        if cmd_default_storage_class and cmd_default_storage_class not in cmdline_storage_class_matrix:
+            raise ValueError(
+                f"Default storage class '{cmd_default_storage_class}' not in --storage-class-matrix. "
+                f"Matrix storage classes: {cmdline_storage_class_matrix}"
+            )
+
+        return
+
+    # Verify default storage class passed via --default-storage-class is supported (when matrix is not passed from cli)
+    if cmd_default_storage_class and cmd_default_storage_class not in available_sc_names:
+        raise ValueError(
+            f"Default storage class '{cmd_default_storage_class}' not found in system storage class matrix. "
+            f"Available storage classes: {available_sc_names}"
+        )
+
+
 def config_default_storage_class(session):
     # Default storage class selection order:
     # 1. --default-storage-class from command line
@@ -106,26 +254,43 @@ def config_default_storage_class(session):
     global_config_default_sc = py_config["default_storage_class"]
     cmd_default_storage_class = session.config.getoption(name="default_storage_class")
     cmdline_storage_class_matrix = session.config.getoption(name="storage_class_matrix")
+    system_storage_class_matrix = py_config["system_storage_class_matrix"]
+
+    parsed_cmdline_matrix = cmdline_storage_class_matrix.split(",") if cmdline_storage_class_matrix else None
+    try:
+        _validate_storage_class_options(
+            cmd_default_storage_class=cmd_default_storage_class,
+            cmdline_storage_class_matrix=parsed_cmdline_matrix,
+        )
+    except ValueError as error:
+        error_message = str(error)
+        target_location = os.path.join(get_data_collector_base_directory(), "utilities", "pytest_exit_errors")
+        write_to_file(
+            file_name="storage_class_validation_error",
+            content=error_message,
+            base_directory=target_location,
+        )
+        pytest.exit(reason=error_message, returncode=4)
+
     updated_default_sc = None
     if cmd_default_storage_class:
         updated_default_sc = cmd_default_storage_class
-    elif cmdline_storage_class_matrix:
-        cmdline_storage_class_matrix = cmdline_storage_class_matrix.split(",")
+    elif parsed_cmdline_matrix:
         updated_default_sc = (
-            global_config_default_sc
-            if global_config_default_sc in cmdline_storage_class_matrix
-            else cmdline_storage_class_matrix[0]
+            global_config_default_sc if global_config_default_sc in parsed_cmdline_matrix else parsed_cmdline_matrix[0]
         )
 
     # Update only if the requested default sc is not the same as set in global_config
     if updated_default_sc and updated_default_sc != global_config_default_sc:
         py_config["default_storage_class"] = updated_default_sc
-        default_storage_class_configuration = [
+        matching_configurations = [
             sc_dict
-            for sc in py_config["storage_class_matrix"]
+            for sc in system_storage_class_matrix
             for sc_name, sc_dict in sc.items()
             if sc_name == updated_default_sc
-        ][0]
+        ]
+
+        default_storage_class_configuration = matching_configurations[0]
 
         py_config["default_volume_mode"] = default_storage_class_configuration["volume_mode"]
         py_config["default_access_mode"] = default_storage_class_configuration["access_mode"]
@@ -255,7 +420,11 @@ def get_artifactory_server_url(cluster_host_url, session):
 
 
 def get_cnv_version_explorer_url(pytest_config):
-    if pytest_config.getoption("install") or pytest_config.getoption("upgrade") == "eus":
+    if (
+        pytest_config.getoption("install")
+        or pytest_config.getoption("upgrade") in ("eus", "cnv")
+        or pytest_config.getoption("upgrade_custom") in ("eus", "cnv")
+    ):
         LOGGER.info("Checking for cnv version explorer url:")
         version_explorer_url = os.environ.get("CNV_VERSION_EXPLORER_URL")
         if not version_explorer_url:
@@ -263,33 +432,71 @@ def get_cnv_version_explorer_url(pytest_config):
         return version_explorer_url
 
 
-def get_tests_cluster_markers(items, filepath=None) -> None:
-    test_markers = set([marker.name for item in items for marker in item.iter_markers()])
+def get_tests_cluster_markers(items: list[pytest.Item], filepath: str | None = None) -> dict[str, list[str]]:
+    """Extract cluster-related markers from collected tests, grouped by category.
 
-    pytest_cluster_markers = []
-    is_config_section = False
-    with open("pytest.ini") as fd:
+    Parses pytest.ini to find markers under Architecture support, Hardware requirements,
+    Configuration requirements, and Required operators sections. Returns only markers
+    that are present in the collected test items.
+
+    Args:
+        items: List of collected pytest items.
+        filepath: Optional path to write the results as JSON.
+
+    Returns:
+        Dictionary mapping category names to lists of matching marker names.
+    """
+    test_markers = {marker.name for item in items for marker in item.iter_markers()}
+
+    section_headers = {
+        "## Architecture support": "architecture",
+        "## Hardware requirements": "hardware",
+        "## Configuration requirements": "configuration",
+        "## Required operators": "operators",
+    }
+
+    markers_by_section: dict[str, list[str]] = {section_name: [] for section_name in section_headers.values()}
+
+    pytest_ini_path = pathlib.Path(__file__).resolve().parent.parent / "pytest.ini"
+    current_section: str | None = None
+    with open(pytest_ini_path) as fd:
         for line in fd:
-            # Get markers from configuration and hardware sections only
-            if "## Configuration requirements" in line or "## Hardware requirements" in line:
-                is_config_section = True
-                continue
+            stripped = line.strip()
 
-            if is_config_section:
-                # Skip empty lines and sections which are not configuration or hardware requirements
-                if (_line := line.strip()) and _line.startswith("#") or line == "\n":
-                    is_config_section = False
-                    continue
-                else:
-                    pytest_cluster_markers.append(line.strip().split(":")[0])
+            # Check if this line starts a tracked section
+            for header, section_name in section_headers.items():
+                if header in line:
+                    current_section = section_name
+                    break
+            else:
+                if current_section:
+                    # End section on empty lines or other section headers
+                    if not stripped or stripped.startswith("#"):
+                        current_section = None
+                        continue
 
-    tests_cluster_markers = [marker for marker in test_markers if marker in pytest_cluster_markers]
-    LOGGER.info(f"Cluster-related test markers: {tests_cluster_markers}")
+                    marker_name = stripped.split(":")[0]
+                    if marker_name in test_markers:
+                        markers_by_section[current_section].append(marker_name)
+
+    empty_sections = [section for section, markers in markers_by_section.items() if not markers]
+    if empty_sections:
+        LOGGER.warning(
+            f"No markers found in sections: {', '.join(empty_sections)}."
+            " Verify pytest.ini section headers match expected format."
+        )
+
+    # Remove empty sections
+    result = {section: markers for section, markers in markers_by_section.items() if markers}
+
+    LOGGER.info(f"Cluster-related test markers: {result}")
 
     if filepath:
         LOGGER.info(f"Write cluster-related test markers in {filepath}")
-        with open(filepath, "w") as fd:
-            fd.write(json.dumps(tests_cluster_markers))
+        with open(filepath, mode="w") as fd:
+            fd.write(json.dumps(result))
+
+    return result
 
 
 def exit_pytest_execution(
@@ -312,6 +519,11 @@ def exit_pytest_execution(
         junitxml_property (pytest plugin): record_testsuite_property
         message (str): Message to log in an error file. If not provided, `log_message` will be used.
         admin_client (DynamicClient): cluster admin client
+
+    Note:
+        Records the failure details in a module-level store so that
+        _inject_failure_junit can emit a synthetic JUnit XML testcase
+        during pytest_sessionfinish.
     """
     target_location = os.path.join(get_data_collector_base_directory(), "utilities", "pytest_exit_errors")
     # collect must-gather for past 5 minutes:
@@ -331,4 +543,412 @@ def exit_pytest_execution(
         )
     if junitxml_property:
         junitxml_property(name="exit_code", value=return_code)
+
+    global _failure_info
+    _failure_info = {
+        "message": message or log_message,
+        "log_message": log_message,
+        "return_code": return_code,
+    }
+
     pytest.exit(reason=log_message, returncode=return_code)
+
+
+def remove_tests_from_list(items: list[pytest.Item], filter_str: str) -> tuple[list[pytest.Item], list[pytest.Item]]:
+    discard_tests: list[pytest.Item] = []
+    items_to_return: list[pytest.Item] = []
+    for item in items:
+        if filter_str in item.keywords:
+            discard_tests.append(item)
+        else:
+            items_to_return.append(item)
+    return discard_tests, items_to_return
+
+
+def filter_hpp_tests(items: list[pytest.Item], config: pytest.Config) -> list[pytest.Item]:
+    marker_expression = config.getoption("-m")
+    if not marker_expression or "hpp" not in marker_expression:
+        discard_tests, items_to_return = remove_tests_from_list(items=items, filter_str="hpp")
+        config.hook.pytest_deselected(items=discard_tests)
+        return items_to_return
+
+    return items
+
+
+def ocs_storage_class_in_matrix() -> bool:
+    """Check whether the OCS storage class is configured in the storage class matrix.
+
+    ``py_config["storage_class_matrix"]`` is populated from the ``--storage-class-matrix`` CLI
+    option. Presence of the OCS storage class in the matrix means OCS is available in the cluster,
+    so OCS-marked tests should run automatically without requiring an explicit ``-m ocs``.
+
+    Returns:
+        True if the OCS storage class is present in the storage class matrix, False otherwise.
+    """
+    return any(
+        StorageClassNames.CEPH_RBD_VIRTUALIZATION in storage_class
+        for storage_class in py_config.get("storage_class_matrix", [])
+    )
+
+
+def filter_ocs_tests(items: list[pytest.Item], config: pytest.Config) -> list[pytest.Item]:
+    """Deselect OCS-marked tests when OCS is not selected or configured.
+
+    Args:
+        items: Collected pytest items.
+        config: Pytest configuration used for marker selection and deselection reporting.
+
+    Returns:
+        The retained pytest items.
+
+    Side Effects:
+        Reports removed OCS-marked items through ``pytest_deselected``.
+    """
+    marker_expression = config.getoption("-m")
+    ocs_marker_requested = bool(marker_expression) and "ocs" in marker_expression
+    if ocs_marker_requested or ocs_storage_class_in_matrix():
+        return items
+
+    discard_tests, items_to_return = remove_tests_from_list(items=items, filter_str="ocs")
+    config.hook.pytest_deselected(items=discard_tests)
+    return items_to_return
+
+
+def mark_nmstate_dependent_tests(items: list[pytest.Item]) -> list[pytest.Item]:
+    """
+    Dynamically mark tests that depend on NMState with the 'nmstate' marker.
+
+    Tests are identified by checking if they depend (directly or indirectly) on the
+    nmstate_dependent_placeholder fixture. This placeholder is used as a dependency tracker
+    by all fixtures that interact with NMState Custom Resources (NNCP, NNCE, NNS) either
+    for viewing or for changing the network configuration.
+    This allows filtering tests using pytest markers (e.g., -m nmstate or -m "not nmstate").
+
+    Args:
+        items: List of collected test items.
+
+    Returns:
+        List of collected test items.
+    """
+    for item in items:
+        if "nmstate_dependent_placeholder" in getattr(item, "fixturenames", []):
+            item.add_marker(marker=pytest.mark.nmstate)
+
+    return items
+
+
+def validate_cpu_arch_params(cpu_arch_option: str) -> None:
+    """Validate the interplay between `--cpu-arch` CLI option and actual cluster architecture.
+
+    Covered cases:
+      - Disallow clusters with nodes of unsupported architectures.
+      - Require `--cpu-arch` to be passed for heterogeneous clusters and
+        ensure the values are a subset of actual cluster architectures.
+      - Validate `--cpu-arch` value(s) are all supported and, in multiarch clusters, match discovered architectures.
+      - For homogeneous clusters, disallow use of the `--cpu-arch` argument.
+
+    Args:
+        cpu_arch_option: Comma-separated architecture(s) from CLI, or empty string.
+
+    Raises:
+        UnsupportedCPUArchitectureError: If architecture usage or CLI option values are invalid.
+    """
+    cluster_arch = get_cluster_architecture()
+    cli_param_arch = cpu_arch_option.split(",")
+
+    if not all(arch in set(SUPPORTED_CPU_ARCHITECTURES) for arch in cluster_arch):
+        raise UnsupportedCPUArchitectureError(f"Node/s have unsupported CPU architecture/s: {cluster_arch}!")
+    if len(cluster_arch) > 1 and not cpu_arch_option:
+        raise UnsupportedCPUArchitectureError(
+            f"`--cpu-arch` cmdline arg must be provided for heterogeneous cluster: {cluster_arch}!"
+        )
+    if len(cluster_arch) == 1 and cpu_arch_option:
+        raise UnsupportedCPUArchitectureError(
+            f"`--cpu-arch` cmdline arg shouldn't be passed for homogeneous cluster: {cluster_arch}!"
+        )
+    if cpu_arch_option and not all(arch in SUPPORTED_MULTIARCH_OPTIONS for arch in cli_param_arch):
+        raise UnsupportedCPUArchitectureError(
+            f"`--cpu-arch` has unsupported value(s): {cli_param_arch}. Allowed values: {SUPPORTED_MULTIARCH_OPTIONS}"
+        )
+    if len(cluster_arch) > 1 and not all(arch in cluster_arch for arch in cli_param_arch):
+        raise UnsupportedCPUArchitectureError(
+            f"`--cpu-arch` value/s {cli_param_arch} not in the cluster's arch list: {cluster_arch}!"
+        )
+
+
+def validate_collected_tests_arch_params(session: pytest.Session) -> None:
+    """Validate collected tests' `multiarch` markers against cluster/CLI settings.
+
+    Args:
+        session: The pytest session with collected test items.
+
+    Raises:
+        UnsupportedCPUArchitectureError: On marker/architecture mismatch.
+    """
+    session_items = session.items
+    session_config = session.config
+    are_all_multiarch_marked_tests = all(item.get_closest_marker("multiarch") for item in session_items)
+    is_any_multiarch_marked_test = any(item.get_closest_marker("multiarch") for item in session_items)
+    cpu_arch_option = session_config.getoption("--cpu-arch") or ""
+
+    if is_any_multiarch_marked_test and py_config["cluster_type"] != MULTIARCH:
+        raise UnsupportedCPUArchitectureError("Tests marked with `multiarch` are not allowed for homogeneous cluster!")
+    if not are_all_multiarch_marked_tests and len(cpu_arch_option.split(",")) > 1:
+        raise UnsupportedCPUArchitectureError(
+            f"Tests not marked with `multiarch` should not run with multiple values in `--cpu-arch` {cpu_arch_option}!"
+        )
+
+
+def generate_common_template_matrix_dicts(os_dict: dict[str, Any], cpu_arch: str | None = None) -> None:
+    """Generate common template matrix dictionaries in py_config from OS lists.
+
+    Args:
+        os_dict: Dict with OS lists (e.g., "rhel_os_list", "windows_os_list",
+            "instance_type_rhel_os_list").
+        cpu_arch: Optional architecture suffix for multi-arch clusters.
+    """
+    if rhel_os_list := os_dict.get("rhel_os_list"):
+        py_config["rhel_os_matrix"] = generate_os_matrix_dict(
+            os_name="rhel", supported_operating_systems=rhel_os_list, arch=cpu_arch
+        )
+        py_config["latest_rhel_os_dict"] = generate_latest_os_dict(os_matrix=py_config["rhel_os_matrix"])
+    if fedora_os_list := os_dict.get("fedora_os_list"):
+        py_config["fedora_os_matrix"] = generate_os_matrix_dict(
+            os_name="fedora", supported_operating_systems=fedora_os_list, arch=cpu_arch
+        )
+        py_config["latest_fedora_os_dict"] = generate_latest_os_dict(os_matrix=py_config["fedora_os_matrix"])
+    if centos_os_list := os_dict.get("centos_os_list"):
+        py_config["centos_os_matrix"] = generate_os_matrix_dict(
+            os_name="centos", supported_operating_systems=centos_os_list, arch=cpu_arch
+        )
+        py_config["latest_centos_os_dict"] = generate_latest_os_dict(os_matrix=py_config["centos_os_matrix"])
+    if windows_os_list := os_dict.get("windows_os_list"):
+        py_config["windows_os_matrix"] = generate_os_matrix_dict(
+            os_name="windows", supported_operating_systems=windows_os_list, arch=cpu_arch
+        )
+        py_config["latest_windows_os_dict"] = generate_latest_os_dict(os_matrix=py_config["windows_os_matrix"])
+
+
+def generate_instance_type_matrix_dicts(os_dict: dict[str, Any], cpu_arch: str | None = None) -> None:
+    """Generate instance type matrix dictionaries in py_config from OS lists.
+
+    Args:
+        os_dict: Dict with OS lists (e.g., "rhel_os_list", "windows_os_list",
+            "instance_type_rhel_os_list").
+        cpu_arch: Optional architecture suffix.
+    """
+    add_preference_arch_suffix = cpu_arch != AMD_64
+    add_data_source_arch_suffix = py_config["cluster_type"] == MULTIARCH
+
+    if instance_type_rhel_os_list := os_dict.get("instance_type_rhel_os_list"):
+        py_config["instance_type_rhel_os_matrix"] = generate_linux_instance_type_os_matrix(
+            os_name="rhel",
+            preferences=instance_type_rhel_os_list,
+            arch_suffix=cpu_arch,
+            add_preference_arch_suffix=add_preference_arch_suffix,
+            add_data_source_arch_suffix=add_data_source_arch_suffix,
+        )
+        py_config["latest_instance_type_rhel_os_dict"] = generate_latest_os_dict(
+            os_matrix=py_config["instance_type_rhel_os_matrix"]
+        )
+    if instance_type_fedora_os_list := os_dict.get("instance_type_fedora_os_list"):
+        py_config["instance_type_fedora_os_matrix"] = generate_linux_instance_type_os_matrix(
+            os_name="fedora",
+            preferences=instance_type_fedora_os_list,
+            arch_suffix=cpu_arch,
+            add_preference_arch_suffix=add_preference_arch_suffix,
+            add_data_source_arch_suffix=add_data_source_arch_suffix,
+        )
+    if instance_type_centos_os_list := os_dict.get("instance_type_centos_os_list"):
+        py_config["instance_type_centos_os_matrix"] = generate_linux_instance_type_os_matrix(
+            os_name="centos.stream",
+            preferences=instance_type_centos_os_list,
+            arch_suffix=cpu_arch,
+            add_preference_arch_suffix=False,
+            add_data_source_arch_suffix=add_data_source_arch_suffix,
+        )
+
+
+def update_latest_os_config(session_config: pytest.Config) -> None:
+    """
+    Update py_config with OS-related configuration based on session configuration.
+
+    Args:
+        session_config (pytest.Config): The pytest session configuration object.
+
+    Side effects:
+        Mutates the module-level py_config dict. Preserves original matrices in
+        system_windows_os_matrix and system_rhel_os_matrix. Updates rhel_os_matrix
+        and instance_type_rhel_os_matrix when --latest_rhel is set, windows_os_matrix
+        when --latest_windows is set, centos_os_matrix when --latest_centos is set,
+        and fedora_os_matrix when --latest_fedora is set.
+    """
+
+    # Save the default windows_os_matrix before it is updated
+    # with runtime windows_os_matrix value(s).
+    # Some tests extract a single OS from the matrix and may fail if running with
+    # passed values from cli
+    if windows_os_matrix := py_config.get("windows_os_matrix"):
+        py_config["system_windows_os_matrix"] = windows_os_matrix
+
+    if rhel_os_matrix := py_config.get("rhel_os_matrix"):
+        py_config["system_rhel_os_matrix"] = rhel_os_matrix
+
+    # Update OS matrix list with the latest OS if running with os_group
+    if session_config.getoption("latest_rhel") and rhel_os_matrix:
+        latest_rhel_os_dict = py_config.get("latest_rhel_os_dict", {})
+        py_config["rhel_os_matrix"] = [{f"rhel.{latest_rhel_os_dict.get('os_version', 'latest')}": latest_rhel_os_dict}]
+        latest_instance_type_rhel_os_dict = py_config.get("latest_instance_type_rhel_os_dict", {})
+        py_config["instance_type_rhel_os_matrix"] = [
+            {latest_instance_type_rhel_os_dict.get("preference", "rhel.latest"): latest_instance_type_rhel_os_dict}
+        ]
+
+    if session_config.getoption("latest_windows") and windows_os_matrix:
+        latest_windows_os_dict = py_config.get("latest_windows_os_dict", {})
+        py_config["windows_os_matrix"] = [
+            {f"windows.{latest_windows_os_dict.get('os_version', 'latest')}": latest_windows_os_dict}
+        ]
+
+    if session_config.getoption("latest_centos") and py_config.get("centos_os_matrix"):
+        latest_centos_os_dict = py_config.get("latest_centos_os_dict", {})
+        py_config["centos_os_matrix"] = [
+            {f"centos-stream.{latest_centos_os_dict.get('os_version', 'latest')}": latest_centos_os_dict}
+        ]
+
+    if session_config.getoption("latest_fedora") and py_config.get("fedora_os_matrix"):
+        latest_fedora_os_dict = py_config.get("latest_fedora_os_dict", {})
+        py_config["fedora_os_matrix"] = [{"fedora": latest_fedora_os_dict}]
+
+
+def update_cpu_arch_related_config(cpu_arch_option: str) -> None:
+    """Update py_config with CPU architecture settings and OS matrices.
+
+    Args:
+        cpu_arch_option: Comma-separated architecture(s) from CLI, or empty string.
+    """
+    validate_cpu_arch_params(cpu_arch_option=cpu_arch_option)
+
+    cpu_arch = cpu_arch_option.split(",") if cpu_arch_option else list(get_cluster_architecture())
+
+    if len(cpu_arch) > 1:
+        LOGGER.warning("OS matrix generation is not supported for multi-arch runs!")
+    else:
+        arch = cpu_arch[0]
+        py_config["cpu_arch"] = arch
+
+        # TODO: remove this when utilities modules are refactored
+        import utilities.constants as constants_module  # noqa: PLC0415
+        from utilities.constants.images import ArchImages  # noqa: PLC0415
+
+        constants_module.Images = getattr(ArchImages, arch.upper())
+
+        if py_config["cluster_type"] == MULTIARCH:
+            generate_common_template_matrix_dicts(os_dict=py_config["os_matrix"][arch], cpu_arch=arch)
+            generate_instance_type_matrix_dicts(os_dict=py_config["os_matrix"][arch], cpu_arch=arch)
+            py_config["data_import_cron_matrix"] = py_config["os_matrix"][arch]["data_import_cron_matrix"]
+            py_config["auto_update_data_source_matrix"] = py_config["os_matrix"][arch]["auto_update_data_source_matrix"]
+        else:
+            generate_common_template_matrix_dicts(os_dict=py_config)
+            if py_config["cluster_type"] != AMD_64:
+                generate_instance_type_matrix_dicts(os_dict=py_config, cpu_arch=arch)
+            else:
+                generate_instance_type_matrix_dicts(os_dict=py_config)
+
+
+def filter_multiarch_tests(items: list[pytest.Item], config: pytest.Config) -> list[pytest.Item]:
+    """Deselect multiarch-marked tests on homogeneous clusters.
+
+    On heterogeneous clusters (cluster_type=MULTIARCH), all tests pass through unchanged.
+    On homogeneous clusters, tests marked with 'multiarch' are deselected and reported
+    via pytest_deselected so they appear in the session summary.
+
+    Args:
+        items: Collected test items.
+        config: Pytest config object, used to report deselected items.
+
+    Returns:
+        Filtered list of test items with multiarch tests removed on homogeneous clusters.
+    """
+    if py_config.get("cluster_type") == MULTIARCH:
+        return items
+    discard_tests, items_to_return = remove_tests_from_list(items=items, filter_str="multiarch")
+    if discard_tests:
+        config.hook.pytest_deselected(items=discard_tests)
+    return items_to_return
+
+
+def assert_incremental_classes_fully_collected(items: list[pytest.Item]) -> None:
+    """Verify that all tests defined in incremental classes were collected.
+
+    Incremental classes require ordered execution — running a subset produces
+    misleading results.  Fail early (at collection time) if any test in an
+    incremental class was filtered out, so the problem is caught before any
+    test runs.
+
+    Args:
+        items: The full list of collected pytest items.
+
+    Raises:
+        pytest.UsageError: When one or more incremental classes are missing collected tests.
+    """
+    incremental_parents: dict[pytest.Class, list[str]] = defaultdict(list)
+    for item in items:
+        if (
+            isinstance(item, pytest.Function)
+            and isinstance(item.parent, pytest.Class)
+            and "incremental" in item.keywords
+        ):
+            incremental_parents[item.parent].append(item.function.__name__)
+
+    errors = []
+    for parent, collected_names in incremental_parents.items():
+        cls = parent.cls
+        all_tests = [
+            name
+            for name in cls.__dict__
+            if name.startswith("test")
+            and callable(getattr(cls, name))
+            and getattr(getattr(cls, name), "__test__", True)
+            and not _is_xfail_no_run(getattr(cls, name))
+        ]
+        missing = [name for name in all_tests if name not in set(collected_names)]
+        if missing:
+            errors.append(f"{cls.__qualname__}: not collected: {missing}")
+
+    if errors:
+        raise pytest.UsageError("Incremental classes partially collected:\n" + "\n".join(errors))
+
+
+def _is_xfail_no_run(method: object) -> bool:
+    return any(mark.name == "xfail" and mark.kwargs.get("run") is False for mark in getattr(method, "pytestmark", []))
+
+
+def filter_post_test_alerts_tests(items: list[pytest.Item], config: pytest.Config) -> list[pytest.Item]:
+    """Filter out post-test alert tests when explicitly skipped or running install tests.
+
+    Args:
+        items: Collected pytest test items.
+        config: Pytest config object.
+
+    Returns:
+        Filtered list of test items.
+    """
+    if config.getoption("--skip-post-test-alerts") or config.getoption("--install"):
+        discard_tests, items_to_return = remove_tests_from_list(items=items, filter_str="post_test_alerts")
+        config.hook.pytest_deselected(items=discard_tests)
+        return items_to_return
+    return items
+
+
+def patch_paramiko_for_fips() -> None:
+    """Patch paramiko's PKey.get_fingerprint to use usedforsecurity=False for FIPS compatibility.
+
+    Workaround for https://github.com/paramiko/paramiko/issues/396: PKey.get_fingerprint()
+    calls hashlib.md5() without usedforsecurity=False, raising UnsupportedDigestmodError on
+    FIPS-enabled systems. MD5 here is used only for display/logging purposes, not security.
+    """
+    type.__setattr__(
+        paramiko.pkey.PKey,
+        "get_fingerprint",
+        lambda self: hashlib.md5(self.asbytes(), usedforsecurity=False).digest(),
+    )

@@ -1,44 +1,49 @@
 import logging
-from datetime import datetime, timezone
+from datetime import UTC, datetime
+from urllib.parse import urlparse
 
 import bitmath
 import pytest
-from ocp_resources.datavolume import DataVolume
 from ocp_resources.persistent_volume_claim import PersistentVolumeClaim
 from ocp_resources.virtual_machine import VirtualMachine
 from ocp_resources.virtual_machine_instance_migration import (
     VirtualMachineInstanceMigration,
 )
-from pytest_testconfig import py_config
 from timeout_sampler import TimeoutExpiredError, TimeoutSampler
 
 from tests.observability.metrics.constants import (
     KUBEVIRT_CONSOLE_ACTIVE_CONNECTIONS_BY_VMI,
     KUBEVIRT_VM_CREATED_BY_POD_TOTAL,
     KUBEVIRT_VM_DISK_ALLOCATED_SIZE_BYTES,
+    KUBEVIRT_VMI_PHASE_TRANSITION_TIME_FROM_DELETION_SECONDS_COUNT_SUCCEEDED,
     KUBEVIRT_VMI_PHASE_TRANSITION_TIME_FROM_DELETION_SECONDS_SUM_SUCCEEDED,
+    KUBEVIRT_VMI_SYNC_TOTAL,
     KUBEVIRT_VNC_ACTIVE_CONNECTIONS_BY_VMI,
+    SUM_KUBEVIRT_VMI_PHASE_TRANSITION_TIME_FROM_DELETION_SECONDS_BUCKET_SUCCEEDED,
 )
 from tests.observability.metrics.utils import (
     compare_metric_file_system_values_with_vm_file_system_values,
     get_pvc_size_bytes,
     timestamp_to_seconds,
+    validate_metric_value_cleared,
     validate_metric_value_greater_than_initial_value,
+    validate_vmi_sync_total_after_migration,
+    validate_vmi_sync_total_reported_and_positive,
     validate_vnic_info,
 )
-from tests.observability.utils import validate_metrics_value
-from tests.os_params import FEDORA_LATEST_LABELS, RHEL_LATEST
-from utilities.constants import (
+from utilities.constants.pytest import QUARANTINED
+from utilities.constants.storage import (
     CAPACITY,
-    LIVE_MIGRATE,
-    MIGRATION_POLICY_VM_LABEL,
+    USED,
+)
+from utilities.constants.timeouts import (
     TIMEOUT_2MIN,
     TIMEOUT_3MIN,
     TIMEOUT_30SEC,
-    USED,
 )
+from utilities.constants.virt import MIGRATION_POLICY_VM_LABEL
 from utilities.infra import get_node_selector_dict
-from utilities.monitoring import get_metrics_value
+from utilities.monitoring import get_metrics_value, validate_metrics_value
 from utilities.virt import VirtualMachineForTests, fedora_vm_body, running_vm
 
 LOGGER = logging.getLogger(__name__)
@@ -48,9 +53,7 @@ def get_last_transition_time(vm):
     for condition in vm.instance.get("status", {}).get("conditions"):
         if condition.get("type") == vm.Condition.READY:
             last_transition_time = condition.get("lastTransitionTime")
-            return int(
-                (datetime.strptime(last_transition_time, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)).timestamp()
-            )
+            return int((datetime.strptime(last_transition_time, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=UTC)).timestamp())
 
 
 def check_vm_last_transition_metric_value(prometheus, metric, vm):
@@ -79,13 +82,14 @@ def stopped_vm_metric_1(vm_metric_1):
 
 
 @pytest.fixture()
-def vm_in_error_state(namespace):
+def vm_in_error_state(namespace, unprivileged_client):
     vm_name = "vm-in-error-state"
     with VirtualMachineForTests(
         name=vm_name,
         namespace=namespace.name,
         body=fedora_vm_body(name=vm_name),
         node_selector=get_node_selector_dict(node_selector="non-existent-node"),
+        client=unprivileged_client,
     ) as vm:
         vm.start()
         vm.wait_for_specific_status(status=VirtualMachine.Status.ERROR_UNSCHEDULABLE)
@@ -106,13 +110,14 @@ def pvc_for_vm_in_starting_state(unprivileged_client, namespace):
 
 
 @pytest.fixture()
-def vm_in_starting_state(namespace, pvc_for_vm_in_starting_state):
+def vm_in_starting_state(namespace, unprivileged_client, pvc_for_vm_in_starting_state):
     vm_name = "vm-in-starting-state"
     with VirtualMachineForTests(
         name=vm_name,
         namespace=namespace.name,
         body=fedora_vm_body(name=vm_name),
         pvc=pvc_for_vm_in_starting_state,
+        client=unprivileged_client,
     ) as vm:
         vm.start()
         vm.wait_for_specific_status(status=VirtualMachine.Status.WAITING_FOR_VOLUME_BINDING)
@@ -187,6 +192,11 @@ class TestVMStatusLastTransitionMetrics:
 
     @pytest.mark.polarion("CNV-9751")
     @pytest.mark.s390x
+    @pytest.mark.xfail(
+        reason=f"{QUARANTINED}: Storage Classes act differently when "
+        f"attaching broken pvc and stuck in other state than expected; tracked in CNV-76518 ",
+        run=False,
+    )
     def test_vm_starting_status_metrics(self, prometheus, vm_in_starting_state):
         check_vm_last_transition_metric_value(
             prometheus=prometheus,
@@ -253,6 +263,7 @@ class TestVmiFileSystemMetricsLinux:
     @pytest.mark.s390x
     def test_metric_kubevirt_vmi_filesystem_capacity_used_bytes_linux(
         self,
+        admin_client,
         prometheus,
         vm_for_test,
         file_system_metric_mountpoints_existence,
@@ -264,10 +275,12 @@ class TestVmiFileSystemMetricsLinux:
             vm_for_test=vm_for_test,
             mount_point=[*disk_file_system_info_linux][0],
             capacity_or_used=capacity_or_used,
+            admin_client=admin_client,
         )
 
 
 @pytest.mark.tier3
+@pytest.mark.windows
 class TestVmiFileSystemMetricsWindows:
     @pytest.mark.parametrize(
         "capacity_or_used",
@@ -286,6 +299,7 @@ class TestVmiFileSystemMetricsWindows:
     )
     def test_metric_kubevirt_vmi_filesystem_capacity_used_bytes_windows(
         self,
+        admin_client,
         prometheus,
         windows_vm_for_test,
         disk_file_system_info_windows,
@@ -296,6 +310,7 @@ class TestVmiFileSystemMetricsWindows:
             vm_for_test=windows_vm_for_test,
             mount_point=[*disk_file_system_info_windows][0],
             capacity_or_used=capacity_or_used,
+            admin_client=admin_client,
         )
 
 
@@ -323,6 +338,7 @@ class TestVmiStatusAddresses:
         "vm_for_test", [pytest.param("vmi-status-addresses", marks=pytest.mark.polarion("CNV-11534"))], indirect=True
     )
     @pytest.mark.s390x
+    @pytest.mark.ipv6
     def test_metric_kubevirt_vmi_status_addresses(
         self,
         prometheus,
@@ -330,7 +346,8 @@ class TestVmiStatusAddresses:
         kubevirt_vmi_status_addresses_ip_labels_values,
         vm_virt_controller_ip_address,
     ):
-        instance_value = kubevirt_vmi_status_addresses_ip_labels_values.get("instance").split(":")[0]
+        instance_value = urlparse(f"//{kubevirt_vmi_status_addresses_ip_labels_values.get('instance')}").hostname
+
         address_value = kubevirt_vmi_status_addresses_ip_labels_values.get("address")
         vm_ip_address = vm_for_test.vmi.interface_ip(interface="eth0")
         assert instance_value == vm_virt_controller_ip_address, (
@@ -373,44 +390,6 @@ class TestVmResourceLimits:
         )
 
 
-class TestKubevirtVmiNonEvictable:
-    @pytest.mark.parametrize(
-        "data_volume_scope_function, vm_from_template_with_existing_dv",
-        [
-            pytest.param(
-                {
-                    "dv_name": "non-evictable-dv",
-                    "image": RHEL_LATEST["image_path"],
-                    "storage_class": py_config["default_storage_class"],
-                    "dv_size": RHEL_LATEST["dv_size"],
-                    "access_modes": DataVolume.AccessMode.RWO,
-                },
-                {
-                    "vm_name": "non-evictable-vm",
-                    "template_labels": FEDORA_LATEST_LABELS,
-                    "ssh": False,
-                    "guest_agent": False,
-                    "eviction_strategy": LIVE_MIGRATE,
-                },
-                marks=pytest.mark.polarion("CNV-7484"),
-            ),
-        ],
-        indirect=True,
-    )
-    @pytest.mark.s390x
-    def test_kubevirt_vmi_non_evictable(
-        self,
-        prometheus,
-        data_volume_scope_function,
-        vm_from_template_with_existing_dv,
-    ):
-        validate_metrics_value(
-            prometheus=prometheus,
-            metric_name="kubevirt_vmi_non_evictable",
-            expected_value="1",
-        )
-
-
 class TestVmDiskAllocatedSizeLinux:
     @pytest.mark.polarion("CNV-11817")
     @pytest.mark.s390x
@@ -427,6 +406,7 @@ class TestVmDiskAllocatedSizeLinux:
 
 
 @pytest.mark.tier3
+@pytest.mark.windows
 class TestVmDiskAllocatedSizeWindows:
     @pytest.mark.polarion("CNV-11916")
     def test_metric_kubevirt_vm_disk_allocated_size_bytes_windows(self, prometheus, windows_vm_for_test):
@@ -454,6 +434,7 @@ class TestVmVnicInfo:
         ],
         indirect=["vnic_info_from_vm_or_vmi_linux"],
     )
+    @pytest.mark.ipv6
     @pytest.mark.s390x
     def test_metric_kubevirt_vm_vnic_info_linux(
         self, prometheus, running_metric_vm, vnic_info_from_vm_or_vmi_linux, query
@@ -465,6 +446,7 @@ class TestVmVnicInfo:
         )
 
     @pytest.mark.tier3
+    @pytest.mark.windows
     @pytest.mark.polarion("CNV-12224")
     def test_metric_kubevirt_vmi_vnic_info_windows(self, prometheus, windows_vm_for_test, vnic_info_from_vmi_windows):
         validate_vnic_info(
@@ -473,26 +455,65 @@ class TestVmVnicInfo:
             metric_name=f"kubevirt_vmi_vnic_info{{name='{windows_vm_for_test.name}'}}",
         )
 
-
-class TestVmiPhaseTransitionFromDeletion:
     @pytest.mark.parametrize(
-        "initial_metric_value",
+        "query",
         [
             pytest.param(
-                KUBEVIRT_VMI_PHASE_TRANSITION_TIME_FROM_DELETION_SECONDS_SUM_SUCCEEDED,
-                marks=pytest.mark.polarion("CNV-12067"),
-            )
+                "kubevirt_vm_vnic_info{{name='{vm_name}', vnic_name='secondary'}}",
+                marks=pytest.mark.polarion("CNV-16018"),
+            ),
+            pytest.param(
+                "kubevirt_vmi_vnic_info{{name='{vm_name}', vnic_name='secondary'}}",
+                marks=pytest.mark.polarion("CNV-16019"),
+            ),
         ],
-        indirect=True,
     )
-    def test_kubevirt_vmi_phase_transition_from_deletion_seconds_sum_linux(
-        self, prometheus, initial_metric_value, running_metric_vm, deleted_vmi
+    def test_metric_kubevirt_vm_vnic_info_after_nad_swap(
+        self, prometheus, post_nad_swap_vm, expected_vnic_info_after_swap, query
     ):
-        validate_metric_value_greater_than_initial_value(
+        """
+        Test that vnic_info metric updates the network label after a NAD swap.
+
+        STP:
+        https://github.com/RedHatQE/openshift-virtualization-tests-design-docs/blob/main/stps/sig-network/hotpluggable-nad-ref.md
+
+        Preconditions:
+            - Two Network Attachment Definitions (NAD-A, NAD-B) with different VLANs on the same Linux bridge
+            - Running VM with a secondary bridge interface attached to NAD-A
+
+        Steps:
+            1. Swap the VM secondary network reference from NAD-A to NAD-B
+            2. Wait for the live migration triggered by the swap to complete
+            3. Query vnic_info metric for the secondary interface
+
+        Expected:
+            - vnic_info labels match the VM spec after NAD swap
+        """
+        validate_vnic_info(
             prometheus=prometheus,
-            metric_name=KUBEVIRT_VMI_PHASE_TRANSITION_TIME_FROM_DELETION_SECONDS_SUM_SUCCEEDED,
-            initial_value=initial_metric_value,
+            vnic_info_to_compare=expected_vnic_info_after_swap,
+            metric_name=query.format(vm_name=post_nad_swap_vm.name),
         )
+
+
+class TestVmiPhaseTransitionFromDeletion:
+    @pytest.mark.polarion("CNV-12990")
+    def test_kubevirt_vmi_phase_transition_from_deletion_seconds_linux(
+        self, prometheus, initial_vmi_deletion_metrics_values, running_metric_vm, deleted_vmi, subtests
+    ):
+        metrics_to_check = [
+            KUBEVIRT_VMI_PHASE_TRANSITION_TIME_FROM_DELETION_SECONDS_SUM_SUCCEEDED,
+            SUM_KUBEVIRT_VMI_PHASE_TRANSITION_TIME_FROM_DELETION_SECONDS_BUCKET_SUCCEEDED,
+            KUBEVIRT_VMI_PHASE_TRANSITION_TIME_FROM_DELETION_SECONDS_COUNT_SUCCEEDED,
+        ]
+
+        for metric in metrics_to_check:
+            with subtests.test(msg=metric):
+                validate_metric_value_greater_than_initial_value(
+                    prometheus=prometheus,
+                    metric_name=metric,
+                    initial_value=initial_vmi_deletion_metrics_values[metric],
+                )
 
     @pytest.mark.parametrize(
         "initial_metric_value",
@@ -504,6 +525,7 @@ class TestVmiPhaseTransitionFromDeletion:
         ],
         indirect=True,
     )
+    @pytest.mark.windows
     def test_kubevirt_vmi_phase_transition_from_deletion_seconds_sum_windows(
         self, prometheus, initial_metric_value, windows_vm_for_test, deleted_windows_vmi
     ):
@@ -535,4 +557,88 @@ class TestVmCreatedByPodTotal:
             prometheus=prometheus,
             metric_name=KUBEVIRT_VM_CREATED_BY_POD_TOTAL.format(namespace=vm_for_test.namespace),
             expected_value=str(vm_created_pod_total_initial_metric_value + 1),
+        )
+
+
+@pytest.mark.incremental
+class TestVmiSyncTotal:
+    """
+    Tests for kubevirt_vmi_sync_total metric.
+
+    Jira: https://redhat.atlassian.net/browse/CNV-80580  # <skip-jira-utils-check>
+
+    Preconditions:
+        - Running VM
+        - Prometheus access configured
+    """
+
+    @pytest.mark.polarion("CNV-16271")
+    @pytest.mark.usefixtures("initial_vmi_sync_total_values")
+    def test_kubevirt_vmi_sync_total(self, prometheus, vm_for_migration_metrics_test):
+        """
+        Test that kubevirt_vmi_sync_total metric is reported by both
+        virt-controller and virt-handler after a VM starts.
+
+        Steps:
+            1. Query Prometheus for kubevirt_vmi_sync_total with the VM's
+               namespace and name
+
+        Expected:
+            - Two metric entries are returned — one from virt-controller
+              and one from virt-handler — each with a value greater than 0
+        """
+        validate_vmi_sync_total_reported_and_positive(
+            prometheus=prometheus,
+            metric_query=KUBEVIRT_VMI_SYNC_TOTAL.format(vm_name=vm_for_migration_metrics_test.name),
+        )
+
+    @pytest.mark.polarion("CNV-16272")
+    @pytest.mark.usefixtures("migration_succeeded_scope_class")
+    def test_kubevirt_vmi_sync_total_increases_after_migration(
+        self, prometheus, initial_vmi_sync_total_values, vm_for_migration_metrics_test
+    ):
+        """
+        Test that kubevirt_vmi_sync_total metric value increases after
+        a VM live migration.
+
+        Preconditions:
+            - Running VM
+            - Initial kubevirt_vmi_sync_total values recorded
+
+        Steps:
+            1. Live migrate the VM
+            2. Query Prometheus for kubevirt_vmi_sync_total with the VM's
+               namespace and name
+
+        Expected:
+            - Metric values from both virt-controller and virt-handler
+              are greater than the values recorded before migration
+        """
+        validate_vmi_sync_total_after_migration(
+            prometheus=prometheus,
+            metric_query=KUBEVIRT_VMI_SYNC_TOTAL.format(vm_name=vm_for_migration_metrics_test.name),
+            initial_values=initial_vmi_sync_total_values,
+        )
+
+    @pytest.mark.polarion("CNV-16273")
+    @pytest.mark.usefixtures("deleted_vmi_sync_total_vm")
+    def test_kubevirt_vmi_sync_total_cleared_after_vm_deletion(self, prometheus, vm_for_migration_metrics_test):
+        """
+        Test that kubevirt_vmi_sync_total metric entry is removed
+        after the VM is deleted.
+
+        Preconditions:
+            - VM with kubevirt_vmi_sync_total metric reported
+
+        Steps:
+            1. Delete the VM
+            2. Query Prometheus for kubevirt_vmi_sync_total with the
+               deleted VM's namespace and name
+
+        Expected:
+            - Metric value is None
+        """
+        validate_metric_value_cleared(
+            prometheus=prometheus,
+            metric_name=KUBEVIRT_VMI_SYNC_TOTAL.format(vm_name=vm_for_migration_metrics_test.name),
         )

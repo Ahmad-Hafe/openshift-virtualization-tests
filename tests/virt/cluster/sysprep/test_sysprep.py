@@ -1,7 +1,10 @@
+from __future__ import annotations
+
 import base64
 import logging
 import os
 import shlex
+from typing import TYPE_CHECKING
 
 import pytest
 from ocp_resources.config_map import ConfigMap
@@ -13,12 +16,21 @@ from ocp_resources.virtual_machine_cluster_preference import (
 from pyhelper_utils.shell import run_ssh_commands
 from timeout_sampler import TimeoutSampler
 
+from libs.infra.images import BASE_IMAGES_DIR
 from tests.os_params import WINDOWS_2019
 from utilities.bitwarden import get_cnv_tests_secret_by_name
-from utilities.constants import BASE_IMAGES_DIR, OS_FLAVOR_WINDOWS, TCP_TIMEOUT_30SEC, TIMEOUT_5MIN
+from utilities.constants.images import OS_FLAVOR_WINDOWS
+from utilities.constants.timeouts import (
+    TCP_TIMEOUT_30SEC,
+    TIMEOUT_2MIN,
+    TIMEOUT_5MIN,
+)
 from utilities.ssp import get_windows_timezone
 from utilities.storage import get_downloaded_artifact
 from utilities.virt import VirtualMachineForTests, migrate_vm_and_verify, running_vm
+
+if TYPE_CHECKING:
+    from kubernetes.dynamic import DynamicClient
 
 LOGGER = logging.getLogger(__name__)
 
@@ -42,9 +54,12 @@ def verify_changes_from_autounattend(vm, timezone, hostname):
 
     # hostname
     LOGGER.info(f"Verifying hostname change from answer file in vm {vm.name}")
-    actual_hostname = run_ssh_commands(host=vm.ssh_exec, commands=["hostname"], tcp_timeout=TCP_TIMEOUT_30SEC)[
-        0
-    ].strip()
+    actual_hostname = run_ssh_commands(
+        host=vm.ssh_exec,
+        commands=["hostname"],
+        tcp_timeout=TCP_TIMEOUT_30SEC,
+        wait_timeout=TIMEOUT_2MIN,
+    )[0].strip()
     assert actual_hostname == hostname, f"Incorrect hostname, expected {hostname}, found {actual_hostname}"
 
 
@@ -133,7 +148,7 @@ def sysprep_vm(
             namespace=namespace.name,
             client=unprivileged_client,
             vm_instance_type=vm_instance_type,
-            vm_preference=VirtualMachineClusterPreference(name="windows.2k19"),
+            vm_preference=VirtualMachineClusterPreference(client=unprivileged_client, name="windows.2k19"),
             data_volume_template=golden_image_data_volume_template_for_test_scope_class,
             os_flavor=OS_FLAVOR_WINDOWS,
             disk_type=None,
@@ -156,6 +171,7 @@ def sealed_vm(sysprep_vm):
             posix=False,
         ),
         tcp_timeout=TCP_TIMEOUT_30SEC,
+        wait_timeout=TIMEOUT_2MIN,
     )
 
 
@@ -200,8 +216,9 @@ def attached_sysprep_volume_to_vm(sysprep_vm_credentials_from_bitwarden, sysprep
 
 
 @pytest.fixture()
-def migrated_sysprep_vm(sysprep_vm):
-    migrate_vm_and_verify(vm=sysprep_vm, check_ssh_connectivity=True)
+def migrated_sysprep_vm(admin_client: DynamicClient, sysprep_vm: VirtualMachineForTests) -> VirtualMachineForTests:
+    migrate_vm_and_verify(vm=sysprep_vm, client=admin_client, check_ssh_connectivity=True)
+    return sysprep_vm
 
 
 @pytest.fixture()
@@ -254,6 +271,7 @@ def detached_sysprep_resource_and_restarted_vm(sysprep_vm, attached_sysprep_volu
     ],
     indirect=True,
 )
+@pytest.mark.windows
 @pytest.mark.special_infra
 @pytest.mark.high_resource_vm
 @pytest.mark.usefixtures("sysprep_vm", "sealed_vm", "attached_sysprep_volume_to_vm")

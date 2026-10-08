@@ -2,7 +2,9 @@ import logging
 import math
 import os
 import shlex
+from collections.abc import Collection, Generator
 from contextlib import contextmanager
+from typing import TYPE_CHECKING, Any
 
 import cachetools.func
 import kubernetes
@@ -14,6 +16,7 @@ from ocp_resources.cdi_config import CDIConfig
 from ocp_resources.data_source import DataSource
 from ocp_resources.datavolume import DataVolume
 from ocp_resources.hostpath_provisioner import HostPathProvisioner
+from ocp_resources.namespace import Namespace
 from ocp_resources.persistent_volume_claim import PersistentVolumeClaim
 from ocp_resources.pod import Pod
 from ocp_resources.resource import NamespacedResource, ResourceEditor
@@ -23,6 +26,7 @@ from ocp_resources.virtual_machine_snapshot import VirtualMachineSnapshot
 from ocp_resources.volume_snapshot import VolumeSnapshot
 from ocp_resources.volume_snapshot_class import VolumeSnapshotClass
 from pyhelper_utils.shell import run_ssh_commands
+from pytest import FixtureRequest
 from pytest_testconfig import config as py_config
 from timeout_sampler import TimeoutExpiredError, TimeoutSampler, retry
 
@@ -30,13 +34,18 @@ import utilities.artifactory
 import utilities.infra
 import utilities.virt as virt_util
 from utilities import console
+from utilities.architecture import get_multiarch_cpu_arch
 from utilities.artifactory import get_test_artifact_server_url
-from utilities.constants import (
+from utilities.constants import Images
+from utilities.constants.components import HPP_POOL
+from utilities.constants.images import OS_FLAVOR_WINDOWS
+from utilities.constants.networking import POD_CONTAINER_SPEC
+from utilities.constants.storage import (
+    BIND_IMMEDIATE_ANNOTATION,
     CDI_LABEL,
     HOTPLUG_DISK_SERIAL,
-    HPP_POOL,
-    OS_FLAVOR_WINDOWS,
-    POD_CONTAINER_SPEC,
+)
+from utilities.constants.timeouts import (
     TIMEOUT_1MIN,
     TIMEOUT_1SEC,
     TIMEOUT_2MIN,
@@ -50,9 +59,11 @@ from utilities.constants import (
     TIMEOUT_30MIN,
     TIMEOUT_30SEC,
     TIMEOUT_60MIN,
-    Images,
 )
 from utilities.exceptions import UrlNotFoundError
+
+if TYPE_CHECKING:
+    from utilities.virt import VirtualMachineForTests
 
 HOTPLUG_VOLUME = "hotplugVolume"
 DATA_IMPORT_CRON_SUFFIX = "-image-cron"
@@ -62,17 +73,26 @@ HPP_CSI = "hpp-csi"
 
 
 LOGGER = logging.getLogger(__name__)
+_DEFAULT_DISK_SERIAL_COMMAND = shlex.split("sudo ls /dev/disk/by-id")
 
 
-def create_dummy_first_consumer_pod(volume_mode=DataVolume.VolumeMode.FILE, dv=None, pvc=None):
+def create_dummy_first_consumer_pod(
+    client: DynamicClient,
+    volume_mode: str = DataVolume.VolumeMode.FILE,
+    dv: DataVolume | None = None,
+    pvc: PersistentVolumeClaim | None = None,
+) -> None:
     """
-    Create a dummy pod that will become the PVCs first consumer
-    Triggers start of CDI worker pod
+    Create a dummy pod that will become the PVCs first consumer.
 
-    To consume PVCs that are not backed by DVs, just pass in pvc param
-    Otherwise, it is needed to pass in dv
+    Triggers start of CDI worker pod.
+
+    Args:
+        client: Kubernetes client to use for creating the pod.
+        volume_mode: Volume mode for the PVC mount.
+        dv: DataVolume to consume. Mutually exclusive with pvc.
+        pvc: PVC to consume directly. Mutually exclusive with dv.
     """
-
     if not (pvc or dv):
         raise ValueError("Exactly one of the args: (dv,pvc) must be passed")
     if dv:
@@ -89,13 +109,15 @@ def create_dummy_first_consumer_pod(volume_mode=DataVolume.VolumeMode.FILE, dv=N
         ):
             if sample:
                 break
-    pvc = pvc or dv.pvc
+        pvc = pvc or dv.pvc
+    if not pvc:
+        raise ValueError("Could not resolve PVC from provided arguments")
     with PodWithPVC(
         namespace=pvc.namespace,
         name=f"first-consumer-{pvc.name}",
         pvc_name=pvc.name,
         containers=get_containers_for_pods_with_pvc(volume_mode=volume_mode, pvc_name=pvc.name),
-        client=pvc.client,
+        client=client,
     ) as pod:
         LOGGER.info(
             f"Created dummy pod {pod.name} to be the first consumer of the PVC, "
@@ -103,114 +125,215 @@ def create_dummy_first_consumer_pod(volume_mode=DataVolume.VolumeMode.FILE, dv=N
         )
 
 
+def construct_datavolume_source_dict(
+    source: str,
+    url: str | None = None,
+    secret_name: str | None = None,
+    cert_configmap_name: str | None = None,
+    source_pvc_name: str | None = None,
+    source_pvc_namespace: str | None = None,
+) -> dict[str, Any]:
+    """
+    Build a DataVolume source_dict.
+
+    Args:
+        source: Source type ("http", "registry", "pvc", "blank", "upload").
+        url: URL for http/registry sources.
+        secret_name: Optional Secret name for authentication (http/registry sources).
+        cert_configmap_name: Optional ConfigMap name for TLS certificates (http/registry sources).
+        source_pvc_name: PVC name for pvc source type.
+        source_pvc_namespace: Namespace of the source PVC.
+
+    Returns:
+        dict[str, Any]: The constructed source_dict for DataVolume.
+    """
+    if source == "http":
+        if not utilities.infra.url_excluded_from_validation(url):
+            validate_file_exists_in_url(url=url)
+        source_spec: dict[str, Any] = {"http": {"url": url}}
+    elif source == "registry":
+        registry_spec: dict[str, Any] = {"url": url}
+        if cpu_arch := get_multiarch_cpu_arch():
+            registry_spec["platform"] = {"architecture": cpu_arch}
+        source_spec = {"registry": registry_spec}
+    elif source == "pvc":
+        pvc_spec: dict[str, Any] = {"name": source_pvc_name}
+        if source_pvc_namespace is not None:
+            pvc_spec["namespace"] = source_pvc_namespace
+        source_spec = {"pvc": pvc_spec}
+    elif source == "blank":
+        source_spec = {"blank": {}}
+    elif source == "upload":
+        source_spec = {"upload": {}}
+    else:
+        raise ValueError(f"Unsupported source type: {source}")
+
+    if source in ("http", "registry"):
+        if secret_name:
+            source_spec[source]["secretRef"] = secret_name
+        if cert_configmap_name:
+            source_spec[source]["certConfigMap"] = cert_configmap_name
+
+    return source_spec
+
+
 @contextmanager
 def create_dv(
-    dv_name,
-    namespace,
-    storage_class,
-    volume_mode=None,
-    url=None,
-    source="http",
-    content_type=DataVolume.ContentType.KUBEVIRT,
-    size="5Gi",
-    secret=None,
-    cert_configmap=None,
-    hostpath_node=None,
-    access_modes=None,
-    client=None,
-    source_pvc=None,
-    source_namespace=None,
-    multus_annotation=None,
-    teardown=True,
-    consume_wffc=True,
-    bind_immediate=None,
-    preallocation=None,
-    api_name="storage",
-    source_ref=None,
-):
+    dv_name: str,
+    namespace: str,
+    client: DynamicClient,
+    storage_class: str | None = None,
+    access_modes: str | None = None,
+    volume_mode: str | None = None,
+    url: str | None = None,
+    source: str | None = None,
+    content_type: str | None = None,
+    size: str = "5Gi",
+    secret_name: str | None = None,
+    cert_configmap_name: str | None = None,
+    source_pvc_name: str | None = None,
+    source_pvc_namespace: str | None = None,
+    annotations: dict[str, str] | None = None,
+    teardown: bool = True,
+    consume_wffc: bool = True,
+    preallocation: bool | None = None,
+    api_name: str = "storage",
+    source_ref: dict[str, Any] | None = None,
+    source_dict: dict[str, Any] | None = None,
+    use_artifactory: bool = False,
+) -> Generator[DataVolume]:
+    """
+    Create and manage a DataVolume with optional Artifactory resource lifecycle.
+
+    Context manager that constructs a DataVolume from either a pre-built ``source_dict``/``source_ref``
+    or by building one via ``construct_datavolume_source_dict`` from the ``source`` parameter.
+    When ``use_artifactory`` is True for http/registry sources, creates namespace-scoped
+    Artifactory Secret and ConfigMap resources that are cleaned up on exit.
+
+    Args:
+        dv_name: Name for the DataVolume resource.
+        namespace: Target Kubernetes namespace.
+        client: Kubernetes dynamic client.
+        storage_class: StorageClass name.
+        access_modes: PVC access mode (e.g. "ReadWriteOnce").
+        volume_mode: PVC volume mode ("Block" or "Filesystem").
+        url: Source URL for http/registry sources.
+        source: Source type ("http", "registry", "pvc", "blank", "upload").
+            Used to construct ``source_dict`` when neither ``source_dict`` nor ``source_ref`` is provided.
+        content_type: CDI content type (e.g. "kubevirt").
+        size: PVC size (default "5Gi").
+        secret_name: Pre-existing Secret name for source authentication.
+        cert_configmap_name: Pre-existing ConfigMap name for TLS certificates.
+        source_pvc_name: PVC name for clone sources.
+        source_pvc_namespace: Namespace of the source PVC for clone sources.
+        annotations: Annotations dict to apply to the DataVolume.
+        teardown: Whether to delete the DataVolume on context exit.
+        consume_wffc: Whether to create a dummy consumer pod for WaitForFirstConsumer storage classes.
+        preallocation: Whether to preallocate the target PVC.
+        api_name: CDI API group name (default "storage").
+        source_ref: Pre-built sourceRef dict for DataVolume.
+        source_dict: Pre-built source dict for DataVolume.
+        use_artifactory: Whether to create Artifactory Secret/ConfigMap for http/registry sources.
+
+    Yields:
+        DataVolume: The created DataVolume resource.
+
+    Raises:
+        ValueError: If ``source`` is not provided when ``source_dict`` and ``source_ref`` are both None.
+    """
     artifactory_secret = None
-    cert_created = None
+    artifactory_config_map = None
 
-    if source_ref:
-        source = None
-    if source in ("http", "https"):
-        if not utilities.infra.url_excluded_from_validation(url):
-            # Make sure URL exists
-            validate_file_exists_in_url(url=url)
-        if not secret:
-            secret = utilities.artifactory.get_artifactory_secret(namespace=namespace)
-            artifactory_secret = secret
-        if not cert_configmap:
-            cert_created = utilities.artifactory.get_artifactory_config_map(namespace=namespace)
-            cert_configmap = cert_created.name
+    try:
+        if source_dict is None and source_ref is None:
+            if not source:
+                raise ValueError("'source' is required when 'source_dict' and 'source_ref' are not provided")
 
-    with DataVolume(
-        source=source,
-        name=dv_name,
-        namespace=namespace,
-        url=url,
-        content_type=content_type,
-        size=size,
-        storage_class=storage_class,
-        cert_configmap=cert_configmap,
-        volume_mode=volume_mode,
-        hostpath_node=hostpath_node,
-        access_modes=access_modes,
-        secret=secret,
-        client=client,
-        source_pvc=source_pvc,
-        source_namespace=source_namespace,
-        bind_immediate_annotation=bind_immediate,
-        multus_annotation=multus_annotation,
-        teardown=teardown,
-        preallocation=preallocation,
-        api_name=api_name,
-        source_ref=source_ref,
-    ) as dv:
-        if sc_volume_binding_mode_is_wffc(sc=storage_class) and consume_wffc:
-            create_dummy_first_consumer_pod(dv=dv)
-        yield dv
-    utilities.artifactory.cleanup_artifactory_secret_and_config_map(
-        artifactory_secret=artifactory_secret, artifactory_config_map=cert_created
-    )
+            LOGGER.info("No 'source_dict' or 'source_ref' provided - will construct the 'source_dict'")
+
+            if source in ("http", "registry") and use_artifactory:
+                LOGGER.info(f"Creating artifactory resources for DV '{dv_name}' in namespace '{namespace}'")
+                LOGGER.info(f"DV source is '{source}' with url: {url}")
+
+                if not secret_name:
+                    artifactory_secret = utilities.artifactory.get_artifactory_secret(
+                        namespace=namespace, client=client
+                    )
+                    secret_name = artifactory_secret.name
+                if not cert_configmap_name:
+                    artifactory_config_map = utilities.artifactory.get_artifactory_config_map(
+                        namespace=namespace, client=client
+                    )
+                    cert_configmap_name = artifactory_config_map.name
+
+            source_dict = construct_datavolume_source_dict(
+                source=source,
+                url=url,
+                secret_name=secret_name,
+                cert_configmap_name=cert_configmap_name,
+                source_pvc_name=source_pvc_name,
+                source_pvc_namespace=source_pvc_namespace,
+            )
+
+        with DataVolume(
+            name=dv_name,
+            namespace=namespace,
+            client=client,
+            content_type=content_type,
+            size=size,
+            storage_class=storage_class,
+            access_modes=access_modes,
+            volume_mode=volume_mode,
+            annotations=annotations,
+            teardown=teardown,
+            preallocation=preallocation,
+            api_name=api_name,
+            source_ref=source_ref,
+            source_dict=source_dict,
+        ) as dv:
+            if storage_class and sc_volume_binding_mode_is_wffc(sc=storage_class, client=client) and consume_wffc:
+                create_dummy_first_consumer_pod(client=client, dv=dv)
+            yield dv
+
+    finally:
+        utilities.artifactory.cleanup_artifactory_secret_and_config_map(
+            artifactory_secret=artifactory_secret, artifactory_config_map=artifactory_config_map
+        )
 
 
 def data_volume(
-    namespace,
-    storage_class_matrix=None,
-    storage_class=None,
-    schedulable_nodes=None,
-    request=None,
-    os_matrix=None,
-    check_dv_exists=False,
-    admin_client=None,
-    bind_immediate=None,
-    client=None,
-):
+    namespace: Namespace,
+    client: DynamicClient,
+    storage_class_matrix: dict[str, dict[str, Any]] | None = None,
+    storage_class: str | None = None,
+    request: FixtureRequest | None = None,
+    os_matrix: dict[str, dict[str, Any]] | None = None,
+    check_dv_exists: bool = False,
+    bind_immediate: bool | None = None,
+) -> Generator[DataVolume]:
     """
     DV creation using create_dv.
 
     Args:
-        namespace (:obj: `Namespace`): namespace resource
-        storage_class_matrix (dict): Contains current storage_class_matrix attributes
-        storage_class (str): Storage class name
-        schedulable_nodes (list): List of schedulable nodes objects
+        namespace: The Namespace object where the DataVolume will be created.
+        client: DynamicClient for API operations.
+        storage_class_matrix (dict): Optional dictionary containing storage class configuration.
+        storage_class (str): Name of the storage class to use.
+        request: Optional pytest request fixture containing parametrized test data in request.param.
         os_matrix (dict): Contains current os_matrix attributes
         check_dv_exists (bool): Skip DV creation if DV exists. Used for golden images. IF the DV exists in golden images
-        namespace, it can be used for cloning.
-        bind_immediate (bool): if True, cdi.kubevirt.io/storage.bind.immediate.requested annotation
+            namespace, it can be used for cloning.
+        bind_immediate (bool): If True, adds the cdi.kubevirt.io/storage.bind.immediate.requested annotation
 
     Yields:
-        obj `DataVolume`: DV resource
-
+        DataVolume: The created or existing DataVolume resource.
     """
-    if not storage_class_matrix:
-        storage_class_matrix = get_storage_class_dict_from_matrix(storage_class=storage_class)
-
-    storage_class = [*storage_class_matrix][0]
-    # Save with a different name to avoid confusing.
-
     params_dict = request.param if request else {}
+
+    if storage_class_matrix:
+        storage_class = [*storage_class_matrix][0]
+    else:
+        storage_class = storage_class or params_dict.get("storage_class")
 
     # Set DV attributes
     # DV name is the only mandatory value
@@ -218,10 +341,7 @@ def data_volume(
     # rhel_os_matrix or windows_os_matrix (passed as os_matrix)
     source = params_dict.get("source", "http")
     consume_wffc = params_dict.get("consume_wffc", True)
-
-    # DV namespace may not be in the same namespace as the originating test
-    # If a namespace is passes in request.param, use it instead of the test's namespace
-    dv_namespace = params_dict.get("dv_namespace", namespace.name)
+    dv_namespace = namespace.name
 
     if os_matrix:
         os_matrix_key = [*os_matrix][0]
@@ -230,7 +350,7 @@ def data_volume(
         dv_size = os_matrix[os_matrix_key].get("dv_size")
     else:
         image = params_dict.get("image", "")
-        dv_name = params_dict.get("dv_name").replace(".", "-").lower()
+        dv_name = (params_dict.get("dv_name") or "").replace(".", "-").lower()
         dv_size = params_dict.get("dv_size")
 
     # Don't need URL for DVs that are not http
@@ -246,7 +366,7 @@ def data_volume(
         consume_wffc = False
         bind_immediate = True
         try:
-            golden_image = list(DataVolume.get(dyn_client=admin_client, name=dv_name, namespace=dv_namespace))
+            golden_image = list(DataVolume.get(client=client, name=dv_name, namespace=dv_namespace))
             yield golden_image[0]
         except NotFoundError:
             LOGGER.warning(f"Golden image {dv_name} not found; DV will be created.")
@@ -256,31 +376,36 @@ def data_volume(
         "namespace": dv_namespace,
         "source": source,
         "size": dv_size,
-        "storage_class": params_dict.get("storage_class", storage_class),
+        "storage_class": storage_class,
         "access_modes": params_dict.get("access_modes"),
         "volume_mode": params_dict.get("volume_mode"),
-        "content_type": DataVolume.ContentType.KUBEVIRT,
         "consume_wffc": consume_wffc,
-        "bind_immediate": bind_immediate,
+        "annotations": BIND_IMMEDIATE_ANNOTATION if bind_immediate else None,
         "preallocation": params_dict.get("preallocation", None),
         "url": url,
         "client": client,
+        "use_artifactory": source == "http",
     }
-    if params_dict.get("cert_configmap"):
-        dv_kwargs["cert_configmap"] = params_dict.get("cert_configmap")
+    if params_dict.get("cert_configmap_name"):
+        dv_kwargs["cert_configmap_name"] = params_dict["cert_configmap_name"]
     # Create dv
     with create_dv(**{k: v for k, v in dv_kwargs.items() if v is not None}) as dv:
         if params_dict.get("wait", True):
             if source == "upload":
                 dv.wait_for_status(status=DataVolume.Status.UPLOAD_READY, timeout=TIMEOUT_3MIN)
             else:
-                if not consume_wffc and sc_volume_binding_mode_is_wffc(sc=storage_class) and not bind_immediate:
+                if (
+                    not consume_wffc
+                    and storage_class
+                    and sc_volume_binding_mode_is_wffc(sc=storage_class, client=client)
+                    and not bind_immediate
+                ):
                     # In the case of WFFC Storage Class && caller asking to NOT consume && WFFC feature gate enabled
                     # and bind_immediate is False (i.e bind_immediate annotation will be added, import will not wait
                     # first consumer)
                     # We will hand out a DV that has nothing on it, just waiting to be further consumed by kubevirt
                     # It will be in a status 'PendingPopulation' (for csi storage)
-                    dv.wait_for_status(status="PendingPopulation", timeout=TIMEOUT_10SEC)
+                    dv.wait_for_status(status=dv.Status.PENDING_POPULATION, timeout=TIMEOUT_10SEC)
                 else:
                     dv.wait_for_dv_success(timeout=TIMEOUT_60MIN if OS_FLAVOR_WINDOWS in image else TIMEOUT_30MIN)
         yield dv
@@ -304,8 +429,7 @@ def get_downloaded_artifact(remote_name, local_name):
     with requests.get(url, headers=artifactory_header, verify=False, stream=True) as created_request:
         created_request.raise_for_status()
         with open(local_name, "wb") as file_downloaded:
-            for chunk in created_request.iter_content(chunk_size=8192):
-                file_downloaded.write(chunk)
+            file_downloaded.writelines(created_request.iter_content(chunk_size=8192))
     try:
         assert os.path.isfile(local_name)
         return True
@@ -315,7 +439,7 @@ def get_downloaded_artifact(remote_name, local_name):
         raise
 
 
-def get_storage_class_dict_from_matrix(storage_class):
+def get_storage_class_dict_from_matrix(storage_class: str) -> dict:
     storages = py_config["system_storage_class_matrix"]
     matching_storage_classes = [sc for sc in storages if [*sc][0] == storage_class]
     if not matching_storage_classes:
@@ -323,15 +447,11 @@ def get_storage_class_dict_from_matrix(storage_class):
     return matching_storage_classes[0]
 
 
-def sc_is_hpp_with_immediate_volume_binding(sc):
+def sc_volume_binding_mode_is_wffc(sc: str, client: DynamicClient) -> bool:
     return (
-        sc == "hostpath-provisioner"
-        and StorageClass(name=sc).instance["volumeBindingMode"] == StorageClass.VolumeBindingMode.Immediate
+        StorageClass(name=sc, client=client).instance["volumeBindingMode"]
+        == StorageClass.VolumeBindingMode.WaitForFirstConsumer
     )
-
-
-def sc_volume_binding_mode_is_wffc(sc):
-    return StorageClass(name=sc).instance["volumeBindingMode"] == StorageClass.VolumeBindingMode.WaitForFirstConsumer
 
 
 @contextmanager
@@ -340,6 +460,7 @@ def virtctl_volume(
     namespace,
     vm_name,
     volume_name,
+    bus=None,
     serial=None,
     persist=None,
 ):
@@ -354,6 +475,8 @@ def virtctl_volume(
         command.append(f"--serial={serial}")
     if persist:
         command.append("--persist")
+    if bus:
+        command.append(f"--bus={bus}")
 
     yield utilities.infra.run_virtctl_command(command=command, namespace=namespace)
     # clean up:
@@ -406,6 +529,7 @@ def virtctl_upload_dv(
     name,
     image_path,
     size,
+    client,
     pvc=False,
     storage_class=None,
     volume_mode=None,
@@ -425,7 +549,9 @@ def virtctl_upload_dv(
         f"--size={size}",
     ]
     resource_to_cleanup = (
-        PersistentVolumeClaim(namespace=namespace, name=name) if pvc else DataVolume(namespace=namespace, name=name)
+        PersistentVolumeClaim(namespace=namespace, name=name, client=client)
+        if pvc
+        else DataVolume(namespace=namespace, name=name, client=client)
     )
     if pvc:
         command[1] = "pvc"
@@ -451,7 +577,7 @@ def virtctl_upload_dv(
         command.append(f"--volume-mode={volume_mode.lower()}")
     if no_create:
         command.append("--no-create")
-    if sc_volume_binding_mode_is_wffc(sc=storage_class) and consume_wffc and not no_create:
+    if sc_volume_binding_mode_is_wffc(sc=storage_class, client=client) and consume_wffc and not no_create:
         command.append("--force-bind")
 
     yield utilities.infra.run_virtctl_command(command=command, namespace=namespace)
@@ -539,39 +665,54 @@ class PodWithPVC(Pod):
         )
 
 
-def data_volume_template_dict(
-    target_dv_name,
-    target_dv_namespace,
-    source_dv,
-    volume_mode=None,
-    size=None,
-    storage_class=None,
-):
-    source_dv_pvc_spec = source_dv.pvc.instance.spec
+def data_volume_template_dict_with_pvc_source(
+    target_dv_name: str,
+    target_dv_namespace: str,
+    source_dv: DataVolume,
+    volume_mode: str | None = None,
+    size: str | None = None,
+    storage_class: str | None = None,
+) -> dict[str, Any]:
     dv = DataVolume(
         name=target_dv_name,
         namespace=target_dv_namespace,
-        source="pvc",
-        storage_class=storage_class or source_dv_pvc_spec.storageClassName,
-        volume_mode=volume_mode or source_dv_pvc_spec.volumeMode,
+        client=source_dv.client,
+        source_dict=construct_datavolume_source_dict(
+            source="pvc",
+            source_pvc_name=source_dv.name,
+            source_pvc_namespace=source_dv.namespace,
+        ),
+        storage_class=storage_class,
+        volume_mode=volume_mode,
         size=size or source_dv.size,
-        source_pvc=source_dv.name,
-        source_namespace=source_dv.namespace,
-        api_name=source_dv.api_name,
+        api_name="storage",
     )
     dv.to_dict()
     return dv.res
 
 
-def data_volume_template_with_source_ref_dict(data_source, storage_class=None):
-    source_dict = data_source.source.instance.to_dict()
-    source_spec_dict = source_dict["spec"]
+def data_volume_template_with_source_ref_dict(
+    data_source: DataSource, storage_class: str | None = None, name: str | None = None
+) -> dict[str, Any]:
+    """Build a DataVolume template dict backed by a DataSource source reference.
+
+    Args:
+        data_source: The DataSource to clone from.
+        storage_class: Storage class for the PVC; if None, the cluster default is used.
+        name: Explicit DataVolume name. If None, a unique name is generated from the
+            DataSource name. The namespace is stripped from the returned dict so the
+            template is safe to embed in a VM's ``dataVolumeTemplates`` list.
+
+    Returns:
+        Mutable DataVolume resource dict with ``metadata.namespace`` removed, ready for
+        use in VM ``dataVolumeTemplates``.
+    """
     dv = DataVolume(
-        name=utilities.infra.unique_name(name=data_source.name),
+        name=name if name is not None else utilities.infra.unique_name(name=data_source.name),
         namespace=data_source.namespace,
-        size=source_spec_dict.get("resources", {}).get("requests", {}).get("storage")
-        or source_dict.get("status", {}).get("restoreSize"),
-        storage_class=storage_class or source_spec_dict.get("storageClassName"),
+        client=data_source.client,
+        size=get_dv_size_from_datasource(data_source=data_source),
+        storage_class=storage_class,
         api_name="storage",
         source_ref={
             "kind": data_source.kind,
@@ -595,88 +736,173 @@ def overhead_size_for_dv(image_size, overhead_value):
     return f"{math.ceil(dv_size)}Mi"
 
 
-def cdi_feature_gate_list_with_added_feature(feature):
+def cdi_feature_gate_list_with_added_feature(feature: str, client: DynamicClient) -> list[str]:
     return [
-        *CDIConfig(name="config").instance.to_dict().get("spec", {}).get("featureGates", []),
+        *CDIConfig(name="config", client=client).instance.to_dict().get("spec", {}).get("featureGates", []),
         feature,
     ]
 
 
-def wait_for_default_sc_in_cdiconfig(cdi_config, sc):
-    """
-    Wait for the default storage class to propagate to CDIConfig as the storage class for scratch space
-    """
-    samples = TimeoutSampler(
-        wait_timeout=TIMEOUT_20SEC,
-        sleep=TIMEOUT_1SEC,
-        func=lambda: cdi_config.scratch_space_storage_class_from_status == sc,
-    )
-    for sample in samples:
-        if sample:
-            return
-
-
 def get_hyperconverged_cdi(admin_client):
     for cdi in CDI.get(
-        dyn_client=admin_client,
+        client=admin_client,
         name="cdi-kubevirt-hyperconverged",
     ):
         return cdi
 
 
-def write_file(vm, filename, content, stop_vm=True):
-    """Start VM if not running, write a file in the VM and stop the VM"""
+def write_file(
+    vm: virt_util.VirtualMachineForTests,
+    filename: str,
+    content: str,
+    stop_vm: bool = True,
+    kubeconfig: str | None = None,
+) -> None:
+    """
+    Start VM if not running, write a file in the VM and stop the VM.
+
+    Args:
+        vm: VirtualMachine instance
+        filename: Path to the file to write in the VM
+        content: Content to write to the file
+        stop_vm: Whether to stop the VM after writing the file
+        kubeconfig: Optional path to kubeconfig file for remote cluster access
+    """
     if not vm.ready:
         vm.start(wait=True)
-    with console.Console(vm=vm) as vm_console:
-        vm_console.sendline(f"echo '{content}' >> {filename}")
+    prompt = r"\$ "
+    with console.Console(vm=vm, prompt=prompt, kubeconfig=kubeconfig) as vm_console:
+        vm_console.sendline(f"echo '{content}' >> {filename} && sync")
+        vm_console.expect(prompt)
     if stop_vm:
         vm.stop(wait=True)
 
 
-def write_file_via_ssh(vm: virt_util.VirtualMachineForTests, filename: str, content: str) -> None:
+def write_file_via_ssh(
+    vm: virt_util.VirtualMachineForTests, filename: str, content: str, use_sudo: bool = False
+) -> None:
     """
-    Write content to a file in VM using SSH connection.
+    Write content to a file in VM using SSH connection with retry.
 
     Args:
         vm: VirtualMachine instance with SSH connectivity
         filename: Path to the file to write in the VM
         content: Content to write to the file
+        use_sudo: Write via "sudo tee" instead of shell redirection. Required for paths the
+            unprivileged SSH user cannot write directly, e.g. raw block devices.
     """
-    cmd = shlex.split(f"echo {shlex.quote(content)} > {shlex.quote(filename)} && sync")
-    run_ssh_commands(host=vm.ssh_exec, commands=cmd)
+    quoted_content = shlex.quote(s=content)
+    quoted_filename = shlex.quote(s=filename)
+    if use_sudo:
+        cmd = shlex.split(f"echo {quoted_content} | sudo tee {quoted_filename} && sync")
+    else:
+        cmd = shlex.split(f"echo {quoted_content} > {quoted_filename} && sync")
+    run_ssh_commands(host=vm.ssh_exec, commands=cmd, wait_timeout=TIMEOUT_2MIN, sleep=TIMEOUT_5SEC)
 
 
-def run_command_on_cirros_vm_and_check_output(vm, command, expected_result):
-    with console.Console(vm=vm) as vm_console:
-        vm_console.sendline(command)
-        vm_console.expect(expected_result, timeout=20)
+def write_file_windows_vm(vm: virt_util.VirtualMachineForTests, file_path: str, content: str) -> None:
+    """
+    Write content to a file on Windows VM using PowerShell over SSH with retry.
+
+    Args:
+        vm: Windows VirtualMachine instance with SSH connectivity
+        file_path: Full path to the file on Windows (e.g., "C:/test.txt")
+        content: Content to write to the file
+    """
+    cmd = shlex.split(f'powershell -command "\\"{content}\\" | Out-File -FilePath {file_path} -Append"')
+    run_ssh_commands(host=vm.ssh_exec, commands=cmd, wait_timeout=TIMEOUT_2MIN, sleep=TIMEOUT_5SEC)
 
 
-def assert_disk_serial(vm, command=shlex.split("sudo ls /dev/disk/by-id")):
-    assert HOTPLUG_DISK_SERIAL in run_ssh_commands(host=vm.ssh_exec, commands=command)[0], (
-        f"hotplug disk serial id {HOTPLUG_DISK_SERIAL} is not in VM"
+def run_command_on_vm_and_check_output(
+    vm: virt_util.VirtualMachineForTests, command: str, expected_result: str
+) -> None:
+    """Run command on VM via SSH with retry and verify output matches expected result.
+
+    Command execution is retried with 2-minute timeout and 5-second intervals.
+
+    Args:
+        vm (VirtualMachineForTests): VM to run command on.
+        command (str): Command to run.
+        expected_result (str): Expected result to check.
+
+    Raises:
+        AssertionError: If command output differs from expected result.
+    """
+    cmd_output = run_ssh_commands(
+        host=vm.ssh_exec,
+        commands=shlex.split(f"bash -c {shlex.quote(command)}"),
+        wait_timeout=TIMEOUT_2MIN,
+        sleep=TIMEOUT_5SEC,
+    )[0].strip()
+    expected_result = expected_result.strip()
+    assert expected_result == cmd_output, (
+        f"Command output mismatch.\nCommand: {command}\nExpected: '{expected_result}'\nActual: '{cmd_output}'"
     )
 
 
-def assert_hotplugvolume_nonexist_optional_restart(vm, restart=False):
-    if restart:
-        virt_util.restart_vm_wait_for_running_vm(vm=vm)
-    volume_status = vm.vmi.instance.status.volumeStatus[0]
-    assert HOTPLUG_VOLUME not in volume_status, (
-        f"{HOTPLUG_VOLUME} in {volume_status}, hotplug disk should become a regular disk for VM after restart"
-    )
+def assert_disk_serial(
+    vm: virt_util.VirtualMachineForTests,
+    serials: list[str] | None = None,
+    command: list[str] = _DEFAULT_DISK_SERIAL_COMMAND,
+) -> None:
+    """Assert that hotplug disk serial(s) are visible inside the VM.
+
+    Args:
+        vm: Virtual machine instance to inspect.
+        serials: Serial strings to verify. Defaults to [HOTPLUG_DISK_SERIAL].
+        command: Shell command whose output is searched for the serial strings.
+    """
+    if serials is None:
+        serials = [HOTPLUG_DISK_SERIAL]
+    output = run_ssh_commands(host=vm.ssh_exec, commands=command, wait_timeout=TIMEOUT_2MIN, sleep=TIMEOUT_5SEC)[0]
+    missing = [serial for serial in serials if serial not in output]
+    assert not missing, f"Disk serial(s) {missing} not found in VM, output: {output}"
 
 
-def wait_for_vm_volume_ready(vm):
+def assert_hotplugvolume_nonexist(vm: virt_util.VirtualMachineForTests) -> None:
+    """Assert no volume in the VM still carries a hotplugVolume marker.
+
+    After a hotplugged disk is persisted the marker must be removed from every
+    volumeStatus entry; a leftover indicates the disk was not fully converted
+    to a regular disk.
+
+    Args:
+        vm: Virtual machine instance to inspect.
+    """
+    hotplug_statuses = [status for status in vm.vmi.instance.status.volumeStatus if HOTPLUG_VOLUME in status]
+    assert not hotplug_statuses, f"Hotplug disk was not converted to a regular disk in {hotplug_statuses}"
+
+
+def wait_for_vm_volume_ready(
+    vm: virt_util.VirtualMachineForTests, volume_name: str, wait_for_disk_in_spec: bool = True
+) -> None:
+    """Wait for a volume to be ready in the VM.
+
+    Args:
+        vm: Virtual machine instance
+        volume_name: Name of the volume to wait for
+        wait_for_disk_in_spec: If True, also waits for the disk to appear in VM spec (needed for persist=True)
+    """
     sampler = TimeoutSampler(
         wait_timeout=TIMEOUT_2MIN,
         sleep=TIMEOUT_1SEC,
         func=lambda: vm.vmi.instance,
     )
     for sample in sampler:
-        if sample.status.volumeStatus[0]["reason"] == "VolumeReady":
-            return
+        volume_status = next(
+            (
+                volume_status_entry
+                for volume_status_entry in sample.status.volumeStatus
+                if volume_status_entry.get("name") == volume_name
+            ),
+            None,
+        )
+        if volume_status and volume_status.get("reason") == "VolumeReady":
+            # If persist is used, also wait for disk in spec
+            if not wait_for_disk_in_spec or any(
+                disk.get("name") == volume_name for disk in sample.spec.domain.devices.disks
+            ):
+                return
 
 
 def generate_data_source_dict(dv):
@@ -701,7 +927,7 @@ def create_or_update_data_source(admin_client, dv):
     target_name = dv.name
     target_namespaces = dv.namespace
     try:
-        for data_source in DataSource.get(dyn_client=admin_client, name=target_name, namespace=target_namespaces):
+        for data_source in DataSource.get(client=admin_client, name=target_name, namespace=target_namespaces):
             LOGGER.info(f"Updating existing dataSource {data_source.name}")
             with ResourceEditor(patches={data_source: generate_data_source_dict(dv=dv)}):
                 yield data_source
@@ -732,13 +958,14 @@ class HppCsiStorageClass(StorageClass):
         HOSTPATH_CSI_PVC_TEMPLATE_OCS_FS = f"{HPP_CSI}-pvc-template-ocs-fs"
         HOSTPATH_CSI_PVC_TEMPLATE_LSO = f"{HPP_CSI}-pvc-template-lso"
 
-    def __init__(self, name, storage_pool=None, teardown=True):
+    def __init__(self, name, client, storage_pool=None, teardown=True):
         super().__init__(
             name=name,
             teardown=teardown,
             provisioner=StorageClass.Provisioner.HOSTPATH_CSI,
             reclaim_policy=StorageClass.ReclaimPolicy.DELETE,
             volume_binding_mode=StorageClass.VolumeBindingMode.WaitForFirstConsumer,
+            client=client,
         )
         self._storage_pool = storage_pool
 
@@ -750,8 +977,8 @@ class HppCsiStorageClass(StorageClass):
             })
 
 
-def get_default_storage_class():
-    storage_classes = list(StorageClass.get())
+def get_default_storage_class(client: DynamicClient) -> StorageClass:
+    storage_classes = list(StorageClass.get(client=client))
     for annotation in [StorageClass.Annotations.IS_DEFAULT_VIRT_CLASS, StorageClass.Annotations.IS_DEFAULT_CLASS]:
         for sc in storage_classes:
             if sc.instance.metadata.get("annotations", {}).get(annotation) == "true":
@@ -761,20 +988,36 @@ def get_default_storage_class():
 
 def is_snapshot_supported_by_sc(sc_name, client):
     sc_instance = StorageClass(client=client, name=sc_name).instance
-    for vsc in VolumeSnapshotClass.get(dyn_client=client):
+    for vsc in VolumeSnapshotClass.get(client=client):
         if vsc.instance.get("driver") == sc_instance.get("provisioner"):
             return True
     return False
 
 
-def check_disk_count_in_vm(vm):
-    LOGGER.info("Check disk count.")
-    out = run_ssh_commands(
-        host=vm.ssh_exec,
-        commands=[shlex.split("lsblk | grep disk | grep -v SWAP| wc -l")],
-    )[0].strip()
-    assert out == str(len(vm.instance.spec.template.spec.domain.devices.disks)), (
-        "Failed to verify actual disk count against VMI"
+def assert_guest_disk_count(vm: VirtualMachineForTests) -> None:
+    """Assert that the number of disks visible inside the guest matches the VM spec.
+
+    Swap disks are excluded from the count because they are provisioned by the OS
+    and not declared in the VM spec.
+
+    Args:
+        vm: A running VM with SSH access.
+
+    Raises:
+        AssertionError: If guest disk count does not match the VM spec disk count.
+    """
+    expected_disks = len(vm.instance.spec.template.spec.domain.devices.disks)
+    guest_disk_count = int(
+        run_ssh_commands(
+            host=vm.ssh_exec,
+            commands=[shlex.split("lsblk --nodeps --noheadings | grep disk | grep -v SWAP | wc -l")],
+            wait_timeout=TIMEOUT_2MIN,
+            sleep=TIMEOUT_5SEC,
+        )[0].strip()
+    )
+    LOGGER.info(f"Guest reports {guest_disk_count} disk(s), VM spec declares {expected_disks} disk(s)")
+    assert guest_disk_count == expected_disks, (
+        f"Guest disk count ({guest_disk_count}) does not match VM spec ({expected_disks} disks expected)"
     )
 
 
@@ -819,16 +1062,18 @@ def add_dv_to_vm(vm, dv_name=None, template_dv=None):
 
 def create_hpp_storage_class(
     storage_class_name,
+    admin_client,
 ):
     storage_class = HppCsiStorageClass(
         name=storage_class_name,
+        client=admin_client,
     )
     storage_class.deploy()
 
 
 class HPPWithStoragePool(HostPathProvisioner):
-    def __init__(self, name, backend_storage_class_name, volume_size, teardown=False):
-        super().__init__(name=name, teardown=teardown)
+    def __init__(self, name, backend_storage_class_name, volume_size, client, teardown=False):
+        super().__init__(name=name, teardown=teardown, client=client)
         self.backend_storage_class_name = backend_storage_class_name
         self.volume_size = volume_size
 
@@ -862,9 +1107,9 @@ class HPPWithStoragePool(HostPathProvisioner):
         })
 
 
-def wait_for_hpp_pool_pods_to_be_running(client, schedulable_nodes):
+def wait_for_hpp_pool_pods_to_be_running(admin_client, schedulable_nodes):
     LOGGER.info(f"Wait for {HPP_POOL} pods to be Running")
-    for hpp_pool_pods in wait_for_hpp_pods(client=client, pod_prefix=HPP_POOL):
+    for hpp_pool_pods in wait_for_hpp_pods(client=admin_client, pod_prefix=HPP_POOL):
         if len(hpp_pool_pods) == len(schedulable_nodes):
             for pod in hpp_pool_pods:
                 pod.wait_for_status(status=pod.Status.RUNNING, timeout=TIMEOUT_2MIN)
@@ -893,7 +1138,7 @@ def wait_for_hpp_pods(client, pod_prefix):
         wait_timeout=TIMEOUT_2MIN,
         sleep=3,
         func=utilities.infra.get_pod_by_name_prefix,
-        dyn_client=client,
+        client=client,
         namespace=py_config["hco_namespace"],
         pod_prefix=f"{pod_prefix}-",
         get_all=True,
@@ -901,12 +1146,12 @@ def wait_for_hpp_pods(client, pod_prefix):
 
 
 def verify_hpp_pool_health(admin_client, schedulable_nodes, hco_namespace):
-    wait_for_hpp_pool_pods_to_be_running(client=admin_client, schedulable_nodes=schedulable_nodes)
+    wait_for_hpp_pool_pods_to_be_running(admin_client=admin_client, schedulable_nodes=schedulable_nodes)
     # Check there are as many 'hpp-pool-' PVCs as schedulable_nodes, and they are Bound
     verify_hpp_pool_pvcs_are_bound(schedulable_nodes=schedulable_nodes, hco_namespace=hco_namespace)
 
 
-def wait_for_cdi_worker_pod(pod_name, storage_ns_name):
+def wait_for_cdi_worker_pod(pod_name, storage_ns_name, admin_client):
     try:
         for sample in TimeoutSampler(
             wait_timeout=TIMEOUT_30SEC,
@@ -915,6 +1160,7 @@ def wait_for_cdi_worker_pod(pod_name, storage_ns_name):
                 Pod.get(
                     namespace=storage_ns_name,
                     label_selector=CDI_LABEL,
+                    client=admin_client,
                 )
             ),
         ):
@@ -927,19 +1173,25 @@ def wait_for_cdi_worker_pod(pod_name, storage_ns_name):
         raise
 
 
-def get_storage_class_with_specified_volume_mode(volume_mode, sc_names):
+def get_storage_class_with_specified_volume_mode(
+    volume_mode: str, sc_names: list[str], client: DynamicClient
+) -> str | None:
     sc_with_volume_mode = f"Storage class with volume mode '{volume_mode}'"
     for storage_class_name in sc_names:
-        for claim_property_set in StorageProfile(name=storage_class_name).instance.status["claimPropertySets"]:
+        for claim_property_set in StorageProfile(name=storage_class_name, client=client).instance.status[
+            "claimPropertySets"
+        ]:
             if claim_property_set["volumeMode"] == volume_mode:
                 LOGGER.info(f"{sc_with_volume_mode}: '{storage_class_name}'")
                 return storage_class_name
     LOGGER.error(f"No {sc_with_volume_mode} among {sc_names}")
+    return None
 
 
 @contextmanager
 def create_vm_from_dv(
     dv,
+    client: DynamicClient,
     vm_name="cirros-vm",
     image=None,
     start=True,
@@ -949,7 +1201,6 @@ def create_vm_from_dv(
     memory_guest=Images.Cirros.DEFAULT_MEMORY_SIZE,
     wait_for_cloud_init=False,
     wait_for_interfaces=False,
-    client=None,
 ):
     with virt_util.VirtualMachineForTests(
         name=vm_name,
@@ -990,9 +1241,9 @@ def update_default_sc(default, storage_class):
         yield
 
 
-def verify_dv_and_pvc_does_not_exist(name, namespace, timeout=TIMEOUT_10MIN):
-    dv = DataVolume(namespace=namespace, name=name)
-    pvc = PersistentVolumeClaim(namespace=namespace, name=name)
+def verify_dv_and_pvc_does_not_exist(name: str, namespace: str, client: DynamicClient, timeout: int = TIMEOUT_10MIN):
+    dv = DataVolume(namespace=namespace, name=name, client=client)
+    pvc = PersistentVolumeClaim(namespace=namespace, name=name, client=client)
 
     samples = TimeoutSampler(wait_timeout=timeout, sleep=TIMEOUT_5SEC, func=lambda: dv.exists or pvc.exists)
     try:
@@ -1004,11 +1255,11 @@ def verify_dv_and_pvc_does_not_exist(name, namespace, timeout=TIMEOUT_10MIN):
         raise
 
 
-def wait_for_volume_snapshot_ready_to_use(namespace, name):
+def wait_for_volume_snapshot_ready_to_use(namespace: str, name: str, client: DynamicClient) -> VolumeSnapshot:
     ready_to_use_status = "readyToUse"
     LOGGER.info(f"Wait for VolumeSnapshot '{name}' in '{namespace}' to be '{ready_to_use_status}'")
-    volume_snapshot = VolumeSnapshot(namespace=namespace, name=name)
-    volume_snapshot.wait()
+    volume_snapshot = VolumeSnapshot(namespace=namespace, name=name, client=client)
+    volume_snapshot.wait(timeout=TIMEOUT_10MIN)
     try:
         for sample in TimeoutSampler(
             wait_timeout=TIMEOUT_5MIN,
@@ -1024,8 +1275,8 @@ def wait_for_volume_snapshot_ready_to_use(namespace, name):
         raise
 
 
-def wait_for_succeeded_dv(namespace, dv_name):
-    dv = DataVolume(namespace=namespace, name=dv_name)
+def wait_for_succeeded_dv(namespace: str, dv_name: str, client: DynamicClient):
+    dv = DataVolume(namespace=namespace, name=dv_name, client=client)
     try:
         samples = TimeoutSampler(
             wait_timeout=TIMEOUT_2MIN,
@@ -1042,21 +1293,43 @@ def wait_for_succeeded_dv(namespace, dv_name):
         raise
 
 
-def get_data_sources_managed_by_data_import_cron(namespace):
+def get_data_sources_managed_by_data_import_cron(client: DynamicClient, namespace: str) -> list[DataSource]:
     return list(
         DataSource.get(
+            client=client,
             namespace=namespace,
             label_selector=RESOURCE_MANAGED_BY_DATA_IMPORT_CRON_LABEL,
         )
     )
 
 
-def verify_boot_sources_reimported(admin_client: DynamicClient, namespace: str) -> bool:
-    """
-    Verify that the boot sources are re-imported while changing a storage class.
+def verify_boot_sources_reimported(
+    admin_client: DynamicClient,
+    namespace: str,
+    consecutive_checks_count: int = 6,
+    exclude_data_source_names: Collection[str] | None = None,
+) -> bool:
+    """Verify DataImportCron-managed DataSources reach Ready=True.
+
+    Checks DataSources sequentially each with its own timeout. Stops on the first
+    DataSource that does not become ready.
+
+    Args:
+        admin_client: Cluster admin client.
+        namespace: Namespace containing the DataImportCron-managed DataSources.
+        consecutive_checks_count: Consecutive Ready=True polls required for stability.
+        exclude_data_source_names: DataSources whose name is in this collection
+            are skipped (e.g. custom DIC templates without valid sources).
+            When None, all DIC-managed DataSources are verified.
+
+    Returns:
+        True if all non-excluded DIC-managed DataSources reached Ready=True, otherwise False
     """
     try:
-        for data_source in get_data_sources_managed_by_data_import_cron(namespace=namespace):
+        for data_source in get_data_sources_managed_by_data_import_cron(client=admin_client, namespace=namespace):
+            if exclude_data_source_names is not None and data_source.name in exclude_data_source_names:
+                LOGGER.info(f"Skipping DataSource {data_source.name}: excluded from verification")
+                continue
             LOGGER.info(f"Waiting for DataSource {data_source.name} consistent ready status")
             utilities.infra.wait_for_consistent_resource_conditions(
                 dynamic_client=admin_client,
@@ -1064,17 +1337,15 @@ def verify_boot_sources_reimported(admin_client: DynamicClient, namespace: str) 
                 resource_kind=DataSource,
                 namespace=namespace,
                 total_timeout=TIMEOUT_10MIN,
-                consecutive_checks_count=6,
+                consecutive_checks_count=consecutive_checks_count,
                 resource_name=data_source.name,
             )
         return True
-    except (TimeoutExpiredError, Exception) as exception:
-        fail_message = (
-            "Failed to re-import boot sources, exiting the pytest execution"
-            if isinstance(exception, TimeoutExpiredError)
-            else str(exception)
+    except TimeoutExpiredError as exception:
+        LOGGER.error(
+            f"Boot source DataSource did not reach Ready=True within {TIMEOUT_10MIN}s. "
+            f"namespace={namespace!r}, data_source={data_source.name!r}, timeout_error={exception!r}"
         )
-        LOGGER.error(fail_message)
         return False
 
 
@@ -1116,6 +1387,7 @@ def vm_snapshot(vm, name):
         name=name,
         namespace=vm.namespace,
         vm_name=vm.name,
+        client=vm.client,
     ) as snapshot:
         snapshot.wait_snapshot_done()
         virt_util.running_vm(vm=vm, wait_for_interfaces=False)
@@ -1130,3 +1402,69 @@ def validate_file_exists_in_url(url):
         raise UrlNotFoundError(url_request=response)
 
     return True
+
+
+def persist_storage_class_default(default: bool, storage_class: StorageClass) -> None:
+    """
+    Update the default storage class to be persistent.
+
+    Args:
+        default (bool): Whether the storage class should be the default storage class.
+        storage_class (StorageClass): The storage class to update.
+    """
+    is_default = str(default).lower()
+    editor = ResourceEditor(
+        patches={
+            storage_class: {
+                "metadata": {
+                    "annotations": {
+                        StorageClass.Annotations.IS_DEFAULT_CLASS: is_default,
+                        StorageClass.Annotations.IS_DEFAULT_VIRT_CLASS: is_default,
+                    },
+                    "name": storage_class.name,
+                },
+            }
+        }
+    )
+    # Apply the changes to be persistent without backup for restoration
+    editor.update(backup_resources=False)
+
+
+def get_dv_size_from_datasource(data_source: DataSource) -> str | int | None:
+    """
+    Returns the DataVolume size from a DataSource's underlying instance.
+
+    Args:
+        data_source: DataSource whose underlying instance size or restore size to read.
+
+    Returns:
+        The storage request value (str or int) from spec.resources.requests.storage if present;
+        otherwise the restore size from status.restoreSize; None if neither exists.
+    """
+    source_dict = data_source.source.instance.to_dict()
+    source_spec_dict = source_dict["spec"]
+    dv_size = source_spec_dict.get("resources", {}).get("requests", {}).get("storage") or source_dict.get(
+        "status", {}
+    ).get("restoreSize")
+    return dv_size
+
+
+def verify_file_in_windows_vm(
+    windows_vm: virt_util.VirtualMachineForTests, file_name_with_path: str, file_content: str
+) -> None:
+    """
+    Verify that a file on a Windows VM contains the expected content.
+
+    Args:
+        windows_vm: The Windows VM to check.
+        file_name_with_path: Full path to the file on the Windows guest (e.g., "C:/test.txt").
+        file_content: Expected file content.
+
+    Raises:
+        AssertionError: If file content does not match expected content.
+    """
+    cmd = shlex.split(f"powershell -NoProfile -Command \"Get-Content -LiteralPath '{file_name_with_path}'\"")
+    out = run_ssh_commands(host=windows_vm.ssh_exec, commands=cmd, wait_timeout=TIMEOUT_2MIN, sleep=TIMEOUT_5SEC)[
+        0
+    ].strip()
+    assert out == file_content, f"'{out}' does not equal '{file_content}'"

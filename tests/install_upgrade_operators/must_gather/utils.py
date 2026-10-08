@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 import difflib
 import glob
 import logging
@@ -14,7 +13,8 @@ from ocp_resources.resource import Resource
 from ocp_resources.service import Service
 
 from tests.install_upgrade_operators.relationship_labels.constants import PART_OF_LABEL_KEY
-from utilities.constants import HCO_PART_OF_LABEL_VALUE, NamespacesNames
+from utilities.constants.components import HCO_PART_OF_LABEL_VALUE
+from utilities.constants.namespaces import NamespacesNames
 from utilities.data_collector import get_data_collector_base_directory
 from utilities.exceptions import ResourceMismatch
 
@@ -54,7 +54,7 @@ FILE_NAMES_TO_CHECK = [
 # To be removed after the issue is fixed in openshift
 
 
-class ResourceFieldEqBugWorkaround(object):
+class ResourceFieldEqBugWorkaround:
     def __enter__(self):
         self.prev_eq_func = ResourceField.__eq__
 
@@ -105,7 +105,7 @@ def compare_resources(resource_instance, temp_dir, resource_path, checks):
 
 
 def check_list_of_resources(
-    dyn_client,
+    client,
     resource_type,
     temp_dir,
     resource_path,
@@ -114,7 +114,7 @@ def check_list_of_resources(
     label_selector=None,
     filter_resource=None,
 ):
-    list_of_resources = resource_type.get(dyn_client=dyn_client, namespace=namespace, label_selector=label_selector)
+    list_of_resources = resource_type.get(client=client, namespace=namespace, label_selector=label_selector)
     assert list_of_resources, f"{resource_type} is empty"
     for resource_instance in list_of_resources:
         if filter_resource is None or filter_resource in resource_instance.name:
@@ -237,7 +237,14 @@ def check_logs(cnv_must_gather, running_hco_containers, namespace, label_selecto
             # Skip comparison of empty/large files. Large files could be ratated, and hence not equal.
             if log_size > 10000 or log_size == 0:
                 continue
-            pod_log = pod.log(previous=is_previous, container=container_name, timestamps=True)
+            try:
+                pod_log = pod.log(previous=is_previous, container=container_name, timestamps=True)
+            except UnicodeDecodeError:
+                LOGGER.warning(
+                    f"Skipping log comparison for {pod.name}/{container_name} "
+                    f"(previous={is_previous}): pod log contains non-UTF-8 data"
+                )
+                continue
             log_file = pod_logfile(
                 pod_name=pod.name,
                 container_name=container_name,
@@ -248,7 +255,7 @@ def check_logs(cnv_must_gather, running_hco_containers, namespace, label_selecto
             assert log_file in pod_log, f"Log file are different for pod/container {pod.name}/{container_name}"
 
 
-def compare_webhook_svc_contents(webhook_resources, cnv_must_gather, dyn_client, checks):
+def compare_webhook_svc_contents(webhook_resources, cnv_must_gather, client, checks):
     for webhook_resource in webhook_resources:
         if not webhook_resource.instance.webhooks:
             if webhook_resource.labels.get(PART_OF_LABEL_KEY) == HCO_PART_OF_LABEL_VALUE:
@@ -273,7 +280,7 @@ def compare_webhook_svc_contents(webhook_resources, cnv_must_gather, dyn_client,
         if webhooks_resource_instance_service:
             webhooks_svc_name = webhooks_resource_instance_service["name"]
             webhooks_svc_namespace = webhooks_resource_instance_service["namespace"]
-            svc_resources = list(Service.get(dyn_client=dyn_client, namespace=webhooks_svc_namespace))
+            svc_resources = list(Service.get(client=client, namespace=webhooks_svc_namespace))
             for svc_resource in svc_resources:
                 if webhooks_svc_name == svc_resource.name:
                     compare_resource_values(resource=svc_resource, path=service_file, checks=checks)
@@ -281,10 +288,10 @@ def compare_webhook_svc_contents(webhook_resources, cnv_must_gather, dyn_client,
             continue
 
 
-def validate_files_collected(base_path, vm_list, nftables_ruleset_from_utility_pods):
+def validate_files_collected(base_path, vm_list, nftables_ruleset_from_utility_pods, admin_client):
     errors = defaultdict(dict)
     for vm in vm_list:
-        virt_launcher = vm.vmi.virt_launcher_pod
+        virt_launcher = vm.vmi.get_virt_launcher_pod(privileged_client=admin_client)
         namespace = virt_launcher.namespace
         vm_name = vm.name
         folder_path = os.path.join(base_path, "namespaces", namespace, "vms", vm_name)
@@ -362,6 +369,7 @@ def validate_must_gather_vm_file_collection(
     must_gather_vm,
     must_gather_vms_from_alternate_namespace,
     nftables_ruleset_from_utility_pods,
+    admin_client,
 ):
     vm_list = get_vm_list_for_validation(
         expected=expected,
@@ -374,6 +382,7 @@ def validate_must_gather_vm_file_collection(
         base_path=collected_vm_details_must_gather_with_params,
         vm_list=vm_list["vms_collected"],
         nftables_ruleset_from_utility_pods=nftables_ruleset_from_utility_pods,
+        admin_client=admin_client,
     )
     not_collected_vm_names = [vm.name for vm in vm_list["vms_not_collected"]]
     LOGGER.info(f"Validating following vms were not collected: {not_collected_vm_names}")
@@ -382,9 +391,10 @@ def validate_must_gather_vm_file_collection(
             base_path=collected_vm_details_must_gather_with_params,
             vm_list=vm_list["vms_not_collected"],
             nftables_ruleset_from_utility_pods=nftables_ruleset_from_utility_pods,
+            admin_client=admin_client,
         )
     assert all(entry in str(exeption_found.value) for entry in not_collected_vm_names + ["path_not_found"]), (
-        f"Failed to find {not_collected_vm_names} in exception message: {str(exeption_found.value)}"
+        f"Failed to find {not_collected_vm_names} in exception message: {exeption_found.value!s}"
     )
 
 
@@ -452,8 +462,8 @@ def clean_up_collected_must_gather(failed, target_path):
         )
 
 
-def validate_guest_console_logs_collected(collected_vm_details_must_gather, vm):
-    virt_launcher_pod = vm.vmi.virt_launcher_pod
+def validate_guest_console_logs_collected(collected_vm_details_must_gather, vm, admin_client):
+    virt_launcher_pod = vm.vmi.get_virt_launcher_pod(privileged_client=admin_client)
     guest_console_log = "guest-console-log"
     base_path = os.path.join(
         collected_vm_details_must_gather,
@@ -497,8 +507,9 @@ def check_disks_exists_in_blockjob_file(
 def extracted_data_from_must_gather_on_vm_node(
     collected_vm_details_must_gather_from_vm_node,
     must_gather_vm,
+    admin_client,
 ):
-    virt_launcher = must_gather_vm.vmi.virt_launcher_pod
+    virt_launcher = must_gather_vm.vmi.get_virt_launcher_pod(privileged_client=admin_client)
     base_path = os.path.join(
         collected_vm_details_must_gather_from_vm_node,
         f"namespaces/{virt_launcher.namespace}/vms/{must_gather_vm.name}",

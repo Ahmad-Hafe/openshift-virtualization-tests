@@ -7,46 +7,30 @@ import logging
 import pytest
 from kubernetes.dynamic.exceptions import UnprocessibleEntityError
 from ocp_resources.datavolume import DataVolume
-from ocp_resources.resource import Resource
 from pytest_testconfig import config as py_config
 from timeout_sampler import TimeoutExpiredError, TimeoutSampler
 
-from tests.os_params import FEDORA_LATEST, RHEL_LATEST
 from tests.storage.constants import (
-    CIRROS_QCOW2_IMG,
+    ALPINE_QCOW2_IMG,
     HTTP,
     HTTPS,
     HTTPS_CONFIG_MAP_NAME,
     INTERNAL_HTTP_CONFIGMAP_NAME,
 )
+from tests.storage.stop_status_utils import dv_stop_status_restart_threshold
 from tests.storage.utils import (
     assert_num_files_in_pod,
     assert_use_populator,
     get_file_url,
-    get_importer_pod,
-    wait_for_importer_container_message,
+    wait_for_dv_condition_message,
 )
-from utilities import console
-from utilities.artifactory import get_test_artifact_server_url
-from utilities.constants import (
-    OS_FLAVOR_ALPINE,
-    OS_FLAVOR_RHEL,
-    QUARANTINED,
-    TIMEOUT_1MIN,
-    TIMEOUT_5MIN,
-    TIMEOUT_5SEC,
-    TIMEOUT_12MIN,
-    TIMEOUT_20SEC,
-    Images,
-)
-from utilities.infra import get_node_selector_dict
+from utilities.constants import Images
+from utilities.constants.pytest import QUARANTINED
+from utilities.constants.timeouts import TIMEOUT_1MIN, TIMEOUT_2MIN, TIMEOUT_5MIN
 from utilities.ssp import validate_os_info_vmi_vs_windows_os
 from utilities.storage import (
     ErrorMsg,
-    create_dummy_first_consumer_pod,
     create_dv,
-    create_vm_from_dv,
-    sc_volume_binding_mode_is_wffc,
 )
 from utilities.virt import running_vm
 
@@ -58,82 +42,9 @@ LOGGER = logging.getLogger(__name__)
 
 ISO_IMG = "Core-current.iso"
 TAR_IMG = "archive.tar"
-DEFAULT_DV_SIZE = Images.Cirros.DEFAULT_DV_SIZE
+DEFAULT_DV_SIZE = Images.Alpine.DEFAULT_DV_SIZE
 SMALL_DV_SIZE = "200Mi"
-
 LATEST_WINDOWS_OS_DICT = py_config.get("latest_windows_os_dict", {})
-
-
-def get_importer_pod_node(importer_pod):
-    for sample in TimeoutSampler(
-        wait_timeout=TIMEOUT_1MIN,
-        sleep=TIMEOUT_5SEC,
-        func=lambda: importer_pod.instance.get("spec", {}).get(
-            "nodeName",
-        ),
-    ):
-        if sample:
-            return sample
-
-
-def wait_for_pvc_recreate(pvc, pvc_original_timestamp):
-    for sample in TimeoutSampler(
-        wait_timeout=TIMEOUT_20SEC,
-        sleep=1,
-        func=lambda: pvc.instance.metadata.creationTimestamp != pvc_original_timestamp,
-    ):
-        if sample:
-            break
-
-
-def wait_dv_and_get_importer(dv, admin_client):
-    dv.wait_for_status(
-        status=DataVolume.Status.IMPORT_IN_PROGRESS,
-        timeout=TIMEOUT_1MIN,
-        stop_status=DataVolume.Status.SUCCEEDED,
-    )
-    return get_importer_pod(dyn_client=admin_client, namespace=dv.namespace)
-
-
-@pytest.fixture()
-def dv_with_annotation(admin_client, namespace, linux_nad):
-    with create_dv(
-        dv_name="dv-annotation",
-        namespace=namespace.name,
-        url=f"{get_test_artifact_server_url()}{FEDORA_LATEST['image_path']}",
-        storage_class=py_config["default_storage_class"],
-        multus_annotation=linux_nad.name,
-    ) as dv:
-        return wait_dv_and_get_importer(dv=dv, admin_client=admin_client).instance.metadata.annotations
-
-
-@pytest.mark.sno
-@pytest.mark.parametrize(
-    "data_volume_multi_storage_scope_function",
-    [
-        pytest.param(
-            {
-                "dv_name": "import-http-dv",
-                "source": HTTP,
-                "image": CIRROS_QCOW2_IMG,
-                "dv_size": DEFAULT_DV_SIZE,
-            },
-            marks=pytest.mark.polarion("CNV-675"),
-        ),
-    ],
-    indirect=True,
-)
-def test_delete_pvc_after_successful_import(
-    data_volume_multi_storage_scope_function,
-):
-    pvc = data_volume_multi_storage_scope_function.pvc
-    pvc_original_timestamp = pvc.instance.metadata.creationTimestamp
-    pvc.delete()
-    wait_for_pvc_recreate(pvc=pvc, pvc_original_timestamp=pvc_original_timestamp)
-    storage_class = data_volume_multi_storage_scope_function.storage_class
-    if sc_volume_binding_mode_is_wffc(sc=storage_class):
-        create_dummy_first_consumer_pod(pvc=pvc)
-    data_volume_multi_storage_scope_function.wait_for_dv_success()
 
 
 @pytest.mark.xfail(
@@ -165,6 +76,7 @@ def test_empty_url(namespace, storage_class_name_scope_module, unprivileged_clie
             client=unprivileged_client,
             dv_name=f"cnv-674-{storage_class_name_scope_module}",
             namespace=namespace.name,
+            source="http",
             url="",
             size=DEFAULT_DV_SIZE,
             storage_class=storage_class_name_scope_module,
@@ -209,6 +121,7 @@ def test_successful_import_image(
                 "source": HTTPS,
                 "content_type": DataVolume.ContentType.ARCHIVE,
                 "configmap_name": INTERNAL_HTTP_CONFIGMAP_NAME,
+                "volume_mode": DataVolume.VolumeMode.FILE,  # Archive type only supports Filesystem volume mode
             },
             marks=pytest.mark.polarion("CNV-2338"),
         ),
@@ -217,13 +130,7 @@ def test_successful_import_image(
 )
 @pytest.mark.sno
 @pytest.mark.s390x
-def test_successful_import_secure_archive(
-    skip_block_volumemode_scope_module, internal_http_configmap, running_pod_with_dv_pvc
-):
-    """
-    Skip block volume mode - archive does not support block mode DVs,
-    https://github.com/kubevirt/containerized-data-importer/blob/main/doc/supported_operations.md
-    """
+def test_successful_import_secure_archive(internal_http_configmap, running_pod_with_dv_pvc):
     assert_num_files_in_pod(pod=running_pod_with_dv_pvc, expected_num_of_files=3)
 
 
@@ -233,7 +140,7 @@ def test_successful_import_secure_archive(
         pytest.param(
             {
                 "dv_name": "cnv-2719",
-                "file_name": Images.Cdi.QCOW2_IMG,
+                "file_name": Images.Alpine.QCOW2_IMG_VERSIONED,
                 "source": HTTPS,
                 "configmap_name": INTERNAL_HTTP_CONFIGMAP_NAME,
             },
@@ -245,7 +152,7 @@ def test_successful_import_secure_archive(
 @pytest.mark.sno
 @pytest.mark.gating
 def test_successful_import_secure_image(internal_http_configmap, dv_from_http_import):
-    dv_from_http_import.wait_for_dv_success()
+    dv_from_http_import.wait_for_dv_success(stop_status_func=dv_stop_status_restart_threshold, dv=dv_from_http_import)
 
 
 @pytest.mark.sno
@@ -254,7 +161,7 @@ def test_successful_import_secure_image(internal_http_configmap, dv_from_http_im
     [
         pytest.param(
             DataVolume.ContentType.KUBEVIRT,
-            Images.Cirros.RAW_IMG_XZ,
+            Images.Alpine.RAW_IMG_XZ,
             marks=(pytest.mark.polarion("CNV-784"), pytest.mark.smoke()),
         ),
     ],
@@ -274,13 +181,14 @@ def test_successful_import_basic_auth(
         client=admin_client,
         dv_name="import-http-dv",
         namespace=namespace.name,
+        source="http",
         url=get_file_url(url=images_internal_http_server["http_auth"], file_name=file_name),
         content_type=content_type,
         size=DEFAULT_DV_SIZE,
-        secret=internal_http_secret,
+        secret_name=internal_http_secret.name,
         storage_class=storage_class_name_scope_module,
     ) as dv:
-        dv.wait_for_dv_success()
+        dv.wait_for_dv_success(stop_status_func=dv_stop_status_restart_threshold, dv=dv)
 
 
 @pytest.mark.sno
@@ -290,7 +198,7 @@ def test_successful_import_basic_auth(
         pytest.param(
             {
                 "dv_name": "cnv-2144",
-                "file_name": Images.Cdi.QCOW2_IMG,
+                "file_name": Images.Alpine.QCOW2_IMG_VERSIONED,
                 "content_type": DataVolume.ContentType.ARCHIVE,
             },
             marks=pytest.mark.polarion("CNV-2144"),
@@ -299,57 +207,14 @@ def test_successful_import_basic_auth(
     indirect=True,
 )
 def test_wrong_content_type(
-    admin_client,
     dv_from_http_import,
 ):
-    wait_for_importer_container_message(
-        importer_pod=wait_dv_and_get_importer(
-            dv=dv_from_http_import,
-            admin_client=admin_client,
-        ),
-        msg=ErrorMsg.EXIT_STATUS_2,
+    dv_from_http_import.wait_for_status(
+        status=DataVolume.Status.IMPORT_IN_PROGRESS,
+        timeout=TIMEOUT_2MIN,
+        stop_status=DataVolume.Status.SUCCEEDED,
     )
-
-
-@pytest.mark.sno
-@pytest.mark.parametrize(
-    "dv_from_http_import",
-    [
-        pytest.param(
-            {
-                "dv_name": "cnv-2220",
-                "file_name": Images.Cirros.RAW_IMG_XZ,
-                "content_type": DataVolume.ContentType.ARCHIVE,
-                "size": SMALL_DV_SIZE,
-            },
-            marks=pytest.mark.polarion("CNV-2220"),
-            id="compressed_xz_archive_content_type",
-        ),
-        pytest.param(
-            {
-                "dv_name": "cnv-2710",
-                "file_name": Images.Cirros.RAW_IMG_GZ,
-                "content_type": DataVolume.ContentType.ARCHIVE,
-                "size": SMALL_DV_SIZE,
-            },
-            marks=pytest.mark.polarion("CNV-2710"),
-            id="compressed_gz_archive_content_type",
-        ),
-    ],
-    indirect=True,
-)
-@pytest.mark.s390x
-def test_unpack_compressed(
-    admin_client,
-    dv_from_http_import,
-):
-    wait_for_importer_container_message(
-        importer_pod=wait_dv_and_get_importer(
-            dv=dv_from_http_import,
-            admin_client=admin_client,
-        ),
-        msg=ErrorMsg.EXIT_STATUS_2,
-    )
+    wait_for_dv_condition_message(dv=dv_from_http_import, expected_message=ErrorMsg.EXIT_STATUS_2)
 
 
 @pytest.mark.sno
@@ -360,7 +225,7 @@ def test_unpack_compressed(
             {"data": "-----BEGIN CERTIFICATE-----"},
             {
                 "dv_name": "cnv-2812",
-                "file_name": Images.Cdi.QCOW2_IMG,
+                "file_name": Images.Alpine.QCOW2_IMG_VERSIONED,
                 "source": HTTPS,
                 "configmap_name": HTTPS_CONFIG_MAP_NAME,
             },
@@ -370,7 +235,7 @@ def test_unpack_compressed(
             {"data": None},
             {
                 "dv_name": "cnv-2813",
-                "file_name": Images.Cdi.QCOW2_IMG,
+                "file_name": Images.Alpine.QCOW2_IMG_VERSIONED,
                 "source": HTTPS,
                 "configmap_name": HTTPS_CONFIG_MAP_NAME,
             },
@@ -381,13 +246,16 @@ def test_unpack_compressed(
 )
 @pytest.mark.s390x
 def test_certconfigmap_incorrect_cert(
-    admin_client,
     https_config_map,
     dv_from_http_import,
 ):
-    wait_for_importer_container_message(
-        importer_pod=wait_dv_and_get_importer(dv=dv_from_http_import, admin_client=admin_client),
-        msg=ErrorMsg.CERTIFICATE_SIGNED_UNKNOWN_AUTHORITY,
+    dv_from_http_import.wait_for_status(
+        status=DataVolume.Status.IMPORT_IN_PROGRESS,
+        timeout=TIMEOUT_2MIN,
+        stop_status=DataVolume.Status.SUCCEEDED,
+    )
+    wait_for_dv_condition_message(
+        dv=dv_from_http_import, expected_message=ErrorMsg.CERTIFICATE_SIGNED_UNKNOWN_AUTHORITY
     )
 
 
@@ -398,9 +266,9 @@ def test_certconfigmap_incorrect_cert(
             {
                 "dv_name": "cnv-2815",
                 "source": HTTP,
-                "image": CIRROS_QCOW2_IMG,
+                "image": ALPINE_QCOW2_IMG,
                 "dv_size": DEFAULT_DV_SIZE,
-                "cert_configmap": "wrong_name",
+                "cert_configmap_name": "wrong_name",
                 "wait": False,
             },
             marks=pytest.mark.polarion("CNV-2815"),
@@ -429,7 +297,7 @@ def test_certconfigmap_missing_or_wrong_cm(data_volume_multi_storage_scope_funct
 
 @pytest.mark.sno
 @pytest.mark.parametrize(
-    "number_of_processes",
+    "number_of_dvs",
     [
         pytest.param(
             4,
@@ -439,10 +307,9 @@ def test_certconfigmap_missing_or_wrong_cm(data_volume_multi_storage_scope_funct
 )
 @pytest.mark.s390x
 def test_successful_concurrent_blank_disk_import(
-    dv_list_created_by_multiprocess,
-    vm_list_created_by_multiprocess,
+    created_vm_list,
 ):
-    for vm in vm_list_created_by_multiprocess:
+    for vm in created_vm_list:
         running_vm(vm=vm)
 
 
@@ -455,88 +322,16 @@ def test_successful_concurrent_blank_disk_import(
 @pytest.mark.polarion("CNV-2004")
 @pytest.mark.s390x
 def test_blank_disk_import_validate_status(data_volume_multi_storage_scope_function):
-    data_volume_multi_storage_scope_function.wait_for_dv_success(timeout=TIMEOUT_5MIN)
-
-
-@pytest.mark.parametrize(
-    "data_volume_multi_storage_scope_function",
-    [
-        pytest.param(
-            {
-                "dv_name": "cnv-3065",
-                "source": HTTP,
-                "image": f"{Images.Alpine.DIR}/{Images.Alpine.QCOW2_IMG}",
-                "dv_size": Images.Alpine.DEFAULT_DV_SIZE,
-                "wait": True,
-            },
-            marks=pytest.mark.polarion("CNV-3065"),
-        ),
-    ],
-    indirect=True,
-)
-@pytest.mark.sno
-def test_disk_falloc(data_volume_multi_storage_scope_function, unprivileged_client):
-    data_volume_multi_storage_scope_function.wait_for_dv_success()
-    with create_vm_from_dv(
-        client=unprivileged_client,
+    data_volume_multi_storage_scope_function.wait_for_dv_success(
+        timeout=TIMEOUT_5MIN,
+        stop_status_func=dv_stop_status_restart_threshold,
         dv=data_volume_multi_storage_scope_function,
-        os_flavor=OS_FLAVOR_ALPINE,
-        memory_guest=Images.Alpine.DEFAULT_MEMORY_SIZE,
-    ) as vm_dv:
-        with console.Console(vm=vm_dv) as vm_console:
-            LOGGER.info("Fill disk space.")
-            vm_console.sendline("dd if=/dev/urandom of=file bs=1M")
-            vm_console.expect("No space left on device", timeout=TIMEOUT_1MIN)
-
-
-@pytest.mark.destructive
-@pytest.mark.parametrize(
-    "data_volume_multi_storage_scope_function",
-    [
-        pytest.param(
-            {
-                "dv_name": "cnv-3362",
-                "source": HTTP,
-                "image": RHEL_LATEST["image_path"],
-                "dv_size": "25Gi",
-                "access_modes": DataVolume.AccessMode.RWX,
-                "wait": False,
-            },
-            marks=pytest.mark.polarion("CNV-3632"),
-        ),
-    ],
-    indirect=True,
-)
-def test_vm_from_dv_on_different_node(
-    admin_client,
-    skip_access_mode_rwo_scope_function,
-    skip_non_shared_storage,
-    schedulable_nodes,
-    data_volume_multi_storage_scope_function,
-):
-    """
-    Test that create and run VM from DataVolume (only use RWX access mode) on different node.
-    It applies to shared storage like Ceph or NFS. It cannot be tested on local storage like HPP.
-    """
-    importer_pod = get_importer_pod(
-        dyn_client=admin_client,
-        namespace=data_volume_multi_storage_scope_function.namespace,
     )
-    importer_node_name = get_importer_pod_node(importer_pod=importer_pod)
-    nodes = list(filter(lambda node: importer_node_name != node.name, schedulable_nodes))
-    data_volume_multi_storage_scope_function.wait_for_dv_success(timeout=TIMEOUT_12MIN)
-    with create_vm_from_dv(
-        client=admin_client,
-        dv=data_volume_multi_storage_scope_function,
-        vm_name="rhel-vm",
-        os_flavor=OS_FLAVOR_RHEL,
-        node_selector=get_node_selector_dict(node_selector=nodes[0].name),
-        memory_guest=Images.Rhel.DEFAULT_MEMORY_SIZE,
-    ) as vm_dv:
-        assert vm_dv.vmi.node.name != importer_node_name
 
 
 @pytest.mark.tier3
+@pytest.mark.windows
+@pytest.mark.usefixtures("started_windows_vm")
 @pytest.mark.parametrize(
     "data_volume_multi_storage_scope_function,"
     "vm_instance_from_template_multi_storage_scope_function,"
@@ -544,15 +339,18 @@ def test_vm_from_dv_on_different_node(
     [
         pytest.param(
             {
-                "dv_name": "dv-win-19",
+                "dv_name": "dv-win-22",
                 "source": HTTP,
-                "image": f"{Images.Windows.UEFI_WIN_DIR}/{Images.Windows.WIN19_RAW}",
+                "image": f"{Images.Windows.DIR}/{Images.Windows.WIN2022_IMG}",
                 "dv_size": Images.Windows.DEFAULT_DV_SIZE,
             },
             {
                 "vm_name": f"vm-win-{LATEST_WINDOWS_OS_DICT.get('os_version')}",
                 "template_labels": LATEST_WINDOWS_OS_DICT.get("template_labels"),
                 "ssh": True,
+                "tpm_params": {"persistent": True},
+                "efi_params": {"persistent": True},
+                "start_vm": False,
             },
             {"os_version": LATEST_WINDOWS_OS_DICT.get("os_version")},
             marks=pytest.mark.polarion("CNV-3637"),
@@ -565,16 +363,7 @@ def test_successful_vm_from_imported_dv_windows(
     namespace,
     data_volume_multi_storage_scope_function,
     vm_instance_from_template_multi_storage_scope_function,
-    started_windows_vm,
 ):
     validate_os_info_vmi_vs_windows_os(
         vm=vm_instance_from_template_multi_storage_scope_function,
     )
-
-
-@pytest.mark.polarion("CNV-5509")
-@pytest.mark.s390x
-def test_importer_pod_annotation(dv_with_annotation, linux_nad):
-    # verify "k8s.v1.cni.cncf.io/networks" can pass to the importer pod
-    assert dv_with_annotation.get(f"{Resource.ApiGroup.K8S_V1_CNI_CNCF_IO}/networks") == linux_nad.name
-    assert '"interface": "net1"' in dv_with_annotation.get(f"{Resource.ApiGroup.K8S_V1_CNI_CNCF_IO}/network-status")

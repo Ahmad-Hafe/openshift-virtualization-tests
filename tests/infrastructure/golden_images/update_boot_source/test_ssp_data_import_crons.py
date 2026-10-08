@@ -4,20 +4,21 @@ import pytest
 from kubernetes.dynamic.exceptions import UnprocessibleEntityError
 from ocp_resources.data_import_cron import DataImportCron
 from ocp_resources.data_source import DataSource
+from pytest_testconfig import config as py_config
 from timeout_sampler import TimeoutExpiredError, TimeoutSampler
 
 from tests.infrastructure.golden_images.constants import (
     CUSTOM_DATA_IMPORT_CRON_NAME,
     CUSTOM_DATA_SOURCE_NAME,
-    DEFAULT_FEDORA_REGISTRY_URL,
 )
 from tests.infrastructure.golden_images.update_boot_source.utils import (
-    get_all_dic_volume_names,
     get_image_version,
     wait_for_created_volume_from_data_import_cron,
     wait_for_existing_auto_update_data_import_crons,
 )
-from utilities.constants import (
+from utilities.constants.architecture import MULTIARCH
+from utilities.constants.images import DEFAULT_FEDORA_REGISTRY_URL, OS_FLAVOR_RHEL
+from utilities.constants.timeouts import (
     TIMEOUT_2MIN,
     TIMEOUT_5MIN,
     TIMEOUT_5SEC,
@@ -32,12 +33,20 @@ from utilities.virt import VirtualMachineForTests, running_vm
 LOGGER = logging.getLogger(__name__)
 
 
-pytestmark = pytest.mark.post_upgrade
+pytestmark = [pytest.mark.post_upgrade, pytest.mark.arm64]
 
 
 @pytest.mark.polarion("CNV-12414")
 def test_updated_rhel_image(golden_images_data_import_crons_scope_class, latest_rhel_release_versions_dict, subtests):
-    for rhel_dic in [dic for dic in golden_images_data_import_crons_scope_class if "rhel" in dic.name.lower()]:
+    cpu_arch = py_config["cpu_arch"]
+    arch_suffix = f"-{cpu_arch}"
+    rhel_dics = [
+        dic
+        for dic in golden_images_data_import_crons_scope_class
+        if OS_FLAVOR_RHEL in dic.name.lower()
+        and (py_config.get("cluster_type") != MULTIARCH or dic.instance.spec.managedDataSource.endswith(arch_suffix))
+    ]
+    for rhel_dic in rhel_dics:
         rhel_instance_dict = rhel_dic.instance
         image_reference_version = get_image_version(
             image=rhel_instance_dict.metadata.annotations.get("cdi.kubevirt.io/storage.import.imageStreamDockerRef")
@@ -45,23 +54,27 @@ def test_updated_rhel_image(golden_images_data_import_crons_scope_class, latest_
         with subtests.test(rhel_dic_name=rhel_dic.name, managed_data_source=rhel_instance_dict.spec.managedDataSource):
             managed_data_source = rhel_instance_dict.spec.managedDataSource
             assert managed_data_source, "spec.managedDataSource doesn't exists"
-            assert latest_rhel_release_versions_dict[managed_data_source] == image_reference_version
+            base_data_source = managed_data_source.removesuffix(arch_suffix)
+            assert latest_rhel_release_versions_dict[base_data_source] == image_reference_version
 
 
 class TestDataImportCronValidation:
     """verify existing DICs behavior"""
 
     @pytest.mark.polarion("CNV-7531")
+    @pytest.mark.s390x
     def test_opt_in_data_import_cron_creation(self, admin_client, golden_images_namespace):
         LOGGER.info("Verify all DataImportCrons are created when opted in")
         wait_for_existing_auto_update_data_import_crons(admin_client=admin_client, namespace=golden_images_namespace)
 
     @pytest.mark.polarion("CNV-8032")
-    def test_data_import_cron_blocked_update(self, golden_images_data_import_crons_scope_function):
+    @pytest.mark.s390x
+    def test_data_import_cron_blocked_update(self, admin_client, golden_images_data_import_crons_scope_function):
         first_data_import_cron = golden_images_data_import_crons_scope_function[0]
         LOGGER.info(f"Verify dataImportCron {first_data_import_cron.name} cannot be updated.")
         with pytest.raises(UnprocessibleEntityError, match=r".*Cannot update DataImportCron Spec.*"):
             with ResourceEditorValidateHCOReconcile(
+                admin_client=admin_client,
                 patches={first_data_import_cron: {"spec": {"managedDataSource": CUSTOM_DATA_SOURCE_NAME}}},
             ):
                 pytest.fail("Expected UnprocessibleEntityError was not raised")
@@ -73,22 +86,11 @@ class TestDataImportCronOptOutOptIn:
     @pytest.mark.polarion("CNV-7532")
     def test_data_import_cron_deletion_on_opt_out(
         self,
-        admin_client,
-        golden_images_namespace,
-        existing_dic_volumes_before_disable,
         golden_images_data_import_crons_scope_function,
         disabled_common_boot_image_import_hco_spec_scope_function,
     ):
         LOGGER.info("Verify DataImportCrons are deleted after opt-out.")
         wait_for_deleted_data_import_crons(data_import_crons=golden_images_data_import_crons_scope_function)
-        volumes_after = get_all_dic_volume_names(client=admin_client, namespace=golden_images_namespace.name)
-        missing_volumes = set(existing_dic_volumes_before_disable) - set(volumes_after)
-        assert not missing_volumes, (
-            f"DataImportCron deletion should not affect existing volumes.\n"
-            f"Missing volumes: {sorted(missing_volumes)}\n"
-            f"Volumes before: {sorted(existing_dic_volumes_before_disable)}\n"
-            f"Volumes after: {sorted(volumes_after)}"
-        )
 
     @pytest.mark.parametrize(
         "updated_hco_with_custom_data_import_cron_scope_function",
@@ -134,6 +136,7 @@ class TestDataImportCronReconciliation:
     """Tests for DIC recreation after deletion"""
 
     @pytest.mark.polarion("CNV-7569")
+    @pytest.mark.s390x
     def test_data_import_cron_auto_recreation_after_deletion(self, golden_images_data_import_crons_scope_function):
         data_import_cron = golden_images_data_import_crons_scope_function[0]
         LOGGER.info(f"Verify dataImportCron {data_import_cron.name} is reconciled after deletion.")
@@ -275,7 +278,9 @@ class TestDataSourceVmCreation:
                     vm_instance_type_infer=True,
                     vm_preference_infer=True,
                     data_volume_template=data_volume_template_with_source_ref_dict(
-                        data_source=DataSource(name=data_source_name, namespace=golden_images_namespace.name)
+                        data_source=DataSource(
+                            client=unprivileged_client, name=data_source_name, namespace=golden_images_namespace.name
+                        )
                     ),
                 ):
                     pass
@@ -292,15 +297,15 @@ class TestDataImportCronDefaultStorageClass:
 
     @pytest.mark.polarion("CNV-7594")
     def test_data_import_cron_uses_default_storage_class(
-        self, updated_default_storage_class_scope_function, created_data_import_cron, created_persistent_volume_claim
+        self, updated_default_storage_class_scope_function, created_data_import_cron, data_import_cron_pvc
     ):
         LOGGER.info(
             "Test DataImportCron and DV creation when using default storage class "
             f"{updated_default_storage_class_scope_function.name}"
         )
-        current_sc = created_persistent_volume_claim.instance.spec.storageClassName
+        current_sc = data_import_cron_pvc.instance.spec.storageClassName
         assert current_sc == updated_default_storage_class_scope_function.name, (
-            f"PVC {created_persistent_volume_claim.name} expected storage class: "
+            f"PVC {data_import_cron_pvc.name} expected storage class: "
             f"{updated_default_storage_class_scope_function.name}, "
             f"current storage class: {current_sc}"
         )

@@ -6,22 +6,20 @@ from collections import OrderedDict
 
 import pytest
 
-from tests.network.libs.ip import random_ipv4_address
+from libs.net.ip import random_ipv4_address
+from libs.net.vmspec import lookup_iface_status_ip
 from tests.network.utils import assert_no_ping
+from utilities.constants.networking import LINUX_BRIDGE
 from utilities.infra import get_node_selector_dict
 from utilities.network import (
     assert_ping_successful,
     cloud_init_network_data,
-    get_vmi_ip_v4_by_name,
     network_device,
     network_nad,
 )
 from utilities.virt import VirtualMachineForTests, fedora_vm_body
 
 pytestmark = [
-    pytest.mark.usefixtures(
-        "hyperconverged_ovs_annotations_enabled_scope_session",
-    ),
     pytest.mark.special_infra,
     pytest.mark.jumbo_frame,
 ]
@@ -34,19 +32,19 @@ def jumbo_frame_bridge_device_name(index_number):
 
 @pytest.fixture(scope="class")
 def jumbo_frame_bridge_device_worker_1(
+    nmstate_dependent_placeholder,
     admin_client,
     cluster_hardware_mtu,
-    bridge_device_matrix__class__,
     worker_node1,
-    nodes_available_nics,
+    hosts_common_available_ports,
     jumbo_frame_bridge_device_name,
 ):
     with network_device(
-        interface_type=bridge_device_matrix__class__,
+        interface_type=LINUX_BRIDGE,
         nncp_name="jumbo-frame-bridge-nncp-1",
         interface_name=jumbo_frame_bridge_device_name,
         node_selector=get_node_selector_dict(node_selector=worker_node1.hostname),
-        ports=[nodes_available_nics[worker_node1.name][-1]],
+        ports=[hosts_common_available_ports[-1]],
         mtu=cluster_hardware_mtu,
         client=admin_client,
     ) as br:
@@ -55,19 +53,19 @@ def jumbo_frame_bridge_device_worker_1(
 
 @pytest.fixture(scope="class")
 def jumbo_frame_bridge_device_worker_2(
+    nmstate_dependent_placeholder,
     admin_client,
     cluster_hardware_mtu,
-    bridge_device_matrix__class__,
     worker_node2,
-    nodes_available_nics,
+    hosts_common_available_ports,
     jumbo_frame_bridge_device_name,
 ):
     with network_device(
-        interface_type=bridge_device_matrix__class__,
+        interface_type=LINUX_BRIDGE,
         nncp_name="jumbo-frame-bridge-nncp-2",
         interface_name=jumbo_frame_bridge_device_name,
         node_selector=get_node_selector_dict(node_selector=worker_node2.hostname),
-        ports=[nodes_available_nics[worker_node2.name][-1]],
+        ports=[hosts_common_available_ports[-1]],
         mtu=cluster_hardware_mtu,
         client=admin_client,
     ) as br:
@@ -78,7 +76,6 @@ def jumbo_frame_bridge_device_worker_2(
 def br1test_bridge_nad(
     admin_client,
     cluster_hardware_mtu,
-    bridge_device_matrix__class__,
     namespace,
     jumbo_frame_bridge_device_name,
     jumbo_frame_bridge_device_worker_1,
@@ -86,7 +83,7 @@ def br1test_bridge_nad(
 ):
     with network_nad(
         namespace=namespace,
-        nad_type=bridge_device_matrix__class__,
+        nad_type=LINUX_BRIDGE,
         nad_name=f"{jumbo_frame_bridge_device_name}-nad",
         interface_name=jumbo_frame_bridge_device_name,
         mtu=cluster_hardware_mtu,
@@ -100,9 +97,7 @@ def bridge_attached_vma(worker_node1, namespace, unprivileged_client, br1test_br
     name = "vma"
     networks = OrderedDict()
     networks[br1test_bridge_nad.name] = br1test_bridge_nad.name
-    network_data_data = {
-        "ethernets": {"eth1": {"addresses": [f"{random_ipv4_address(net_seed=0, host_address=1)}/24"]}}
-    }
+    network_data_data = {"ethernets": {"eth1": {"addresses": [str(random_ipv4_address(net_seed=0, host_address=1))]}}}
     cloud_init_data = cloud_init_network_data(data=network_data_data)
 
     with VirtualMachineForTests(
@@ -125,9 +120,7 @@ def bridge_attached_vmb(worker_node2, namespace, unprivileged_client, br1test_br
     name = "vmb"
     networks = OrderedDict()
     networks[br1test_bridge_nad.name] = br1test_bridge_nad.name
-    network_data_data = {
-        "ethernets": {"eth1": {"addresses": [f"{random_ipv4_address(net_seed=0, host_address=2)}/24"]}}
-    }
+    network_data_data = {"ethernets": {"eth1": {"addresses": [str(random_ipv4_address(net_seed=0, host_address=2))]}}}
     cloud_init_data = cloud_init_network_data(data=network_data_data)
 
     with VirtualMachineForTests(
@@ -162,7 +155,7 @@ class TestJumboFrameBridge:
         ip_header = 20
         assert_ping_successful(
             src_vm=bridge_attached_vma,
-            dst_ip=get_vmi_ip_v4_by_name(vm=bridge_attached_vmb, name=br1test_bridge_nad.name),
+            dst_ip=lookup_iface_status_ip(vm=bridge_attached_vmb, iface_name=br1test_bridge_nad.name, ip_family=4),
             packet_size=br1test_bridge_nad.mtu - ip_header - icmp_header,
         )
 
@@ -180,6 +173,6 @@ class TestJumboFrameBridge:
         """
         assert_no_ping(
             src_vm=bridge_attached_vma,
-            dst_ip=get_vmi_ip_v4_by_name(vm=bridge_attached_vmb, name=br1test_bridge_nad.name),
+            dst_ip=lookup_iface_status_ip(vm=bridge_attached_vmb, iface_name=br1test_bridge_nad.name, ip_family=4),
             packet_size=br1test_bridge_nad.mtu + 100,
         )

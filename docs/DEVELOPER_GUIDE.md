@@ -9,8 +9,9 @@ The project is structured as follows:
 - [utilities](../utilities): Base directory for utility functions
   - Each module contains a set of utility functions related to a specific topic, for example:
     - [infra](../utilities/infra.py): Infrastructure-related (cluster resources) utility functions
-    - [constants](../utilities/constants.py): Constants used in the project
-- [docs](../docs): Documentation
+    - [constants](../utilities/constants/): Shared constants package — see [Code Organization](CODE_ORGANIZATION.md#constants-utilitiesconstants)
+  - [tests/fixtures](../tests/fixtures/): Shared pytest fixture implementations — see [Code Organization](CODE_ORGANIZATION.md#fixtures-testsfixtures-and-conftestpy)
+- [docs](../docs): Documentation — including [Code Organization](CODE_ORGANIZATION.md) for constants, utilities, and fixtures
 - [py_config](../tests/global_config.py) contains tests-specific configuration which can be controlled from the command line.
 Please refer to [pytest-testconfig](https://github.com/wojole/pytest-testconfig) for more information.
 
@@ -111,6 +112,30 @@ It is essential to have a good commit message if you want your change to be revi
 - Add a link to the related jira card (required for any significant automation work)
   - `jira-ticket: https://issues.redhat.com/browse/<jira_id>`
   - The card will be automatically closed once PR is merged
+
+### Request a test execution plan
+
+Comment on your GitHub PR:
+
+```bash
+/test-plan
+```
+
+This triggers CodeRabbit to analyze the PR's changed files and post an inline review comment with a test execution plan (smoke/gating impact, affected tests to run).
+
+### Re-run smoke tests
+
+Comment on your GitHub PR (OWNER / MEMBER / COLLABORATOR only):
+
+```bash
+/rerun-smoke
+```
+
+This adds the `retest-smoke` label so Jenkins job `github-events-listener` can pick up a smoke re-run (Jenkins typically removes the label after processing).
+If `retest-smoke` is already on the PR and was added less than 4 hours ago, the workflow skips re-adding the label and logs guidance to check that Jenkins job.
+If the label is still present and older than 4 hours, the workflow removes and re-adds it so Jenkins sees a fresh labeled event.
+A thumbs-up on the comment means the workflow accepted the request and added or refreshed the label.
+If the request is skipped (4-hour cooldown, or label present without usable label history), the thumbs-up is replaced with 👎 — check the workflow Action logs and Jenkins job `github-events-listener`.
 
 ### Run the tests via a Jenkins job
 

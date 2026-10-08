@@ -10,7 +10,11 @@ from ocp_resources.pod import Pod
 from tests.virt.node.log_verbosity.constants import (
     VIRT_LOG_VERBOSITY_LEVEL_6,
 )
-from utilities.constants import VIRT_API, VIRT_CONTROLLER, VIRT_HANDLER
+from utilities.constants.components import (
+    VIRT_API,
+    VIRT_CONTROLLER,
+    VIRT_HANDLER,
+)
 from utilities.infra import get_pods
 
 LOGGER = logging.getLogger(__name__)
@@ -32,7 +36,7 @@ def virt_component_pods(admin_client, hco_namespace):
     for virt_component in [VIRT_HANDLER, VIRT_API, VIRT_CONTROLLER]:
         virt_pods_list.extend(
             get_pods(
-                dyn_client=admin_client,
+                client=admin_client,
                 namespace=hco_namespace,
                 label=f"{Pod.ApiGroup.KUBEVIRT_IO}={virt_component}",
             )

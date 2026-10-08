@@ -24,14 +24,9 @@ from tests.storage.checkups.constants import (
 )
 from tests.storage.checkups.utils import update_storage_profile
 from tests.utils import create_cirros_vm, get_image_from_csv
-from utilities.constants import (
-    BIND_IMMEDIATE_ANNOTATION,
-    OUTDATED,
-    TIMEOUT_10MIN,
-    VALUE_STR,
-    WILDCARD_CRON_EXPRESSION,
-    StorageClassNames,
-)
+from utilities.constants.cluster import VALUE_STR
+from utilities.constants.storage import BIND_IMMEDIATE_ANNOTATION, OUTDATED, WILDCARD_CRON_EXPRESSION, StorageClassNames
+from utilities.constants.timeouts import TIMEOUT_10MIN
 from utilities.exceptions import StorageCheckupConditionTimeoutExpiredError
 from utilities.infra import create_ns, get_pods
 from utilities.storage import update_default_sc
@@ -157,7 +152,7 @@ def checkup_job(
             )
         except (TimeoutExpiredError, ConditionError) as e:
             job_pods = get_pods(
-                dyn_client=admin_client,
+                client=admin_client,
                 namespace=checkups_namespace,
                 label=f"job-name={job.name}",
             )
@@ -202,12 +197,6 @@ def updated_default_storage_profile(default_sc, admin_client):
     claim_property_set_dict = update_storage_profile(storage_profile=storage_profile)
     with ResourceEditor(patches={storage_profile: {SPEC_STR: {"claimPropertySets": [claim_property_set_dict]}}}):
         yield storage_profile
-
-
-@pytest.fixture()
-def skip_if_no_ocs_rbd_non_virt_sc(cluster_storage_classes_names):
-    if StorageClassNames.CEPH_RBD not in cluster_storage_classes_names:
-        pytest.skip(f"Skip due to no storageclass  {StorageClassNames.CEPH_RBD} in the cluster")
 
 
 @pytest.fixture()

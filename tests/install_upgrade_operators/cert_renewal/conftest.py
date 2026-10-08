@@ -19,7 +19,10 @@ from tests.install_upgrade_operators.constants import (
     HCO_CR_CERT_CONFIG_KEY,
     HCO_CR_CERT_CONFIG_SERVER_KEY,
 )
-from utilities.constants import TIMEOUT_1MIN, TIMEOUT_11MIN
+from utilities.constants.timeouts import (
+    TIMEOUT_1MIN,
+    TIMEOUT_11MIN,
+)
 from utilities.hco import ResourceEditorValidateHCOReconcile, wait_for_hco_conditions
 from utilities.jira import is_jira_open
 
@@ -39,7 +42,12 @@ def hyperconverged_resource_certconfig_change(
     }
     LOGGER.info("Modifying certconfig in HCO CR")
     with ResourceEditorValidateHCOReconcile(
-        patches={hyperconverged_resource_scope_class: {"spec": {HCO_CR_CERT_CONFIG_KEY: target_certconfig_stanza}}},
+        admin_client=admin_client,
+        patches={
+            hyperconverged_resource_scope_class: {
+                "spec": {"security": {HCO_CR_CERT_CONFIG_KEY: target_certconfig_stanza}}
+            }
+        },
         list_resource_reconcile=[CDI, NetworkAddonsConfig, SSP],
         wait_for_reconcile_post_update=True,
     ):
@@ -50,10 +58,10 @@ def hyperconverged_resource_certconfig_change(
 def initial_certificates_dates(admin_client, hco_namespace, tmpdir, secrets_with_non_closed_bugs):
     LOGGER.info("Delete secrets so that the cert-manager will create new ones with the updated certConfig")
     for secret in SECRETS:
-        Secret(name=secret, namespace=hco_namespace.name).delete(wait=True)
+        Secret(name=secret, namespace=hco_namespace.name, client=admin_client).delete(wait=True)
 
     for secret in SECRETS:
-        Secret(name=secret, namespace=hco_namespace.name).wait(timeout=TIMEOUT_1MIN)
+        Secret(name=secret, namespace=hco_namespace.name, client=admin_client).wait(timeout=TIMEOUT_1MIN)
 
     wait_for_hco_conditions(
         admin_client=admin_client,
@@ -66,6 +74,7 @@ def initial_certificates_dates(admin_client, hco_namespace, tmpdir, secrets_with
         hco_namespace_name=hco_namespace.name,
         tmpdir=tmpdir,
         secrets_to_skip=secrets_with_non_closed_bugs,
+        admin_client=admin_client,
         seconds=TIMEOUT_11MIN,
     )
 

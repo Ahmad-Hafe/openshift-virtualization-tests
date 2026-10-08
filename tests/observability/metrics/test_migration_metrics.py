@@ -1,5 +1,4 @@
 import logging
-from datetime import datetime, timezone
 
 import pytest
 
@@ -9,54 +8,14 @@ from tests.observability.metrics.constants import (
     KUBEVIRT_VMI_MIGRATION_DATA_TOTAL_BYTES,
     KUBEVIRT_VMI_MIGRATION_DIRTY_MEMORY_RATE_BYTES,
     KUBEVIRT_VMI_MIGRATION_MEMORY_TRANSFER_RATE_BYTES,
-    KUBEVIRT_VMI_MIGRATIONS_IN_RUNNING_PHASE,
-    KUBEVIRT_VMI_MIGRATIONS_IN_SCHEDULING_PHASE,
 )
 from tests.observability.metrics.utils import (
     timestamp_to_seconds,
-    wait_for_expected_metric_value_sum,
     wait_for_non_empty_metrics_value,
 )
-from tests.observability.utils import validate_metrics_value
+from utilities.monitoring import validate_metrics_value
 
 LOGGER = logging.getLogger(__name__)
-
-
-class TestMigrationMetrics:
-    @pytest.mark.polarion("CNV-8480")
-    @pytest.mark.s390x
-    def test_migration_metrics_scheduling(
-        self,
-        admin_client,
-        namespace,
-        prometheus,
-        initial_migration_metrics_values,
-        vm_with_node_selector,
-        vm_with_node_selector_vmim,
-    ):
-        wait_for_expected_metric_value_sum(
-            prometheus=prometheus,
-            metric_name=KUBEVIRT_VMI_MIGRATIONS_IN_SCHEDULING_PHASE,
-            expected_value=initial_migration_metrics_values[KUBEVIRT_VMI_MIGRATIONS_IN_SCHEDULING_PHASE] + 1,
-            check_times=1,
-        )
-
-    @pytest.mark.polarion("CNV-8481")
-    @pytest.mark.s390x
-    def test_migration_metrics_running(
-        self,
-        prometheus,
-        initial_migration_metrics_values,
-        migration_policy_with_bandwidth,
-        vm_for_migration_metrics_test,
-        vm_migration_metrics_vmim,
-    ):
-        wait_for_expected_metric_value_sum(
-            prometheus=prometheus,
-            metric_name=KUBEVIRT_VMI_MIGRATIONS_IN_RUNNING_PHASE,
-            expected_value=initial_migration_metrics_values[KUBEVIRT_VMI_MIGRATIONS_IN_RUNNING_PHASE] + 1,
-            check_times=1,
-        )
 
 
 class TestKubevirtVmiMigrationMetrics:
@@ -70,11 +29,11 @@ class TestKubevirtVmiMigrationMetrics:
             ),
             pytest.param(
                 KUBEVIRT_VMI_MIGRATION_MEMORY_TRANSFER_RATE_BYTES,
-                marks=(pytest.mark.polarion("CNV-11598")),
+                marks=[pytest.mark.jira("CNV-98667", run=False), pytest.mark.polarion("CNV-11598")],
             ),
             pytest.param(
                 KUBEVIRT_VMI_MIGRATION_DIRTY_MEMORY_RATE_BYTES,
-                marks=(pytest.mark.polarion("CNV-11599")),
+                marks=[pytest.mark.jira("CNV-98667", run=False), pytest.mark.polarion("CNV-11599")],
             ),
             pytest.param(
                 KUBEVIRT_VMI_MIGRATION_DATA_TOTAL_BYTES,
@@ -82,7 +41,6 @@ class TestKubevirtVmiMigrationMetrics:
             ),
         ],
     )
-    @pytest.mark.jira("CNV-71828", run=False)
     @pytest.mark.s390x
     def test_kubevirt_vmi_migration_metrics(
         self,
@@ -91,19 +49,11 @@ class TestKubevirtVmiMigrationMetrics:
         admin_client,
         migration_policy_with_bandwidth_scope_class,
         vm_for_migration_metrics_test,
-        vm_migration_metrics_vmim_scope_class,
+        vm_migration_metrics_vmim_scope_function,
         query,
     ):
-        minutes_passed_since_migration_start = (
-            int(datetime.now(timezone.utc).timestamp())
-            - timestamp_to_seconds(
-                timestamp=vm_for_migration_metrics_test.vmi.instance.status.migrationState.startTimestamp
-            )
-        ) // 60
         wait_for_non_empty_metrics_value(
-            prometheus=prometheus,
-            metric_name=f"last_over_time({query.format(vm_name=vm_for_migration_metrics_test.name)}"
-            f"[{minutes_passed_since_migration_start if minutes_passed_since_migration_start > 10 else 10}m])",
+            prometheus=prometheus, metric_name=query.format(vm_name=vm_for_migration_metrics_test.name)
         )
 
 

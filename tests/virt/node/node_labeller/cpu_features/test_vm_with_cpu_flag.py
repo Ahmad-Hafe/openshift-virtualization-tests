@@ -5,7 +5,7 @@ VM with CPU flag
 import pytest
 from timeout_sampler import TimeoutExpiredError
 
-from utilities.constants import TIMEOUT_1MIN
+from utilities.constants.timeouts import TIMEOUT_1MIN
 from utilities.virt import VirtualMachineForTests, fedora_vm_body, running_vm
 
 pytestmark = [pytest.mark.post_upgrade, pytest.mark.sno]
@@ -62,6 +62,7 @@ def test_vm_with_cpu_flag_negative(cpu_flag_vm_negative):
 
 
 @pytest.mark.polarion("CNV-1269")
+@pytest.mark.s390x
 @pytest.mark.gating
 @pytest.mark.conformance
 def test_vm_with_cpu_flag_positive_case(cpu_flag_vm_positive, cluster_common_node_cpu):

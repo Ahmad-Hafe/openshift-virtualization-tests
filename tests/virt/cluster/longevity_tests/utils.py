@@ -1,8 +1,10 @@
+from __future__ import annotations
+
 import logging
 import shlex
 import shutil
-import socket
 from threading import Thread
+from typing import TYPE_CHECKING
 
 from ocp_resources import pod
 from ocp_resources.data_source import DataSource
@@ -11,18 +13,26 @@ from ocp_resources.template import Template
 from pyhelper_utils.shell import run_ssh_commands
 from timeout_sampler import TimeoutExpiredError, TimeoutSampler
 
+from tests.utils import verify_wsl2_guest_works
 from tests.virt.cluster.longevity_tests.constants import (
     PROC_PER_OS_DICT,
     WINDOWS_OS_PREFIX,
 )
-from tests.virt.utils import migrate_and_verify_multi_vms, verify_wsl2_guest_works
+from tests.virt.utils import migrate_and_verify_multi_vms
 from utilities.artifactory import (
     cleanup_artifactory_secret_and_config_map,
     get_artifactory_config_map,
     get_artifactory_secret,
 )
-from utilities.constants import TCP_TIMEOUT_30SEC, TIMEOUT_5MIN, TIMEOUT_30MIN, TIMEOUT_40MIN, TIMEOUT_60MIN, WIN_10
-from utilities.storage import get_test_artifact_server_url
+from utilities.constants.timeouts import (
+    TCP_TIMEOUT_30SEC,
+    TIMEOUT_2MIN,
+    TIMEOUT_5MIN,
+    TIMEOUT_30MIN,
+    TIMEOUT_40MIN,
+    TIMEOUT_60MIN,
+)
+from utilities.storage import construct_datavolume_source_dict, get_test_artifact_server_url
 from utilities.virt import (
     VirtualMachineForTests,
     VirtualMachineForTestsFromTemplate,
@@ -30,6 +40,9 @@ from utilities.virt import (
     running_vm,
     wait_for_ssh_connectivity,
 )
+
+if TYPE_CHECKING:
+    from kubernetes.dynamic import DynamicClient
 
 LOGGER = logging.getLogger(__name__)
 ADMIN_DOWNLOADS_FOLDER_PATH = r"C:\Users\Administrator\Downloads"
@@ -41,13 +54,19 @@ def decorate_log(msg):
     return f"{msg_decor}{msg}{msg_decor}"
 
 
-def run_migration_loop(iterations, vms_with_pids, os_type, wsl2_guest=False):
+def run_migration_loop(
+    client: DynamicClient,
+    iterations: int,
+    vms_with_pids: dict[str, dict[str, VirtualMachineForTests]],
+    os_type: str,
+    wsl2_guest: bool = False,
+) -> None:
     for iteration in range(iterations):
         LOGGER.info(decorate_log(f"Iteration {iteration + 1}"))
 
         LOGGER.info(decorate_log("VM Migration"))
         vm_list = [vms_with_pids[vm_name]["vm"] for vm_name in vms_with_pids]
-        migrate_and_verify_multi_vms(vm_list=vm_list)
+        migrate_and_verify_multi_vms(client=client, vm_list=vm_list)
 
         LOGGER.info(decorate_log("PID check"))
         verify_pid_after_migrate_multi_vms(vms_with_pids=vms_with_pids, os_type=os_type)
@@ -93,10 +112,12 @@ def reboot_vm(vm):
 
 def start_win_upgrade_multi_vms(vm_list):
     def _set_interface_mtu(vm):
-        interface_name = "Ethernet 2" if WIN_10 in vm.name else "Ethernet Instance 0"
         run_ssh_commands(
             host=vm.ssh_exec,
-            commands=shlex.split(f'netsh interface ipv4 set subinterface "{interface_name}" mtu=1400 store=persistent'),
+            commands=shlex.split(
+                'netsh interface ipv4 set subinterface "Ethernet Instance 0" mtu=1400 store=persistent'
+            ),
+            wait_timeout=TIMEOUT_2MIN,
         )
 
     def _prepare_win_upgrade(vm):
@@ -115,7 +136,11 @@ def start_win_upgrade_multi_vms(vm_list):
                 rf'-DestinationPath {ADMIN_DOWNLOADS_FOLDER_PATH}\PSExec"'
             ),
         ]
-        run_ssh_commands(host=vm.ssh_exec, commands=win_upgrade_prepare_cmds)
+        run_ssh_commands(
+            host=vm.ssh_exec,
+            commands=win_upgrade_prepare_cmds,
+            wait_timeout=TIMEOUT_2MIN,
+        )
 
     def _start_win_upgrade(vm):
         LOGGER.info(f"VM {vm.name}: Starting upgrade process")
@@ -137,7 +162,7 @@ def start_win_upgrade_multi_vms(vm_list):
                 timeout=TIMEOUT_40MIN,
             )
             LOGGER.info(f"VM {vm.name}: Finished upgrades download/install stage")
-        except socket.timeout:
+        except TimeoutError:
             LOGGER.warning(f"VM {vm.name}: Finished upgrades download/install stage but the script was stuck")
 
     upgrade_threads_list = []
@@ -170,7 +195,7 @@ def verify_pid_after_migrate_multi_vms(vms_with_pids, os_type):
         new_pid = None
         try:
             new_pid = os_dict["fetch_pid"](vm=vms_with_pids[vm_name]["vm"], process_name=os_dict["proc_name"])
-        except AssertionError | ValueError:
+        except AssertionError, ValueError:
             vms_with_wrong_pids_dict[vm_name] = {
                 "orig_pid": orig_pid,
                 "new_pid": new_pid,
@@ -201,7 +226,11 @@ def verify_windows_upgraded_recently_multi_vms(vm_list):
 
     failed_vms_list = []
     for vm in vm_list:
-        if not run_ssh_commands(host=vm.ssh_exec, commands=get_upgrade_history_cmd)[0]:
+        if not run_ssh_commands(
+            host=vm.ssh_exec,
+            commands=get_upgrade_history_cmd,
+            wait_timeout=TIMEOUT_2MIN,
+        )[0]:
             failed_vms_list.append(vm.name)
 
     assert not failed_vms_list, f"Some VMs failed to upgrade! Falied VMs: {failed_vms_list}"
@@ -227,7 +256,7 @@ def wait_windows_reboot_multi_vm(vm_list):
             try:
                 wait_for_ssh_connectivity(vm=vm)
                 os_dict["fetch_pid"](vm=vm, process_name=os_dict["proc_name"])
-            except AssertionError | ValueError | TimeoutExpiredError:
+            except AssertionError, ValueError, TimeoutExpiredError:
                 rebooted_vms.append(vm.name)
         return rebooted_vms
 
@@ -346,13 +375,15 @@ def create_multi_dvs(namespace, client, dv_params):
             name=dv_name,
             client=client,
             namespace=namespace_name,
-            source="http",
+            source_dict=construct_datavolume_source_dict(
+                source="http",
+                url=f"{get_test_artifact_server_url()}{dv[dv_name].get('image_path')}",
+                secret_name=artifactory_secret.name,
+                cert_configmap_name=artifactory_config_map.name,
+            ),
             size=dv[dv_name].get("dv_size"),
             storage_class=dv[dv_name].get("storage_class"),
-            url=f"{get_test_artifact_server_url()}{dv[dv_name].get('image_path')}",
             api_name="storage",
-            secret=artifactory_secret,
-            cert_configmap=artifactory_config_map.name,
         )
 
     yield from deploy_and_wait_for_dvs(dv_dict=dvs)

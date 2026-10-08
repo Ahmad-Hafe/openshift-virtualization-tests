@@ -1,47 +1,32 @@
-# -*- coding: utf-8 -*-
-
 """
 Pytest conftest file for CNV network tests
 """
 
 import logging
-import os
 
 import pytest
+from kubernetes.dynamic import DynamicClient
 from kubernetes.dynamic.exceptions import ResourceNotFoundError
 from ocp_resources.namespace import Namespace
 from ocp_resources.network_config_openshift_io import Network
 from ocp_resources.performance_profile import PerformanceProfile
 from ocp_resources.pod import Pod
-from pytest_testconfig import config as py_config
 from timeout_sampler import TimeoutExpiredError
 
-from tests.network.constants import BRCNV
-from tests.network.utils import get_vlan_index_number, vm_for_brcnv_tests
-from utilities.constants import (
-    CLUSTER,
-    CLUSTER_NETWORK_ADDONS_OPERATOR,
-    IPV4_STR,
-    IPV6_STR,
-    ISTIO_SYSTEM_DEFAULT_NS,
-    OVS_BRIDGE,
-    VIRT_HANDLER,
-    NamespacesNames,
-)
+from libs.net.cluster import ipv4_supported_cluster, ipv6_supported_cluster
+from utilities.constants.components import CLUSTER, CLUSTER_NETWORK_ADDONS_OPERATOR, VIRT_HANDLER
+from utilities.constants.namespaces import NamespacesNames
 from utilities.infra import (
-    ExecCommandOnPod,
     get_deployment_by_name,
-    get_node_selector_dict,
     wait_for_pods_running,
 )
 from utilities.network import (
     get_cluster_cni_type,
-    ip_version_data_from_matrix,
-    network_nad,
 )
 from utilities.pytest_utils import exit_pytest_execution
 
 LOGGER = logging.getLogger(__name__)
+ISTIO_SYSTEM_DEFAULT_NS = "istio-system"
 
 
 def get_index_number():
@@ -59,7 +44,7 @@ def index_number():
 @pytest.fixture(scope="session")
 def virt_handler_pod(admin_client):
     for pod in Pod.get(
-        dyn_client=admin_client,
+        client=admin_client,
         label_selector=f"{Pod.ApiGroup.KUBEVIRT_IO}={VIRT_HANDLER}",
     ):
         return pod
@@ -67,46 +52,20 @@ def virt_handler_pod(admin_client):
     raise ResourceNotFoundError(f"No {VIRT_HANDLER} Pod found.")
 
 
-@pytest.fixture(scope="session")
-def dual_stack_cluster(ipv4_supported_cluster, ipv6_supported_cluster):
-    return ipv4_supported_cluster and ipv6_supported_cluster
-
-
-@pytest.fixture()
-def fail_if_not_ipv4_supported_cluster_from_mtx(
-    request,
-    ipv4_supported_cluster,
-):
-    if ip_version_data_from_matrix(request=request) == IPV4_STR and not ipv4_supported_cluster:
-        pytest.fail(reason="IPv4 is not supported in this cluster")
-
-
-@pytest.fixture()
-def fail_if_not_ipv6_supported_cluster_from_mtx(
-    request,
-    ipv6_supported_cluster,
-):
-    if ip_version_data_from_matrix(request=request) == IPV6_STR and not ipv6_supported_cluster:
-        pytest.fail(reason="IPv6 is not supported in this cluster")
-
-
-@pytest.fixture()
-def worker_node1_pod_executor(workers_utility_pods, worker_node1):
-    return ExecCommandOnPod(utility_pods=workers_utility_pods, node=worker_node1)
-
-
 @pytest.fixture(scope="module")
-def dual_stack_network_data(ipv6_supported_cluster):
-    if ipv6_supported_cluster:
+def ipv6_primary_interface_cloud_init_data() -> dict[str, dict] | None:
+    if ipv6_supported_cluster():
         return {
             "ethernets": {
                 "eth0": {
-                    "dhcp4": True,
                     "addresses": ["fd10:0:2::2/120"],
                     "gateway6": "fd10:0:2::1",
+                    "dhcp4": ipv4_supported_cluster(),
+                    "dhcp6": False,
                 },
             },
         }
+    return None
 
 
 @pytest.fixture(scope="session")
@@ -128,55 +87,6 @@ def sriov_workers_node2(sriov_workers):
     Get second worker nodes with SR-IOV capabilities
     """
     return sriov_workers[1]
-
-
-@pytest.fixture(scope="session")
-def vlans_list():
-    vlans = py_config["vlans"]
-    if not isinstance(vlans, list):
-        vlans = vlans.split(",")
-    return [int(_id) for _id in vlans]
-
-
-@pytest.fixture(scope="module")
-def vlan_index_number(vlans_list):
-    return get_vlan_index_number(vlans_list=vlans_list)
-
-
-@pytest.fixture(scope="module")
-def brcnv_ovs_nad_vlan_1(
-    admin_client,
-    hyperconverged_ovs_annotations_enabled_scope_session,
-    namespace,
-    vlan_index_number,
-):
-    vlan_tag = next(vlan_index_number)
-    with network_nad(
-        namespace=namespace,
-        nad_type=OVS_BRIDGE,
-        nad_name=f"{BRCNV}-{vlan_tag}",
-        interface_name=BRCNV,
-        vlan=vlan_tag,
-        client=admin_client,
-    ) as nad:
-        yield nad
-
-
-@pytest.fixture(scope="module")
-def brcnv_vma_with_vlan_1(
-    unprivileged_client,
-    namespace,
-    worker_node1,
-    brcnv_ovs_nad_vlan_1,
-):
-    yield from vm_for_brcnv_tests(
-        vm_name="vma",
-        namespace=namespace,
-        unprivileged_client=unprivileged_client,
-        nads=[brcnv_ovs_nad_vlan_1],
-        address_suffix=1,
-        node_selector=get_node_selector_dict(node_selector=worker_node1.hostname),
-    )
 
 
 @pytest.fixture(scope="session")
@@ -202,10 +112,11 @@ def cluster_hardware_mtu(network_overhead, cluster_network_mtu):
 
 
 @pytest.fixture(scope="module")
-def cnao_deployment(hco_namespace):
+def cnao_deployment(hco_namespace, admin_client):
     return get_deployment_by_name(
         namespace_name=hco_namespace.name,
         deployment_name=CLUSTER_NETWORK_ADDONS_OPERATOR,
+        admin_client=admin_client,
     )
 
 
@@ -221,20 +132,25 @@ def network_operator(admin_client):
     )
 
 
+@pytest.fixture(scope="session")
+def mtv_namespace_scope_session(admin_client: DynamicClient) -> Namespace:
+    return Namespace(name=NamespacesNames.OPENSHIFT_MTV, client=admin_client)
+
+
 @pytest.fixture(scope="session", autouse=True)
 def network_sanity(
     admin_client,
-    hosts_common_available_ports,
     junitxml_plugin,
     request,
     istio_system_namespace,
     cluster_network_mtu,
     network_overhead,
     sriov_workers,
-    ipv4_supported_cluster,
-    ipv6_supported_cluster,
     conformance_tests,
     nmstate_namespace,
+    mtv_namespace_scope_session,
+    sriov_namespace,
+    sriov_node_policy,
 ):
     """
     Ensures the test cluster meets network requirements before executing tests.
@@ -259,6 +175,8 @@ def network_sanity(
             return
 
         LOGGER.info("Verifying if the cluster has multiple NICs for network tests")
+        # Lazily resolve hosts_common_available_ports only when needed
+        hosts_common_available_ports = _request.getfixturevalue(argname="hosts_common_available_ports")
         if len(hosts_common_available_ports) <= 1:
             failure_msgs.append(
                 f"Cluster lacks multiple NICs, only {hosts_common_available_ports} common available ports found"
@@ -306,20 +224,25 @@ def network_sanity(
     def _verify_sriov():
         if any(test.get_closest_marker("sriov") for test in collected_tests):
             LOGGER.info("Verifying if the cluster supports running SRIOV tests...")
-            if not Namespace(name=py_config["sriov_namespace"], client=admin_client).exists:
+            if not sriov_namespace.exists:
                 failure_msgs.append(
-                    f"SRIOV operator is not installed, the '{py_config['sriov_namespace']}' namespace does not exist"
+                    f"SRIOV operator is not installed, the '{sriov_namespace.name}' namespace does not exist"
                 )
+                return
             if len(sriov_workers) < 2:
                 failure_msgs.append(
                     "SRIOV tests require at least 2 SRIOV-capable worker nodes, but fewer were detected"
                 )
-            else:
-                LOGGER.info(
-                    "Validated SRIOV operator is running against a valid cluster with "
-                    f"'{py_config['sriov_namespace']}' namespace and "
-                    f"has {len(sriov_workers)} SRIOV-capable worker nodes"
-                )
+                return
+            if not sriov_node_policy:
+                failure_msgs.append(f"No SR-IOV network node policy found in namespace {sriov_namespace.name}")
+                return
+            LOGGER.info(
+                "Validated SRIOV operator is running against a valid cluster with "
+                f"'{sriov_namespace.name}' namespace, "
+                f"has {len(sriov_workers)} SRIOV-capable worker nodes "
+                f"and '{sriov_node_policy.name}' {sriov_node_policy.kind}"
+            )
 
     def _verify_ip_family(family, is_supported_in_cluster):
         if any(test.get_closest_marker(family) for test in collected_tests):
@@ -329,50 +252,44 @@ def network_sanity(
             else:
                 LOGGER.info(f"Validated network lane is running against an {family} supported cluster")
 
-    def _verify_bgp_env_vars():
-        """Verify if the cluster supports running BGP tests.
-
-        Requires the following environment variables to be set:
-        PRIMARY_NODE_NETWORK_VLAN_TAG: expected VLAN number on the node br-ex interface.
-        EXTERNAL_FRR_STATIC_IPV4: reserved IP in CIDR format for the external FRR pod inside
-                                  PRIMARY_NODE_NETWORK_VLAN_TAG network.
-        """
-        if any(test.get_closest_marker("bgp") and not test.get_closest_marker("xfail") for test in collected_tests):
-            LOGGER.info("Verifying if the cluster supports running BGP tests...")
-            required_env_vars = [
-                "PRIMARY_NODE_NETWORK_VLAN_TAG",
-                "EXTERNAL_FRR_STATIC_IPV4",
-            ]
-            missing_env_vars = [var for var in required_env_vars if not os.getenv(var)]
-
-            if missing_env_vars:
-                failure_msgs.append(f"BGP tests require the following environment variables: {missing_env_vars}")
+    def _verify_nmstate_running_pods(_admin_client, namespace):
+        if any(test.get_closest_marker("nmstate") for test in collected_tests):
+            LOGGER.info("Verifying if the cluster supports running K-NMState dependent tests")
+            if not namespace:
+                failure_msgs.append(f"Knmstate namespace '{NamespacesNames.OPENSHIFT_NMSTATE}' does not exist.")
                 return
 
-    def _verify_nmstate_running_pods(_admin_client, namespace):
-        # TODO: Only test if nmstate is required by the test(s)
-        if not namespace:
-            failure_msgs.append(f"Knmstate namespace '{NamespacesNames.OPENSHIFT_NMSTATE}' does not exist.")
-            return
+            LOGGER.info("Verifying all pods in nmstate namespace are running")
+            try:
+                wait_for_pods_running(
+                    admin_client=_admin_client,
+                    namespace=namespace,
+                )
+            except TimeoutExpiredError:
+                failure_msgs.append(f"Some pods are not running in nmstate namespace '{namespace.name}'")
 
-        LOGGER.info("Verifying all pods in nmstate namespace are running")
-        try:
-            wait_for_pods_running(
-                admin_client=_admin_client,
-                namespace=namespace,
-            )
-        except TimeoutExpiredError:
-            failure_msgs.append(f"Some pods are not running in nmstate namespace '{namespace.name}'")
+    def _verify_mtv_installed():
+        if any(test.get_closest_marker("mtv") for test in collected_tests):
+            LOGGER.info("Verifying if the MTV operator is installed in the cluster...")
+            if not mtv_namespace_scope_session.exists:
+                failure_msgs.append(
+                    f"MTV operator is not installed, the '{mtv_namespace_scope_session.name}' namespace does not exist"
+                )
+            else:
+                LOGGER.info(
+                    f"Validated MTV operator is installed in the cluster with "
+                    f"'{mtv_namespace_scope_session.name}' namespace"
+                )
 
     _verify_multi_nic(_request=request)
     _verify_dpdk()
     _verify_service_mesh()
     _verify_jumbo_frame()
     _verify_sriov()
-    _verify_ip_family(family="ipv4", is_supported_in_cluster=ipv4_supported_cluster)
-    _verify_ip_family(family="ipv6", is_supported_in_cluster=ipv6_supported_cluster)
-    _verify_bgp_env_vars()
+    _verify_ip_family(family="ipv4", is_supported_in_cluster=ipv4_supported_cluster())
+    _verify_ip_family(family="ipv6", is_supported_in_cluster=ipv6_supported_cluster())
     _verify_nmstate_running_pods(_admin_client=admin_client, namespace=nmstate_namespace)
+    _verify_mtv_installed()
 
     if failure_msgs:
         err_msg = "\n".join(failure_msgs)

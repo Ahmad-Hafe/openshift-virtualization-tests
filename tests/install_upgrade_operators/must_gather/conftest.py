@@ -21,7 +21,8 @@ from tests.install_upgrade_operators.must_gather.utils import (
     get_must_gather_dir,
 )
 from tests.utils import create_vms
-from utilities.constants import LINUX_BRIDGE, TIMEOUT_40MIN
+from utilities.constants.networking import LINUX_BRIDGE
+from utilities.constants.timeouts import TIMEOUT_40MIN
 from utilities.exceptions import MissingResourceException
 from utilities.hco import ResourceEditorValidateHCOReconcile
 from utilities.infra import (
@@ -39,7 +40,6 @@ from utilities.storage import add_dv_to_vm
 from utilities.virt import VirtualMachineForTests, fedora_vm_body, running_vm
 
 LOGGER = logging.getLogger(__name__)
-LONG_VM_NAME = "v" * 63
 
 
 @pytest.fixture(scope="module")
@@ -123,7 +123,7 @@ def collected_vm_details_must_gather_function_scope(
 
 @pytest.fixture(scope="module")
 def custom_resource_definitions(admin_client):
-    yield list(CustomResourceDefinition.get(dyn_client=admin_client))
+    yield list(CustomResourceDefinition.get(client=admin_client))
 
 
 @pytest.fixture(scope="module")
@@ -176,7 +176,7 @@ def must_gather_bridge(admin_client, worker_node1):
 @pytest.fixture(scope="module")
 def running_hco_containers(admin_client, hco_namespace):
     pods = []
-    for pod in Pod.get(dyn_client=admin_client, namespace=hco_namespace.name):
+    for pod in Pod.get(client=admin_client, namespace=hco_namespace.name):
         for container in pod.instance["status"].get("containerStatuses", []):
             if container["ready"]:
                 pods.append((pod, container))
@@ -238,17 +238,17 @@ def must_gather_vm_scope_class(
 
 
 @pytest.fixture(scope="function")
-def resource_type(request, admin_client):
+def resource_type(admin_client, request):
     resource_type = request.param
-    if not next(resource_type.get(dyn_client=admin_client), None):
+    if not next(resource_type.get(client=admin_client), None):
         raise MissingResourceException(resource_type.__name__)
     return resource_type
 
 
 @pytest.fixture(scope="function")
-def config_map_by_name(request, admin_client):
+def config_map_by_name(admin_client, request):
     cm_name, cm_namespace = request.param
-    return ConfigMap(name=cm_name, namespace=cm_namespace)
+    return ConfigMap(name=cm_name, namespace=cm_namespace, client=admin_client)
 
 
 @pytest.fixture(scope="class")
@@ -270,10 +270,11 @@ def nad_mac_address(must_gather_nad, must_gather_vm):
 
 
 @pytest.fixture(scope="package")
-def vm_interface_name(nad_mac_address, must_gather_vm):
+def vm_interface_name(admin_client, nad_mac_address, must_gather_vm):
     bridge_command = f"bridge fdb show | grep {nad_mac_address}"
     output = (
-        must_gather_vm.privileged_vmi.virt_launcher_pod
+        must_gather_vm.vmi
+        .get_virt_launcher_pod(privileged_client=admin_client)
         .execute(
             command=shlex.split(f"bash -c {shlex.quote(bridge_command)}"),
             container="compute",
@@ -287,11 +288,12 @@ def vm_interface_name(nad_mac_address, must_gather_vm):
 @pytest.fixture()
 def extracted_data_from_must_gather_file(
     request,
+    admin_client,
     collected_vm_details_must_gather,
     must_gather_vm,
     nftables_ruleset_from_utility_pods,
 ):
-    virt_launcher = must_gather_vm.vmi.virt_launcher_pod
+    virt_launcher = must_gather_vm.vmi.get_virt_launcher_pod(privileged_client=admin_client)
     namespace = virt_launcher.namespace
     vm_name = must_gather_vm.name
     file_suffix = request.param[FILE_SUFFIX]
@@ -338,9 +340,10 @@ def extracted_data_from_must_gather_file(
 
 
 @pytest.fixture(scope="class")
-def executed_bridge_link_show_command(must_gather_vm):
+def executed_bridge_link_show_command(admin_client, must_gather_vm):
     output = (
-        must_gather_vm.privileged_vmi.virt_launcher_pod
+        must_gather_vm.vmi
+        .get_virt_launcher_pod(privileged_client=admin_client)
         .execute(
             command=shlex.split(f"bash -c {shlex.quote(BRIDGE_COMMAND)}"),
             container="compute",
@@ -457,19 +460,6 @@ def must_gather_stopped_vms(must_gather_vms_from_alternate_namespace):
 
 
 @pytest.fixture(scope="class")
-def must_gather_long_name_vm(node_gather_unprivileged_namespace, unprivileged_client):
-    with VirtualMachineForTests(
-        client=unprivileged_client,
-        namespace=node_gather_unprivileged_namespace.name,
-        name=LONG_VM_NAME,
-        body=fedora_vm_body(name=LONG_VM_NAME),
-        generate_unique_name=False,
-    ) as vm:
-        running_vm(vm=vm)
-        yield vm
-
-
-@pytest.fixture(scope="class")
 def gathered_images(
     request,
     must_gather_tmpdir_scope_module,
@@ -567,11 +557,12 @@ def multiple_disks_vm(namespace, unprivileged_client, data_volume_scope_class):
 
 @pytest.fixture()
 def extracted_data_from_must_gather_file_multiple_disks(
+    admin_client,
     multiple_disks_vm,
     collected_vm_details_must_gather_function_scope,
     nftables_ruleset_from_utility_pods,
 ):
-    virt_launcher = multiple_disks_vm.vmi.virt_launcher_pod
+    virt_launcher = multiple_disks_vm.vmi.get_virt_launcher_pod(privileged_client=admin_client)
     file_suffix = "blockjob.txt"
     base_path = os.path.join(
         collected_vm_details_must_gather_function_scope,
@@ -633,14 +624,15 @@ def must_gather_vm_files_path(collected_vm_details_must_gather, vm_for_migration
 
 
 @pytest.fixture(scope="class")
-def updated_disable_serial_console_log_false(hyperconverged_resource_scope_class):
-    if hyperconverged_resource_scope_class.instance.spec.virtualMachineOptions.disableSerialConsoleLog:
+def updated_disable_serial_console_log_false(admin_client, hyperconverged_resource_scope_class):
+    if hyperconverged_resource_scope_class.instance.spec.virtualization.virtualMachineOptions.disableSerialConsoleLog:
         with ResourceEditorValidateHCOReconcile(
+            admin_client=admin_client,
             patches={
                 hyperconverged_resource_scope_class: {
-                    "spec": {"virtualMachineOptions": {"disableSerialConsoleLog": False}}
+                    "spec": {"virtualization": {"virtualMachineOptions": {"disableSerialConsoleLog": False}}}
                 }
-            }
+            },
         ):
             yield
     else:

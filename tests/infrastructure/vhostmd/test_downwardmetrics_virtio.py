@@ -19,8 +19,8 @@ from ocp_resources.virtual_machine_cluster_preference import (
 )
 from pyhelper_utils.shell import run_ssh_commands
 
-from utilities.constants import OS_FLAVOR_RHEL
-from utilities.hco import ResourceEditorValidateHCOReconcile
+from utilities.constants.images import OS_FLAVOR_RHEL
+from utilities.hco import ResourceEditorValidateHCOReconcile, hco_feature_gates_patch
 from utilities.virt import VirtualMachineForTests, wait_for_running_vm
 
 LOGGER = logging.getLogger(__name__)
@@ -31,7 +31,7 @@ EXPECTED_METRICS = {
     ("VirtualizationVendor", "string", "host"),
     ("VirtProductInfo", "string", "host"),
     ("TotalCPUTime", "real64", "vm"),
-    ("ResourceProcessorLimit", "uint64", "vm"),
+    ("ResourceProcessorLimit", "int64", "vm"),
     ("PhysicalMemoryAllocatedToVirtualSystem", "uint64", "vm"),
     ("ResourceMemoryLimit", "uint64", "vm"),
     ("NumberOfPhysicalCPUs", "int64", "host"),
@@ -93,10 +93,17 @@ def parsed_metrics_command_data(vm):
 
 @pytest.fixture()
 def enabled_feature_gate_for_downward_metrics_scope_function(
+    admin_client,
     hyperconverged_resource_scope_function,
 ):
     with ResourceEditorValidateHCOReconcile(
-        patches={hyperconverged_resource_scope_function: {"spec": {"featureGates": {"downwardMetrics": True}}}},
+        admin_client=admin_client,
+        patches={
+            hyperconverged_resource_scope_function: hco_feature_gates_patch(
+                hco_resource=hyperconverged_resource_scope_function,
+                enable=["downwardMetrics"],
+            )
+        },
         list_resource_reconcile=[KubeVirt],
         wait_for_reconcile_post_update=True,
     ):
@@ -163,6 +170,7 @@ def vm_ready_for_tests(vm_parameters_for_virtio_downward_metrics):
 
 
 @pytest.mark.polarion("CNV-10937")
+@pytest.mark.s390x
 def test_downward_metrics_virtio_serial_port_default(
     vm_parameters_for_virtio_downward_metrics,
 ):

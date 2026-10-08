@@ -1,0 +1,98 @@
+import logging
+
+import pytest
+from ocp_resources.cdi import CDI
+from ocp_resources.kubevirt import KubeVirt
+from ocp_resources.network_addons_config import NetworkAddonsConfig
+from ocp_resources.ssp import SSP
+
+from tests.install_upgrade_operators.constants import (
+    ENABLE_MULTI_ARCH_BOOT_IMAGE_IMPORT,
+    FG_DISABLED,
+    FG_ENABLED,
+)
+from tests.install_upgrade_operators.hco_enablement_golden_image_updates.multiarch.utils import (
+    CUSTOM_MULTIARCH_DATASOURCE_NAME,
+    MULTIARCH_MANAGED_CRS,
+)
+from utilities.constants.cluster import KUBERNETES_ARCH_LABEL
+from utilities.hco import ResourceEditorValidateHCOReconcile, update_hco_templates_spec
+
+LOGGER = logging.getLogger(__name__)
+
+
+@pytest.fixture(scope="class")
+def disabled_multiarch_feature_gate(admin_client, hyperconverged_resource_scope_class):
+    with ResourceEditorValidateHCOReconcile(
+        admin_client=admin_client,
+        patches={
+            hyperconverged_resource_scope_class: {
+                "spec": {"workloadSources": {ENABLE_MULTI_ARCH_BOOT_IMAGE_IMPORT: FG_DISABLED}}
+            }
+        },
+        list_resource_reconcile=MULTIARCH_MANAGED_CRS,
+        wait_for_reconcile_post_update=True,
+    ):
+        yield
+
+
+@pytest.fixture(scope="class")
+def enabled_multiarch_feature_gate(admin_client, hyperconverged_resource_scope_class):
+    workload_sources = hyperconverged_resource_scope_class.instance.spec.get("workloadSources", {})
+    if workload_sources.get(ENABLE_MULTI_ARCH_BOOT_IMAGE_IMPORT):
+        LOGGER.info("Multiarch feature gate is already enabled")
+        yield
+    else:
+        with ResourceEditorValidateHCOReconcile(
+            admin_client=admin_client,
+            patches={
+                hyperconverged_resource_scope_class: {
+                    "spec": {"workloadSources": {ENABLE_MULTI_ARCH_BOOT_IMAGE_IMPORT: FG_ENABLED}}
+                }
+            },
+            list_resource_reconcile=MULTIARCH_MANAGED_CRS,
+            wait_for_reconcile_post_update=True,
+        ):
+            yield
+
+
+@pytest.fixture(scope="class")
+def hco_status_default_architecture(hyperconverged_resource_scope_class):
+    return hyperconverged_resource_scope_class.instance.status.nodeInfo.defaultWorkloadArchitecture
+
+
+@pytest.fixture()
+def single_arch_node_placement(admin_client, workers_architectures, hyperconverged_resource_scope_function):
+    single_arch = min(workers_architectures)
+    LOGGER.info(f"Restricting workloads nodePlacement to single architecture: {single_arch}")
+    placement = {"nodeSelector": {KUBERNETES_ARCH_LABEL: single_arch}}
+    with ResourceEditorValidateHCOReconcile(
+        admin_client=admin_client,
+        patches={
+            hyperconverged_resource_scope_function: {
+                "spec": {"deployment": {"nodePlacements": {"workload": placement}}}
+            }
+        },
+        list_resource_reconcile=[SSP, KubeVirt, CDI, NetworkAddonsConfig],
+        wait_for_reconcile_post_update=True,
+    ):
+        yield
+
+
+@pytest.fixture()
+def hco_with_custom_template(
+    request,
+    admin_client,
+    hco_namespace,
+    golden_images_namespace,
+    hyperconverged_resource_scope_function,
+    hyperconverged_status_templates_scope_function,
+):
+    yield from update_hco_templates_spec(
+        admin_client=admin_client,
+        hco_namespace=hco_namespace,
+        hyperconverged_resource=hyperconverged_resource_scope_function,
+        updated_template=request.param(common_templates=hyperconverged_status_templates_scope_function),
+        custom_datasource_name=CUSTOM_MULTIARCH_DATASOURCE_NAME,
+        golden_images_namespace=golden_images_namespace,
+    )

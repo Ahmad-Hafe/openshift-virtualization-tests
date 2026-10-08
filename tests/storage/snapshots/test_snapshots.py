@@ -1,10 +1,11 @@
-# -*- coding: utf-8 -*-
-
 """
 Snapshots tests
 """
 
+from __future__ import annotations
+
 import logging
+from typing import TYPE_CHECKING
 
 import pytest
 from kubernetes.client.rest import ApiException
@@ -12,6 +13,8 @@ from ocp_resources.virtual_machine_restore import VirtualMachineRestore
 from ocp_resources.virtual_machine_snapshot import VirtualMachineSnapshot
 from timeout_sampler import TimeoutExpiredError, TimeoutSampler
 
+from tests.os_params import RHEL_LATEST, RHEL_LATEST_LABELS
+from tests.storage.concurrent_vm_boot.utils import run_parallel
 from tests.storage.constants import ADMIN_NAMESPACE_PARAM
 from tests.storage.snapshots.constants import (
     ERROR_MSG_USER_CANNOT_CREATE_VM_RESTORE,
@@ -22,12 +25,23 @@ from tests.storage.snapshots.constants import (
 from tests.storage.snapshots.utils import (
     expected_output_after_restore,
     fail_to_create_snapshot_no_permissions,
-    run_command_on_vm_and_check_output,
+    snapshot_restore_across_rhcos,
     start_windows_vm_after_restore,
 )
 from tests.storage.utils import assert_windows_directory_existence
-from utilities.constants import LS_COMMAND, TIMEOUT_1MIN, TIMEOUT_10SEC
+from utilities.constants.cluster import (
+    LS_COMMAND,
+    RHCOS9_AFFINITY,
+    RHCOS10_AFFINITY,
+)
+from utilities.constants.timeouts import TIMEOUT_1MIN, TIMEOUT_5MIN, TIMEOUT_10MIN, TIMEOUT_10SEC
+from utilities.storage import assert_guest_disk_count, run_command_on_vm_and_check_output
 from utilities.virt import restart_vm_wait_for_running_vm, running_vm
+
+if TYPE_CHECKING:
+    from kubernetes.dynamic import DynamicClient
+
+    from utilities.virt import VirtualMachineForTestsFromTemplate
 
 LOGGER = logging.getLogger(__name__)
 
@@ -266,6 +280,49 @@ class TestRestoreSnapshots:
                     expected_result=expected_output_after_restore(1),
                 )
 
+    @pytest.mark.parametrize(
+        "rhel_vm_name, snapshot_with_content",
+        [
+            pytest.param(
+                {"vm_name": "vm-cnv-16212"},
+                {"number_of_snapshots": 1, "online_vm": False},
+                marks=pytest.mark.polarion("CNV-16212"),
+            ),
+        ],
+        indirect=True,
+    )
+    def test_restore_snapshot_with_predictable_names(
+        self,
+        vm_restore_with_predictable_names,
+        source_volume_name_for_predictable_name_restore,
+    ):
+        """
+        Test restore snapshot where the DV/PVC restored has a predictable name derived from the source vm name and
+        source volume name when `volumeRestorePolicy` is set to `PrefixTargetName`.
+
+        Preconditions:
+            - A VM snapshot (any).
+            - Volume restore policy is set to `PrefixTargetName`.
+
+        Steps:
+            1. Restore the snapshot.
+
+        Expected Results:
+            - The restored DV/PVC name matches the expected predictable name derived from the source vm name and source volume name.
+        """
+
+        restore_status = vm_restore_with_predictable_names.instance.status
+        expected_name = (
+            f"{vm_restore_with_predictable_names.vm_name}-{source_volume_name_for_predictable_name_restore}"[:63]
+        )
+
+        assert restore_status.restores[0].dataVolumeName == expected_name, (
+            f"Restored DV name is '{restore_status.restores[0].dataVolumeName}', expected '{expected_name}'"
+        )
+        assert restore_status.restores[0].persistentVolumeClaim == expected_name, (
+            f"Restored PVC name is '{restore_status.restores[0].persistentVolumeClaim}', expected '{expected_name}'"
+        )
+
 
 @pytest.mark.parametrize(
     "rhel_vm_name, snapshot_with_content",
@@ -346,7 +403,7 @@ def test_unprivileged_client_fails_to_list_resources(namespace, unprivileged_cli
         ApiException,
         match=error_msg,
     ):
-        list(resource.get(dyn_client=unprivileged_client, namespace=namespace.name))
+        list(resource.get(client=unprivileged_client, namespace=namespace.name))
         return
 
 
@@ -399,54 +456,310 @@ def test_fail_to_snapshot_with_unprivileged_client_dv_permissions(
     )
 
 
+@pytest.mark.tier3
+@pytest.mark.conformance
+@pytest.mark.windows
 @pytest.mark.parametrize(
-    "windows_vm_for_snapshot",
+    "windows_vm_with_vtpm_for_snapshot",
     [
         pytest.param(
-            {"dv_name": "dv-8307", "vm_name": "vm-8307"},
+            {"vm_name": "vm-8307"},
             marks=pytest.mark.polarion("CNV-8307"),
         ),
     ],
     indirect=True,
 )
 def test_online_windows_vm_successful_restore(
-    windows_vm_for_snapshot,
+    windows_vm_with_vtpm_for_snapshot,
     windows_snapshot,
     snapshot_dirctory_removed,
 ):
     with VirtualMachineRestore(
         name="restore-vm",
-        namespace=windows_vm_for_snapshot.namespace,
-        vm_name=windows_vm_for_snapshot.name,
+        namespace=windows_vm_with_vtpm_for_snapshot.namespace,
+        vm_name=windows_vm_with_vtpm_for_snapshot.name,
         snapshot_name=windows_snapshot.name,
+        client=windows_vm_with_vtpm_for_snapshot.client,
     ) as restore:
-        start_windows_vm_after_restore(vm_restore=restore, windows_vm=windows_vm_for_snapshot)
+        start_windows_vm_after_restore(vm_restore=restore, windows_vm=windows_vm_with_vtpm_for_snapshot)
         assert_windows_directory_existence(
             expected_result=True,
-            windows_vm=windows_vm_for_snapshot,
+            windows_vm=windows_vm_with_vtpm_for_snapshot,
             directory_path=WINDOWS_DIRECTORY_PATH,
         )
 
 
+@pytest.mark.tier3
+@pytest.mark.conformance
+@pytest.mark.windows
 @pytest.mark.parametrize(
-    "windows_vm_for_snapshot",
+    "windows_vm_with_vtpm_for_snapshot",
     [
         pytest.param(
-            {"dv_name": "dv-8536", "vm_name": "vm-8536"},
+            {"vm_name": "vm-8536"},
             marks=pytest.mark.polarion("CNV-8536"),
         ),
     ],
     indirect=True,
 )
 def test_write_to_file_while_snapshot(
-    windows_vm_for_snapshot,
+    windows_vm_with_vtpm_for_snapshot,
     windows_snapshot,
     file_created_during_snapshot,
 ):
     with VirtualMachineRestore(
         name="restore-vm",
-        namespace=windows_vm_for_snapshot.namespace,
-        vm_name=windows_vm_for_snapshot.name,
+        namespace=windows_vm_with_vtpm_for_snapshot.namespace,
+        vm_name=windows_vm_with_vtpm_for_snapshot.name,
         snapshot_name=windows_snapshot.name,
+        client=windows_vm_with_vtpm_for_snapshot.client,
     ) as restore:
-        start_windows_vm_after_restore(vm_restore=restore, windows_vm=windows_vm_for_snapshot)
+        start_windows_vm_after_restore(vm_restore=restore, windows_vm=windows_vm_with_vtpm_for_snapshot)
+
+
+@pytest.mark.tier3
+@pytest.mark.conformance
+class TestRestoreMultiDiskPerformance:
+    """
+    Snapshot restore performance tests for VMs with multiple disks.
+
+    Jira: https://redhat.atlassian.net/browse/CNV-88908  # <skip-jira-utils-check>
+
+    Preconditions:
+        - VolumeSnapshot-capable StorageClass available
+        - Fedora golden image DataSource available
+    """
+
+    @pytest.mark.polarion("CNV-16805")
+    def test_restore_single_vm_with_4_disks_completes_within_five_minutes(self, vm_with_4_disks):
+        """
+        Test that restoring a snapshot of a single VM with 4 disks completes within 5 minutes.
+
+        Preconditions:
+            - 1 running Fedora VM with 4 disk devices (1 boot from golden image DataSource + 3 blank DVs)
+            - VM snapshot taken and ready to use
+            - VM stopped before restore
+
+        Steps:
+            1. Create a snapshot of the under-test VM
+            2. Initiate restore within a 5-minute deadline
+            3. Start the restored VM
+            4. Verify the restored VM guest disk count matches the VM spec
+
+        Expected:
+            - Restore completed successfully within 5 minutes and the restored VM
+              reports the same number of disks as the VM spec
+        """
+
+        vm = vm_with_4_disks
+        if vm.ready:
+            vm.stop(wait=True)
+
+        with VirtualMachineSnapshot(
+            name=f"snapshot-{vm.name}",
+            namespace=vm.namespace,
+            vm_name=vm.name,
+            client=vm.client,
+        ) as snapshot:
+            snapshot.wait_snapshot_done()
+            with VirtualMachineRestore(
+                name=f"restore-{vm.name}",
+                namespace=vm.namespace,
+                vm_name=vm.name,
+                snapshot_name=snapshot.name,
+                client=vm.client,
+            ) as restore:
+                restore.wait_restore_done(timeout=TIMEOUT_5MIN)
+                running_vm(vm=vm)
+                assert_guest_disk_count(vm=vm)
+
+    @pytest.mark.polarion("CNV-16806")
+    def test_restore_four_vms_with_4_disks_completes_within_five_minutes(self, vms_with_4_disks_created):
+        """
+        Test that restoring snapshots of 4 VMs (each with 4 disks) in parallel completes within 5 minutes per VM.
+
+        Preconditions:
+            - 4 Fedora VMs, each with 4 disk devices (1 boot from golden image DataSource + 3 blank DVs)
+
+        Steps:
+            1. Snapshot all 4 VMs
+            2. Restore all 4 VM snapshots in parallel, each with a 5-minute timeout
+            3. Start all restored VMs
+            4. Verify each restored VM guest disk count
+
+        Expected:
+            - All restores complete successfully within 5 minutes per VM
+            - All restored VMs report the correct disk count
+        """
+        vms = vms_with_4_disks_created
+        snapshots_to_cleanup = []
+
+        try:
+            for vm in vms:
+                if vm.ready:
+                    vm.stop(wait=True)
+
+            vm_snapshot_pairs = []
+            for vm in vms:
+                snapshot = VirtualMachineSnapshot(
+                    name=f"snapshot-{vm.name}",
+                    namespace=vm.namespace,
+                    vm_name=vm.name,
+                    client=vm.client,
+                    teardown=False,
+                )
+                snapshot.deploy()
+                snapshots_to_cleanup.append(snapshot)
+                snapshot.wait_snapshot_done(timeout=TIMEOUT_10MIN)
+                vm_snapshot_pairs.append((vm, snapshot))
+
+            def restore_and_verify_vm(vm_snapshot_pair):
+                vm, snapshot = vm_snapshot_pair
+                with VirtualMachineRestore(
+                    name=f"restore-{vm.name}",
+                    namespace=vm.namespace,
+                    vm_name=vm.name,
+                    snapshot_name=snapshot.name,
+                    client=vm.client,
+                ) as restore:
+                    restore.wait_restore_done(timeout=TIMEOUT_5MIN)
+                    running_vm(vm=vm)
+                    assert_guest_disk_count(vm=vm)
+
+            _, failed_vms = run_parallel(
+                items=vm_snapshot_pairs,
+                func=restore_and_verify_vm,
+                label="Restore failed",
+                item_name=lambda pair: pair[0].name,
+            )
+
+            assert not failed_vms, f"Restore failures: {', '.join(failed_vms)}"
+        finally:
+            cleanup_errors = []
+            for snapshot in snapshots_to_cleanup:
+                try:
+                    snapshot.clean_up()
+                except Exception as error:
+                    LOGGER.error(f"Failed to clean up snapshot {snapshot.name}: {error}")
+                    cleanup_errors.append(error)
+
+            if cleanup_errors:
+                raise ExceptionGroup("Snapshot cleanup errors", cleanup_errors)
+
+
+@pytest.mark.mixed_os_nodes
+class TestSnapshotRestoreMixedRhcos:
+    """
+    Snapshot/Restore Across RHCOS 9 and RHCOS 10 Worker Nodes
+
+    STP:
+    https://github.com/RedHatQE/openshift-virtualization-tests-design-docs/blob/main/stps/sig-virt/dual-stream-cluster-rhcos9-rhcos10/storage.md
+
+    Preconditions:
+        - RHCOS 9 and RHCOS 10 worker nodes in the cluster
+        - VolumeSnapshot-capable StorageClass available
+    """
+
+    @pytest.mark.polarion("CNV-96772-1")
+    @pytest.mark.parametrize(
+        "golden_image_data_source_for_test_scope_function, snapshot_source_vm",
+        [
+            pytest.param(
+                {"os_dict": RHEL_LATEST},
+                {
+                    "vm_name": "snap-rhcos9-restore-rhcos10-rhel",
+                    "template_labels": RHEL_LATEST_LABELS,
+                    "vm_affinity": RHCOS9_AFFINITY,
+                },
+                id="RHEL-VM",
+            ),
+        ],
+        indirect=True,
+    )
+    def test_snapshot_rhcos9_restore_rhcos10(
+        self,
+        admin_client: DynamicClient,
+        snapshot_source_vm: VirtualMachineForTestsFromTemplate,
+    ) -> None:
+        """
+        Test that snapshot created on RHCOS 9 can be restored on RHCOS 10 without data loss or corruption.
+
+        STP:
+        https://github.com/RedHatQE/openshift-virtualization-tests-design-docs/blob/main/stps/sig-virt/dual-stream-cluster-rhcos9-rhcos10/storage.md
+
+        Preconditions:
+            - RHEL VM running on an RHCOS 9 worker node
+
+        Steps:
+            1. Verify VM is on RHCOS 9 worker node
+            2. Write test data to VM disk
+            3. Create snapshot of the VM
+            4. Change VM affinity to RHCOS 10 worker node
+            5. Restore VM from snapshot on RHCOS 10
+            6. Verify VM is running on RHCOS 10 node
+            7. Verify test data content is preserved after restore
+
+        Expected:
+            - Snapshot created successfully
+            - VM restores without errors
+            - VM is running on RHCOS 10 node after restore
+            - Test data content matches after restore
+        """
+        snapshot_restore_across_rhcos(
+            admin_client=admin_client,
+            vm=snapshot_source_vm,
+            expect_rhcos9_before=True,
+            target_affinity=RHCOS10_AFFINITY,
+        )
+
+    @pytest.mark.polarion("CNV-96772-2")
+    @pytest.mark.parametrize(
+        "golden_image_data_source_for_test_scope_function, snapshot_source_vm",
+        [
+            pytest.param(
+                {"os_dict": RHEL_LATEST},
+                {
+                    "vm_name": "snap-rhcos10-restore-rhcos9-rhel",
+                    "template_labels": RHEL_LATEST_LABELS,
+                    "vm_affinity": RHCOS10_AFFINITY,
+                },
+                id="RHEL-VM",
+            ),
+        ],
+        indirect=True,
+    )
+    def test_snapshot_rhcos10_restore_rhcos9(
+        self,
+        admin_client: DynamicClient,
+        snapshot_source_vm: VirtualMachineForTestsFromTemplate,
+    ) -> None:
+        """
+        Test that snapshot created on RHCOS 10 can be restored on RHCOS 9 without data loss or corruption.
+
+        STP:
+        https://github.com/RedHatQE/openshift-virtualization-tests-design-docs/blob/main/stps/sig-virt/dual-stream-cluster-rhcos9-rhcos10/storage.md
+
+        Preconditions:
+            - RHEL VM running on an RHCOS 10 worker node
+
+        Steps:
+            1. Verify VM is on RHCOS 10 worker node
+            2. Write test data to VM disk
+            3. Create snapshot of the VM
+            4. Change VM affinity to RHCOS 9 worker node
+            5. Restore VM from snapshot on RHCOS 9
+            6. Verify VM is running on RHCOS 9 node
+            7. Verify test data content is preserved after restore
+
+        Expected:
+            - Snapshot created successfully
+            - VM restores without errors
+            - VM is running on RHCOS 9 node after restore
+            - Test data content matches after restore
+        """
+        snapshot_restore_across_rhcos(
+            admin_client=admin_client,
+            vm=snapshot_source_vm,
+            expect_rhcos9_before=False,
+            target_affinity=RHCOS9_AFFINITY,
+        )

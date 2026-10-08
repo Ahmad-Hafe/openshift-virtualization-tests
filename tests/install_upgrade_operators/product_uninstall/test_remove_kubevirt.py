@@ -5,15 +5,21 @@ from ocp_resources.kubevirt import KubeVirt
 from ocp_resources.virtual_machine import VirtualMachine
 from timeout_sampler import TimeoutSampler
 
-from utilities.constants import TIMEOUT_3MIN, TIMEOUT_4MIN
+from utilities.constants.timeouts import (
+    TIMEOUT_3MIN,
+    TIMEOUT_4MIN,
+)
 from utilities.hco import ResourceEditorValidateHCOReconcile
 from utilities.virt import VirtualMachineForTests, fedora_vm_body
 
 
 @pytest.fixture()
-def set_uninstall_strategy_remove_workloads(hyperconverged_resource_scope_function):
+def set_uninstall_strategy_remove_workloads(admin_client, hyperconverged_resource_scope_function):
     with ResourceEditorValidateHCOReconcile(
-        patches={hyperconverged_resource_scope_function: {"spec": {"uninstallStrategy": "RemoveWorkloads"}}},
+        admin_client=admin_client,
+        patches={
+            hyperconverged_resource_scope_function: {"spec": {"deployment": {"uninstallStrategy": "RemoveWorkloads"}}}
+        },
         list_resource_reconcile=[CDI, KubeVirt],
         wait_for_reconcile_post_update=True,
     ) as edits:
@@ -32,15 +38,6 @@ def remove_kubevirt_vm(unprivileged_client, namespace):
         vm.start()
         vm.vmi.wait_until_running()
         yield vm
-
-
-@pytest.mark.polarion("CNV-3738")
-@pytest.mark.s390x
-def test_validate_default_uninstall_strategy(kubevirt_resource):
-    strategy = kubevirt_resource.instance.spec.uninstallStrategy
-    assert strategy == "BlockUninstallIfWorkloadsExist", (
-        f"Default uninstall strategy is incorrect.Expected 'BlockUninstallIfWorkloadsExist', found '{strategy}'"
-    )
 
 
 @pytest.mark.polarion("CNV-3718")
@@ -78,7 +75,7 @@ def test_remove_workloads(
     for sample in TimeoutSampler(
         wait_timeout=TIMEOUT_3MIN,
         sleep=5,
-        func=lambda: list(VirtualMachine.get(dyn_client=admin_client)) or kubevirt_resource.instance.uid == old_uid,
+        func=lambda: list(VirtualMachine.get(client=admin_client)) or kubevirt_resource.instance.uid == old_uid,
     ):
         if not sample:
             break

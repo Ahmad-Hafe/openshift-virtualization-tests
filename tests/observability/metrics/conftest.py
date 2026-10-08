@@ -8,64 +8,84 @@ from ocp_resources.deployment import Deployment
 from ocp_resources.pod import Pod
 from ocp_resources.resource import ResourceEditor
 from ocp_resources.storage_class import StorageClass
+from ocp_resources.virtual_machine_cluster_instancetype import VirtualMachineClusterInstancetype
+from ocp_resources.virtual_machine_cluster_preference import VirtualMachineClusterPreference
 from ocp_resources.virtual_machine_instance_migration import VirtualMachineInstanceMigration
+from packaging.version import Version
 from pytest_testconfig import py_config
 from timeout_sampler import TimeoutExpiredError, TimeoutSampler
 
+from libs.net.vmspec import update_nad_references
+from libs.vm.factory import base_vmspec, fedora_vm
+from libs.vm.spec import Devices, Interface, Multus, Network
 from tests.observability.metrics.constants import (
+    BINDING_NAME,
+    BINDING_TYPE,
+    GUEST_LOAD_TIME_PERIODS,
     KUBEVIRT_CONSOLE_ACTIVE_CONNECTIONS_BY_VMI,
     KUBEVIRT_VM_CREATED_BY_POD_TOTAL,
-    KUBEVIRT_VMI_MIGRATIONS_IN_RUNNING_PHASE,
-    KUBEVIRT_VMI_MIGRATIONS_IN_SCHEDULING_PHASE,
+    KUBEVIRT_VMI_PHASE_TRANSITION_TIME_FROM_DELETION_SECONDS_COUNT_SUCCEEDED,
+    KUBEVIRT_VMI_PHASE_TRANSITION_TIME_FROM_DELETION_SECONDS_SUM_SUCCEEDED,
     KUBEVIRT_VMI_STATUS_ADDRESSES,
+    KUBEVIRT_VMI_SYNC_TOTAL,
     KUBEVIRT_VNC_ACTIVE_CONNECTIONS_BY_VMI,
+    SUM_KUBEVIRT_VMI_PHASE_TRANSITION_TIME_FROM_DELETION_SECONDS_BUCKET_SUCCEEDED,
 )
 from tests.observability.metrics.utils import (
     SINGLE_VM,
+    binding_name_and_type_from_vm_or_vmi,
     create_windows11_wsl2_vm,
     disk_file_system_info,
     enable_swap_fedora_vm,
-    get_metric_sum_value,
     get_vm_comparison_info_dict,
     get_vmi_guest_os_kernel_release_info_metric_from_vm,
     metric_result_output_dict_by_mountpoint,
+    network_packets_received,
+    validate_vmi_sync_total_reported_and_positive,
     vnic_info_from_vm_or_vmi,
 )
-from tests.observability.utils import validate_metrics_value
-from tests.utils import create_vms
+from tests.utils import create_vms, start_stress_on_vm
 from utilities import console
-from utilities.constants import (
-    IPV4_STR,
+from utilities.constants import Images
+from utilities.constants.components import (
+    SSP_OPERATOR,
+    VIRT_TEMPLATE_VALIDATOR,
+)
+from utilities.constants.images import OS_FLAVOR_FEDORA
+from utilities.constants.instance_types import U1_SMALL
+from utilities.constants.monitoring import (
     KUBEVIRT_VMI_MEMORY_PGMAJFAULT_TOTAL,
     KUBEVIRT_VMI_MEMORY_PGMINFAULT_TOTAL,
     KUBEVIRT_VMI_MEMORY_SWAP_IN_TRAFFIC_BYTES,
     KUBEVIRT_VMI_MEMORY_SWAP_OUT_TRAFFIC_BYTES,
     KUBEVIRT_VMI_MEMORY_UNUSED_BYTES,
     KUBEVIRT_VMI_MEMORY_USABLE_BYTES,
-    MIGRATION_POLICY_VM_LABEL,
-    ONE_CPU_CORE,
-    OS_FLAVOR_FEDORA,
-    SSP_OPERATOR,
+)
+from utilities.constants.networking import IPV4_STR
+from utilities.constants.timeouts import (
     TIMEOUT_2MIN,
     TIMEOUT_3MIN,
     TIMEOUT_4MIN,
     TIMEOUT_5MIN,
     TIMEOUT_15SEC,
+)
+from utilities.constants.virt import (
+    MIGRATION_POLICY_VM_LABEL,
+    ONE_CPU_CORE,
+    ONE_CPU_THREAD,
+    STRESS_CPU_MEM_IO_COMMAND,
     TWO_CPU_CORES,
     TWO_CPU_SOCKETS,
     TWO_CPU_THREADS,
-    VIRT_TEMPLATE_VALIDATOR,
-    Images,
 )
 from utilities.hco import ResourceEditorValidateHCOReconcile, enabled_aaq_in_hco
 from utilities.infra import (
     create_ns,
-    get_node_selector_dict,
+    get_linux_guest_agent_version,
     get_pod_by_name_prefix,
     unique_name,
 )
-from utilities.jira import is_jira_open
-from utilities.monitoring import get_metrics_value
+from utilities.monitoring import get_metrics_value, validate_metrics_value
 from utilities.network import assert_ping_successful, get_ip_from_vm_or_virt_handler_pod, ping
 from utilities.ssp import verify_ssp_pod_is_running
 from utilities.storage import (
@@ -92,6 +112,8 @@ METRICS_WITH_WINDOWS_VM_BUGS = [
     KUBEVIRT_VMI_MEMORY_USABLE_BYTES,
     KUBEVIRT_VMI_MEMORY_PGMINFAULT_TOTAL,
 ]
+MINIMUM_QEMU_GUEST_AGENT_VERSION_FOR_GUEST_LOAD_METRICS = "9.6"
+_NAD_SWAP_SECONDARY_IFACE = "secondary"
 
 
 @pytest.fixture(scope="module")
@@ -142,12 +164,12 @@ def virt_pod_info_from_prometheus(request, prometheus):
 
 
 @pytest.fixture()
-def virt_pod_names_by_label(request, admin_client, hco_namespace):
+def virt_pod_names_by_label(admin_client, request, hco_namespace):
     """Get pod names by a given label (request.param) in the list."""
     return [
         pod.name
         for pod in Pod.get(
-            dyn_client=admin_client,
+            client=admin_client,
             namespace=hco_namespace.name,
             label_selector=request.param,
         )
@@ -209,7 +231,7 @@ def connected_vnc_console(prometheus, vm_for_test):
 def generated_network_traffic(vm_for_test):
     assert_ping_successful(
         src_vm=vm_for_test,
-        dst_ip=vm_for_test.privileged_vmi.interfaces[0]["ipAddress"],
+        dst_ip=vm_for_test.vmi.interfaces[0]["ipAddress"],
         count=20,
     )
 
@@ -220,28 +242,41 @@ def generated_network_traffic_windows_vm(windows_vm_for_test):
         src_vm=windows_vm_for_test,
         dst_ip=get_ip_from_vm_or_virt_handler_pod(family=IPV4_STR, vm=windows_vm_for_test),
         windows=True,
+        quiet_output=False,
     )
 
 
 @pytest.fixture(scope="class")
 def linux_vm_for_test_interface_name(vm_for_test):
-    return vm_for_test.vmi.interfaces[0].interfaceName
+    return vm_for_test.vmi.interfaces[0].podInterfaceName
 
 
 @pytest.fixture(scope="class")
 def windows_vm_for_test_interface_name(windows_vm_for_test):
-    return windows_vm_for_test.vmi.interfaces[0].interfaceName
+    return windows_vm_for_test.vmi.interfaces[0].podInterfaceName
+
+
+@pytest.fixture()
+def network_packet_received_windows_vm(windows_vm_for_test, windows_vm_for_test_interface_name):
+    return network_packets_received(
+        vm=windows_vm_for_test, interface_name=windows_vm_for_test_interface_name, windows_wsl=True
+    )
+
+
+@pytest.fixture()
+def network_packet_received_linux_vm(vm_for_test, linux_vm_for_test_interface_name):
+    return network_packets_received(vm=vm_for_test, interface_name=linux_vm_for_test_interface_name)
 
 
 @pytest.fixture(scope="class")
-def vm_with_cpu_spec(namespace, unprivileged_client):
+def vm_with_cpu_spec(namespace, unprivileged_client, is_s390x_cluster):
     name = "vm-resource-test"
     with VirtualMachineForTests(
         name=name,
         namespace=namespace.name,
         cpu_cores=TWO_CPU_CORES,
         cpu_sockets=TWO_CPU_SOCKETS,
-        cpu_threads=TWO_CPU_THREADS,
+        cpu_threads=ONE_CPU_THREAD if is_s390x_cluster else TWO_CPU_THREADS,
         body=fedora_vm_body(name=name),
         client=unprivileged_client,
     ) as vm:
@@ -284,7 +319,7 @@ def vm_virt_controller_ip_address(admin_client, hco_namespace, kubevirt_vmi_stat
     virt_controller_pod_name = kubevirt_vmi_status_addresses_ip_labels_values.get("pod")
     assert virt_controller_pod_name, "virt-controller not found"
     virt_controller_pod_ip = get_pod_by_name_prefix(
-        dyn_client=admin_client,
+        client=admin_client,
         pod_prefix=virt_controller_pod_name,
         namespace=hco_namespace.name,
     ).ip
@@ -299,13 +334,13 @@ def vm_for_test_snapshot(vm_for_test):
 
 
 @pytest.fixture()
-def disk_file_system_info_linux(vm_for_test):
-    return disk_file_system_info(vm=vm_for_test)
+def disk_file_system_info_linux(admin_client, vm_for_test):
+    return disk_file_system_info(vm=vm_for_test, admin_client=admin_client)
 
 
 @pytest.fixture()
-def disk_file_system_info_windows(windows_vm_for_test):
-    return disk_file_system_info(vm=windows_vm_for_test)
+def disk_file_system_info_windows(admin_client, windows_vm_for_test):
+    return disk_file_system_info(vm=windows_vm_for_test, admin_client=admin_client)
 
 
 @pytest.fixture()
@@ -336,7 +371,7 @@ def file_system_metric_mountpoints_existence(request, prometheus, vm_for_test, d
 
 
 @pytest.fixture(scope="class")
-def vm_for_test_with_resource_limits(namespace):
+def vm_for_test_with_resource_limits(namespace, unprivileged_client):
     vm_name = "vm-with-limits"
     with VirtualMachineForTests(
         name=vm_name,
@@ -344,6 +379,7 @@ def vm_for_test_with_resource_limits(namespace):
         cpu_limits=ONE_CPU_CORE,
         memory_limits=Images.Fedora.DEFAULT_MEMORY_SIZE,
         body=fedora_vm_body(name=vm_name),
+        client=unprivileged_client,
     ) as vm:
         running_vm(vm=vm)
         yield vm
@@ -368,7 +404,8 @@ def storage_class_labels_for_testing(admin_client):
 def template_validator_finalizer(admin_client, hco_namespace):
     deployment = Deployment(name=VIRT_TEMPLATE_VALIDATOR, namespace=hco_namespace.name, client=admin_client)
     with ResourceEditorValidateHCOReconcile(
-        patches={deployment: {"metadata": {"finalizers": ["ssp.kubernetes.io/temporary-finalizer"]}}}
+        admin_client=admin_client,
+        patches={deployment: {"metadata": {"finalizers": ["ssp.kubernetes.io/temporary-finalizer"]}}},
     ):
         yield
 
@@ -376,12 +413,12 @@ def template_validator_finalizer(admin_client, hco_namespace):
 @pytest.fixture(scope="class")
 def deleted_ssp_operator_pod(admin_client, hco_namespace):
     get_pod_by_name_prefix(
-        dyn_client=admin_client,
+        client=admin_client,
         pod_prefix=SSP_OPERATOR,
         namespace=hco_namespace.name,
     ).delete(wait=True)
     yield
-    verify_ssp_pod_is_running(dyn_client=admin_client, hco_namespace=hco_namespace)
+    verify_ssp_pod_is_running(client=admin_client, hco_namespace=hco_namespace)
 
 
 @pytest.fixture(scope="class")
@@ -397,7 +434,9 @@ def vm_for_vm_disk_allocation_size_test(namespace, unprivileged_client, golden_i
         namespace=namespace.name,
         data_volume_template=data_volume_template_with_source_ref_dict(
             data_source=DataSource(
-                name=OS_FLAVOR_FEDORA, namespace=golden_images_namespace.name, client=unprivileged_client
+                name=OS_FLAVOR_FEDORA,
+                namespace=golden_images_namespace.name,
+                client=unprivileged_client,
             ),
             storage_class=py_config["default_storage_class"],
         ),
@@ -418,13 +457,10 @@ def vnic_info_from_vmi_windows(windows_vm_for_test):
 
 
 @pytest.fixture()
-def vmi_guest_os_kernel_release_info_linux(single_metric_vm):
-    return get_vmi_guest_os_kernel_release_info_metric_from_vm(vm=single_metric_vm)
-
-
-@pytest.fixture()
-def vmi_guest_os_kernel_release_info_windows(windows_vm_for_test):
-    return get_vmi_guest_os_kernel_release_info_metric_from_vm(vm=windows_vm_for_test, windows=True)
+def vmi_guest_os_kernel_release_info_windows(windows_vm_for_test, admin_client):
+    return get_vmi_guest_os_kernel_release_info_metric_from_vm(
+        vm=windows_vm_for_test, admin_client=admin_client, windows=True
+    )
 
 
 @pytest.fixture()
@@ -437,11 +473,20 @@ def windows_vm_info_to_compare(windows_vm_for_test):
     return get_vm_comparison_info_dict(vm=windows_vm_for_test)
 
 
-@pytest.fixture(scope="module")
-def windows_vm_for_test(namespace, unprivileged_client):
+@pytest.fixture(scope="package")
+def windows_vm_namespace(admin_client, unprivileged_client):
+    yield from create_ns(
+        admin_client=admin_client,
+        unprivileged_client=unprivileged_client,
+        name=unique_name(name="observability-win-vm"),
+    )
+
+
+@pytest.fixture(scope="package")
+def windows_vm_for_test(windows_vm_namespace, unprivileged_client):
     with create_windows11_wsl2_vm(
         dv_name="dv-for-windows",
-        namespace=namespace.name,
+        namespace=windows_vm_namespace.name,
         client=unprivileged_client,
         vm_name="win-vm-for-test",
         storage_class=py_config["default_storage_class"],
@@ -449,30 +494,8 @@ def windows_vm_for_test(namespace, unprivileged_client):
         yield vm
 
 
-@pytest.fixture(scope="session")
-def memory_metric_has_bug():
-    return is_jira_open(jira_id="CNV-71827")
-
-
-@pytest.fixture()
-def xfail_if_memory_metric_has_bug(memory_metric_has_bug, cnv_vmi_monitoring_metrics_matrix__function__):
-    if cnv_vmi_monitoring_metrics_matrix__function__ in METRICS_WITH_WINDOWS_VM_BUGS and memory_metric_has_bug:
-        pytest.xfail(
-            f"Bug (CNV-71827), Metric: {cnv_vmi_monitoring_metrics_matrix__function__} not showing "
-            "any value for windows vm"
-        )
-
-
-@pytest.fixture()
-def initial_migration_metrics_values(prometheus):
-    yield {
-        metric: get_metric_sum_value(prometheus=prometheus, metric=metric)
-        for metric in [KUBEVIRT_VMI_MIGRATIONS_IN_SCHEDULING_PHASE, KUBEVIRT_VMI_MIGRATIONS_IN_RUNNING_PHASE]
-    }
-
-
 @pytest.fixture(scope="class")
-def vm_for_migration_metrics_test(namespace, cpu_for_migration):
+def vm_for_migration_metrics_test(namespace, unprivileged_client, cpu_for_migration):
     name = "vm-for-migration-metrics-test"
     with VirtualMachineForTests(
         name=name,
@@ -480,20 +503,10 @@ def vm_for_migration_metrics_test(namespace, cpu_for_migration):
         body=fedora_vm_body(name=name),
         cpu_model=cpu_for_migration,
         additional_labels=MIGRATION_POLICY_VM_LABEL,
+        client=unprivileged_client,
     ) as vm:
         running_vm(vm=vm, check_ssh_connectivity=False)
         yield vm
-
-
-@pytest.fixture()
-def vm_migration_metrics_vmim(admin_client, vm_for_migration_metrics_test):
-    with VirtualMachineInstanceMigration(
-        name="vm-migration-metrics-vmim",
-        namespace=vm_for_migration_metrics_test.namespace,
-        vmi_name=vm_for_migration_metrics_test.vmi.name,
-        client=admin_client,
-    ) as vmim:
-        yield vmim
 
 
 @pytest.fixture(scope="class")
@@ -509,27 +522,14 @@ def vm_migration_metrics_vmim_scope_class(admin_client, vm_for_migration_metrics
 
 
 @pytest.fixture()
-def vm_with_node_selector(namespace, worker_node1):
-    name = "vm-with-node-selector"
-    with VirtualMachineForTests(
-        name=name,
-        namespace=namespace.name,
-        body=fedora_vm_body(name=name),
-        additional_labels=MIGRATION_POLICY_VM_LABEL,
-        node_selector=get_node_selector_dict(node_selector=worker_node1.name),
-    ) as vm:
-        running_vm(vm=vm)
-        yield vm
-
-
-@pytest.fixture()
-def vm_with_node_selector_vmim(admin_client, vm_with_node_selector):
+def vm_migration_metrics_vmim_scope_function(admin_client, vm_for_migration_metrics_test):
     with VirtualMachineInstanceMigration(
-        name="vm-with-node-selector-vmim",
-        namespace=vm_with_node_selector.namespace,
-        vmi_name=vm_with_node_selector.vmi.name,
+        name="vm-migration-metrics-vmim",
+        namespace=vm_for_migration_metrics_test.namespace,
+        vmi_name=vm_for_migration_metrics_test.vmi.name,
         client=admin_client,
     ) as vmim:
+        vmim.wait_for_status(status=vmim.Status.RUNNING, timeout=TIMEOUT_3MIN)
         yield vmim
 
 
@@ -545,7 +545,7 @@ def initial_metric_value(request, prometheus):
     return int(get_metrics_value(prometheus=prometheus, metrics_name=request.param))
 
 
-@pytest.fixture()
+@pytest.fixture(scope="class")
 def deleted_vmi(running_metric_vm):
     running_metric_vm.delete(wait=True)
 
@@ -587,9 +587,154 @@ def aaq_resource_hard_limit_and_used(application_aware_resource_quota):
 
 
 @pytest.fixture(scope="class")
+def fedora_vm_with_stress_ng(namespace, unprivileged_client, golden_images_namespace):
+    with VirtualMachineForTests(
+        client=unprivileged_client,
+        name="fedora-vm-test-with-stress-ng",
+        namespace=namespace.name,
+        vm_instance_type=VirtualMachineClusterInstancetype(client=unprivileged_client, name=U1_SMALL),
+        vm_preference=VirtualMachineClusterPreference(client=unprivileged_client, name=OS_FLAVOR_FEDORA),
+        data_volume_template=data_volume_template_with_source_ref_dict(
+            data_source=DataSource(
+                name=OS_FLAVOR_FEDORA,
+                namespace=golden_images_namespace.name,
+                client=unprivileged_client,
+            ),
+            storage_class=py_config["default_storage_class"],
+        ),
+    ) as vm:
+        running_vm(vm=vm)
+        yield vm
+
+
+@pytest.fixture(scope="class")
+def qemu_guest_agent_version_validated(fedora_vm_with_stress_ng):
+    LOGGER.info(f"Checking qemu-guest-agent package on VM: {fedora_vm_with_stress_ng.name}")
+    guest_agent_version_str = get_linux_guest_agent_version(ssh_exec=fedora_vm_with_stress_ng.ssh_exec)
+    LOGGER.info(f"qemu-guest-agent version: {guest_agent_version_str}")
+    guest_agent_version = Version(version=guest_agent_version_str)
+    assert guest_agent_version >= Version(version=MINIMUM_QEMU_GUEST_AGENT_VERSION_FOR_GUEST_LOAD_METRICS), (
+        f"qemu-guest-agent version {guest_agent_version} is less than required "
+        f"{MINIMUM_QEMU_GUEST_AGENT_VERSION_FOR_GUEST_LOAD_METRICS}"
+    )
+
+
+@pytest.fixture(scope="class")
+def initial_guest_load_metrics_values(prometheus, fedora_vm_with_stress_ng):
+    """Capture initial values for all guest load metrics before stressing the VM."""
+
+    return {
+        metric: get_metrics_value(
+            prometheus=prometheus,
+            metrics_name=f"{metric}{{name='{fedora_vm_with_stress_ng.name}'}}",
+        )
+        for metric in GUEST_LOAD_TIME_PERIODS
+    }
+
+
+@pytest.fixture(scope="class")
+def stressed_vm_cpu_fedora(fedora_vm_with_stress_ng):
+    LOGGER.info(f"Starting CPU stress test on VM: {fedora_vm_with_stress_ng.name}")
+    start_stress_on_vm(
+        vm=fedora_vm_with_stress_ng,
+        stress_command=STRESS_CPU_MEM_IO_COMMAND.format(workers="2", memory="50%", timeout="30m"),
+    )
+
+
+@pytest.fixture(scope="class")
 def vm_created_pod_total_initial_metric_value(prometheus, namespace):
     return int(
         get_metrics_value(
             prometheus=prometheus, metrics_name=KUBEVIRT_VM_CREATED_BY_POD_TOTAL.format(namespace=namespace.name)
         )
     )
+
+
+@pytest.fixture(scope="class")
+def initial_vmi_deletion_metrics_values(prometheus):
+    return {
+        metric: int(get_metrics_value(prometheus=prometheus, metrics_name=metric))
+        for metric in [
+            KUBEVIRT_VMI_PHASE_TRANSITION_TIME_FROM_DELETION_SECONDS_SUM_SUCCEEDED,
+            SUM_KUBEVIRT_VMI_PHASE_TRANSITION_TIME_FROM_DELETION_SECONDS_BUCKET_SUCCEEDED,
+            KUBEVIRT_VMI_PHASE_TRANSITION_TIME_FROM_DELETION_SECONDS_COUNT_SUCCEEDED,
+        ]
+    }
+
+
+@pytest.fixture(scope="class")
+def expected_cpu_affinity_metric_value(admin_client, vm_with_cpu_spec):
+    """Calculate expected kubevirt_vmi_node_cpu_affinity metric value."""
+    # Calculate VM CPU count
+    vm_cpu = vm_with_cpu_spec.vmi.instance.spec.domain.cpu
+    cpu_count_from_vm = (vm_cpu.threads or 1) * (vm_cpu.cores or 1) * (vm_cpu.sockets or 1)
+    # Get node CPU capacity
+    cpu_count_from_vm_node = int(
+        vm_with_cpu_spec.vmi.get_node(privileged_client=admin_client).instance.status.capacity.cpu
+    )
+
+    # return multiplication for multi-CPU VMs
+    return str(cpu_count_from_vm_node * cpu_count_from_vm)
+
+
+@pytest.fixture(scope="class")
+def initial_vmi_sync_total_values(prometheus, vm_for_migration_metrics_test):
+    metric_query = KUBEVIRT_VMI_SYNC_TOTAL.format(vm_name=vm_for_migration_metrics_test.name)
+    results = validate_vmi_sync_total_reported_and_positive(prometheus=prometheus, metric_query=metric_query)
+    return {result["metric"]["pod"]: float(result["value"][1]) for result in results}
+
+
+@pytest.fixture(scope="class")
+def deleted_vmi_sync_total_vm(vm_for_migration_metrics_test):
+    vm_for_migration_metrics_test.delete(wait=True)
+
+
+@pytest.fixture(scope="class")
+def vm_for_nad_swap_test(
+    unprivileged_client,
+    namespace,
+    bridge_nad_a,
+):
+    vm_name = "vm-nad-swap-vnic-info"
+    spec = base_vmspec()
+    spec.template.spec.domain.devices = Devices(
+        interfaces=[
+            Interface(name="default", masquerade={}),
+            Interface(name=_NAD_SWAP_SECONDARY_IFACE, bridge={}),
+        ]
+    )
+    spec.template.spec.networks = [
+        Network(name="default", pod={}),
+        Network(name=_NAD_SWAP_SECONDARY_IFACE, multus=Multus(networkName=bridge_nad_a.name)),
+    ]
+    with fedora_vm(namespace=namespace.name, name=vm_name, client=unprivileged_client, spec=spec) as vm:
+        vm.start(wait=True)
+        yield vm
+
+
+@pytest.fixture(scope="class")
+def post_nad_swap_vm(
+    vm_for_nad_swap_test,
+    bridge_nad_b,
+):
+    update_nad_references(
+        vm=vm_for_nad_swap_test,
+        nad_name_by_net={_NAD_SWAP_SECONDARY_IFACE: bridge_nad_b.name},
+    )
+    yield vm_for_nad_swap_test
+
+
+@pytest.fixture(scope="class")
+def expected_vnic_info_after_swap(
+    post_nad_swap_vm,
+    bridge_nad_b,
+):
+    vm_interfaces = post_nad_swap_vm.instance.spec.template.spec.domain.devices.interfaces
+    secondary_interface = next(iface for iface in vm_interfaces if iface["name"] == _NAD_SWAP_SECONDARY_IFACE)
+    binding_info = binding_name_and_type_from_vm_or_vmi(vm_interface=secondary_interface)
+    return {
+        "vnic_name": _NAD_SWAP_SECONDARY_IFACE,
+        BINDING_NAME: binding_info[BINDING_NAME],
+        BINDING_TYPE: binding_info[BINDING_TYPE],
+        "network": bridge_nad_b.name,
+    }

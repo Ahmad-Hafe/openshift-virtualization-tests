@@ -6,14 +6,15 @@ from collections import OrderedDict
 
 import pytest
 
-from tests.network.libs.ip import random_ipv4_address
+from libs.net.ip import random_ipv4_address
+from libs.net.vmspec import lookup_iface_status_ip
 from tests.network.utils import assert_no_ping
+from utilities.constants.networking import LINUX_BRIDGE
 from utilities.infra import get_node_selector_dict
 from utilities.network import (
     BondNodeNetworkConfigurationPolicy,
     assert_ping_successful,
     cloud_init_network_data,
-    get_vmi_ip_v4_by_name,
     network_device,
     network_nad,
 )
@@ -24,10 +25,7 @@ BRIDGE_NAME = "brbond1"
 
 
 pytestmark = [
-    pytest.mark.usefixtures(
-        "hyperconverged_ovs_annotations_enabled_scope_session",
-        "workers_type",
-    ),
+    pytest.mark.usefixtures("workers_type"),
     pytest.mark.special_infra,
     pytest.mark.jumbo_frame,
 ]
@@ -35,11 +33,12 @@ pytestmark = [
 
 @pytest.fixture(scope="class")
 def jumbo_frame_bond1_worker_1(
+    nmstate_dependent_placeholder,
     admin_client,
     cluster_hardware_mtu,
     index_number,
     worker_node1,
-    nodes_available_nics,
+    hosts_common_available_ports,
 ):
     """
     Create BOND if setup support BOND
@@ -48,7 +47,7 @@ def jumbo_frame_bond1_worker_1(
         client=admin_client,
         name=f"jumbo-frame-bond{next(index_number)}-nncp",
         bond_name=BOND_NAME,
-        bond_ports=nodes_available_nics[worker_node1.name][-2:],
+        bond_ports=hosts_common_available_ports[-2:],
         node_selector=get_node_selector_dict(node_selector=worker_node1.hostname),
         mtu=cluster_hardware_mtu,
     ) as bond:
@@ -57,11 +56,12 @@ def jumbo_frame_bond1_worker_1(
 
 @pytest.fixture(scope="class")
 def jumbo_frame_bond1_worker_2(
+    nmstate_dependent_placeholder,
     admin_client,
     cluster_hardware_mtu,
     index_number,
     worker_node2,
-    nodes_available_nics,
+    hosts_common_available_ports,
 ):
     """
     Create BOND if setup support BOND
@@ -70,7 +70,7 @@ def jumbo_frame_bond1_worker_2(
         client=admin_client,
         name=f"jumbo-frame-bond{next(index_number)}-nncp",
         bond_name=BOND_NAME,
-        bond_ports=nodes_available_nics[worker_node2.name][-2:],
+        bond_ports=hosts_common_available_ports[-2:],
         node_selector=get_node_selector_dict(node_selector=worker_node2.hostname),
         mtu=cluster_hardware_mtu,
     ) as bond:
@@ -79,16 +79,16 @@ def jumbo_frame_bond1_worker_2(
 
 @pytest.fixture(scope="class")
 def jumbo_frame_bridge_on_bond_worker_1(
+    nmstate_dependent_placeholder,
     admin_client,
     cluster_hardware_mtu,
-    bridge_device_matrix__class__,
     jumbo_frame_bond1_worker_1,
 ):
     """
     Create bridge and attach the BOND to it
     """
     with network_device(
-        interface_type=bridge_device_matrix__class__,
+        interface_type=LINUX_BRIDGE,
         nncp_name="jumbo-frame-bridge-on-bond-1",
         interface_name=BRIDGE_NAME,
         node_selector=jumbo_frame_bond1_worker_1.node_selector,
@@ -101,16 +101,16 @@ def jumbo_frame_bridge_on_bond_worker_1(
 
 @pytest.fixture(scope="class")
 def jumbo_frame_bridge_on_bond_worker_2(
+    nmstate_dependent_placeholder,
     admin_client,
     cluster_hardware_mtu,
-    bridge_device_matrix__class__,
     jumbo_frame_bond1_worker_2,
 ):
     """
     Create bridge and attach the BOND to it
     """
     with network_device(
-        interface_type=bridge_device_matrix__class__,
+        interface_type=LINUX_BRIDGE,
         nncp_name="jumbo-frame-bridge-on-bond-2",
         interface_name=BRIDGE_NAME,
         node_selector=jumbo_frame_bond1_worker_2.node_selector,
@@ -125,14 +125,13 @@ def jumbo_frame_bridge_on_bond_worker_2(
 def br1bond_nad(
     admin_client,
     cluster_hardware_mtu,
-    bridge_device_matrix__class__,
     namespace,
     jumbo_frame_bridge_on_bond_worker_1,
     jumbo_frame_bridge_on_bond_worker_2,
 ):
     with network_nad(
         namespace=namespace,
-        nad_type=bridge_device_matrix__class__,
+        nad_type=LINUX_BRIDGE,
         nad_name=f"{BRIDGE_NAME}-bond-nad",
         interface_name=jumbo_frame_bridge_on_bond_worker_1.bridge_name,
         mtu=cluster_hardware_mtu,
@@ -152,9 +151,7 @@ def bond_bridge_attached_vma(
     name = "bond-vma"
     networks = OrderedDict()
     networks[br1bond_nad.name] = br1bond_nad.name
-    network_data_data = {
-        "ethernets": {"eth1": {"addresses": [f"{random_ipv4_address(net_seed=0, host_address=1)}/24"]}}
-    }
+    network_data_data = {"ethernets": {"eth1": {"addresses": [str(random_ipv4_address(net_seed=0, host_address=1))]}}}
     cloud_init_data = cloud_init_network_data(data=network_data_data)
 
     with VirtualMachineForTests(
@@ -182,9 +179,7 @@ def bond_bridge_attached_vmb(
     name = "bond-vmb"
     networks = OrderedDict()
     networks[br1bond_nad.name] = br1bond_nad.name
-    network_data_data = {
-        "ethernets": {"eth1": {"addresses": [f"{random_ipv4_address(net_seed=0, host_address=2)}/24"]}}
-    }
+    network_data_data = {"ethernets": {"eth1": {"addresses": [str(random_ipv4_address(net_seed=0, host_address=2))]}}}
     cloud_init_data = cloud_init_network_data(data=network_data_data)
 
     with VirtualMachineForTests(
@@ -234,7 +229,9 @@ class TestBondJumboFrame:
         ip_header = 20
         assert_ping_successful(
             src_vm=bond_bridge_attached_vma,
-            dst_ip=get_vmi_ip_v4_by_name(vm=running_bond_bridge_attached_vmb, name=br1bond_nad.name),
+            dst_ip=lookup_iface_status_ip(
+                vm=running_bond_bridge_attached_vmb, iface_name=br1bond_nad.name, ip_family=4
+            ),
             packet_size=br1bond_nad.mtu - ip_header - icmp_header,
         )
 
@@ -256,6 +253,8 @@ class TestBondJumboFrame:
         """
         assert_no_ping(
             src_vm=bond_bridge_attached_vma,
-            dst_ip=get_vmi_ip_v4_by_name(vm=running_bond_bridge_attached_vmb, name=br1bond_nad.name),
+            dst_ip=lookup_iface_status_ip(
+                vm=running_bond_bridge_attached_vmb, iface_name=br1bond_nad.name, ip_family=4
+            ),
             packet_size=br1bond_nad.mtu + 100,
         )

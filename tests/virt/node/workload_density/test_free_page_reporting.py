@@ -11,8 +11,10 @@ from utilities.virt import (
 )
 
 
-def assert_vmi_free_page_reporting(vm, expected_free_page_reporting):
-    actual_free_page_reporting = vm.privileged_vmi.xml_dict["domain"]["devices"]["memballoon"]["@freePageReporting"]
+def assert_vmi_free_page_reporting(vm, expected_free_page_reporting, admin_client):
+    actual_free_page_reporting = vm.vmi.get_xml_dict(privileged_client=admin_client)["domain"]["devices"]["memballoon"][
+        "@freePageReporting"
+    ]
     assert actual_free_page_reporting == expected_free_page_reporting, (
         f"expected free_page_reporting to be {expected_free_page_reporting}, got {actual_free_page_reporting}"
     )
@@ -20,12 +22,14 @@ def assert_vmi_free_page_reporting(vm, expected_free_page_reporting):
 
 @pytest.fixture(scope="class")
 def free_page_reporting_vm(
+    unprivileged_client,
     namespace,
 ):
     name = "free-page-reporting-vm"
     with VirtualMachineForTests(
         name=name,
         namespace=namespace.name,
+        client=unprivileged_client,
         body=fedora_vm_body(name=name),
     ) as vm:
         running_vm(vm=vm)
@@ -34,12 +38,14 @@ def free_page_reporting_vm(
 
 @pytest.fixture()
 def vm_with_dedicated_cpu(
+    unprivileged_client,
     namespace,
 ):
     name = "vm-with-dedicated-cpu"
     with VirtualMachineForTests(
         name=name,
         namespace=namespace.name,
+        client=unprivileged_client,
         body=fedora_vm_body(name=name),
         cpu_placement=True,
     ) as vm:
@@ -48,11 +54,12 @@ def vm_with_dedicated_cpu(
 
 
 @pytest.fixture()
-def vm_with_hugepages(namespace):
+def vm_with_hugepages(unprivileged_client, namespace):
     name = "vm-with-hugepage"
     with VirtualMachineForTests(
         name=name,
         namespace=namespace.name,
+        client=unprivileged_client,
         body=fedora_vm_body(name=name),
         hugepages_page_size="1Gi",
     ) as vm:
@@ -62,12 +69,14 @@ def vm_with_hugepages(namespace):
 
 @pytest.fixture()
 def disabled_free_page_reporting_in_hco_cr(
+    admin_client,
     hyperconverged_resource_scope_function,
 ):
     with ResourceEditorValidateHCOReconcile(
+        admin_client=admin_client,
         patches={
             hyperconverged_resource_scope_function: {
-                "spec": {"virtualMachineOptions": {"disableFreePageReporting": True}}
+                "spec": {"virtualization": {"virtualMachineOptions": {"disableFreePageReporting": True}}}
             }
         },
         list_resource_reconcile=[KubeVirt],
@@ -87,35 +96,40 @@ def disabled_free_page_reporting_in_vm(free_page_reporting_vm):
 
 
 @pytest.mark.gating
+@pytest.mark.s390x
 class TestFreePageReporting:
     @pytest.mark.dependency()
     @pytest.mark.polarion("CNV-10540")
     def test_free_page_reporting_enabled_by_default(
-        self, free_page_reporting_vm, hyperconverged_resource_scope_function
+        self, admin_client, free_page_reporting_vm, hyperconverged_resource_scope_function
     ):
-        assert not hyperconverged_resource_scope_function.instance.to_dict()["spec"]["virtualMachineOptions"][
-            "disableFreePageReporting"
-        ]
+        assert not hyperconverged_resource_scope_function.instance.to_dict()["spec"]["virtualization"][
+            "virtualMachineOptions"
+        ]["disableFreePageReporting"]
         assert_vmi_free_page_reporting(
             vm=free_page_reporting_vm,
             expected_free_page_reporting="on",
+            admin_client=admin_client,
         )
 
     @pytest.mark.dependency(depends=["TestFreePageReporting::test_free_page_reporting_enabled_by_default"])
     @pytest.mark.polarion("CNV-10544")
     def test_disable_free_page_reporting_on_vm_level(
         self,
+        admin_client,
         free_page_reporting_vm,
         disabled_free_page_reporting_in_vm,
     ):
         assert_vmi_free_page_reporting(
             vm=free_page_reporting_vm,
             expected_free_page_reporting="off",
+            admin_client=admin_client,
         )
 
     @pytest.mark.polarion("CNV-10543")
     def test_disable_free_page_reporting_in_hco(
         self,
+        admin_client,
         disabled_free_page_reporting_in_hco_cr,
         free_page_reporting_vm,
     ):
@@ -123,22 +137,25 @@ class TestFreePageReporting:
         assert_vmi_free_page_reporting(
             vm=free_page_reporting_vm,
             expected_free_page_reporting="off",
+            admin_client=admin_client,
         )
 
 
 @pytest.mark.polarion("CNV-10596")
-def test_free_page_reporting_in_vm_with_dedicated_cpu(vm_with_dedicated_cpu):
+def test_free_page_reporting_in_vm_with_dedicated_cpu(admin_client, vm_with_dedicated_cpu):
     assert_vmi_free_page_reporting(
         vm=vm_with_dedicated_cpu,
         expected_free_page_reporting="off",
+        admin_client=admin_client,
     )
 
 
 @pytest.mark.polarion("CNV-10597")
 @pytest.mark.special_infra
 @pytest.mark.hugepages
-def test_free_page_reporting_in_vm_with_hugepages(vm_with_hugepages):
+def test_free_page_reporting_in_vm_with_hugepages(admin_client, vm_with_hugepages):
     assert_vmi_free_page_reporting(
         vm=vm_with_hugepages,
         expected_free_page_reporting="off",
+        admin_client=admin_client,
     )

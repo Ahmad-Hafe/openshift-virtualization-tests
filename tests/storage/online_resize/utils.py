@@ -1,5 +1,3 @@
-# -*- coding: utf-8 -*-
-
 """
 Utility functions and context managers for online resize tests
 """
@@ -13,7 +11,8 @@ from ocp_resources.virtual_machine_restore import VirtualMachineRestore
 from pyhelper_utils.shell import run_ssh_commands
 from timeout_sampler import TimeoutExpiredError, TimeoutSampler
 
-from utilities.constants import TIMEOUT_4MIN
+from tests.storage.stop_status_utils import dv_stop_status_restart_threshold
+from utilities.constants.timeouts import TIMEOUT_2MIN, TIMEOUT_4MIN, TIMEOUT_5SEC
 from utilities.storage import create_dv
 from utilities.virt import running_vm
 
@@ -39,7 +38,7 @@ def create_rhel_dv_from_data_source(unprivileged_client, namespace, name, storag
             "namespace": rhel_data_source.namespace,
         },
     ) as dv:
-        dv.wait_for_dv_success()
+        dv.wait_for_dv_success(stop_status_func=dv_stop_status_restart_threshold, dv=dv)
         yield dv
 
 
@@ -61,9 +60,16 @@ def cksum_file(vm, filename, create=False):
         run_ssh_commands(
             host=vm.ssh_exec,
             commands=shlex.split(f"dd if=/dev/urandom of={filename} count=100 && sync"),
+            wait_timeout=TIMEOUT_2MIN,
+            sleep=TIMEOUT_5SEC,
         )
 
-    out = run_ssh_commands(host=vm.ssh_exec, commands=shlex.split(f"sha256sum {filename}"))[0]
+    out = run_ssh_commands(
+        host=vm.ssh_exec,
+        commands=shlex.split(f"sha256sum {filename}"),
+        wait_timeout=TIMEOUT_2MIN,
+        sleep=TIMEOUT_5SEC,
+    )[0]
     sha256sum = out.split()[0]
     LOGGER.info(f"File sha256sum is {sha256sum}")
     return sha256sum
@@ -104,7 +110,7 @@ def expand_pvc(dv, size_change):
 
 def get_resize_count(vm):
     commands = shlex.split("sudo dmesg | grep -c 'new size' || true")
-    result = run_ssh_commands(host=vm.ssh_exec, commands=commands)[0]
+    result = run_ssh_commands(host=vm.ssh_exec, commands=commands, wait_timeout=TIMEOUT_2MIN, sleep=TIMEOUT_5SEC)[0]
 
     return int(result)
 
@@ -136,7 +142,9 @@ def wait_for_resize(vm, count=1):
             if current_resize_count in (desired_count, desired_count + 1):
                 break
     except TimeoutExpiredError:
-        dmesg = run_ssh_commands(host=vm.ssh_exec, commands=shlex.split("dmesg"))[0]
+        dmesg = run_ssh_commands(
+            host=vm.ssh_exec, commands=shlex.split("dmesg"), wait_timeout=TIMEOUT_2MIN, sleep=TIMEOUT_5SEC
+        )[0]
         LOGGER.error(f"Failed to reach resize count {desired_count}.\ndmesg:\n{dmesg}")
         raise
 
@@ -149,6 +157,7 @@ def vm_restore(vm, name):
         namespace=vm.namespace,
         vm_name=vm.name,
         snapshot_name=name,
+        client=vm.client,
     ) as restore:
         restore.wait_restore_done()
         running_vm(vm=vm)

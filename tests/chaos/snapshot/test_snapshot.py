@@ -4,13 +4,18 @@ from ocp_resources.deployment import Deployment
 from ocp_resources.virtual_machine_restore import VirtualMachineRestore
 from pytest_testconfig import py_config
 
-from utilities.constants import TIMEOUT_5MIN, TIMEOUT_5SEC, NamespacesNames
+from utilities.constants.namespaces import NamespacesNames
+from utilities.constants.timeouts import (
+    TIMEOUT_5MIN,
+    TIMEOUT_5SEC,
+)
 
 pytestmark = [
     pytest.mark.chaos,
     pytest.mark.gpfs,
     pytest.mark.usefixtures(
         "skip_if_no_storage_class_for_snapshot",
+        "multiprocessing_start_method_fork",
         "chaos_namespace",
         "cluster_monitoring_process",
     ),

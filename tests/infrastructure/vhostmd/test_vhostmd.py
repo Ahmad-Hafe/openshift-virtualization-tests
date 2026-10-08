@@ -11,10 +11,15 @@ from ocp_resources.resource import Resource
 from pyhelper_utils.shell import run_ssh_commands
 from pytest_testconfig import config as py_config
 
-from tests.os_params import RHEL_LATEST, RHEL_LATEST_LABELS, RHEL_LATEST_OS
+from tests.os_params import RHEL_LATEST_LABELS
 from utilities.artifactory import get_artifactory_header
-from utilities.constants import TIMEOUT_3MIN, TIMEOUT_30SEC
-from utilities.hco import ResourceEditorValidateHCOReconcile
+from utilities.constants.architecture import S390X
+from utilities.constants.timeouts import (
+    TIMEOUT_3MIN,
+    TIMEOUT_5SEC,
+    TIMEOUT_30SEC,
+)
+from utilities.hco import ResourceEditorValidateHCOReconcile, hco_feature_gates_patch
 from utilities.infra import get_node_selector_dict, get_node_selector_name
 from utilities.virt import (
     running_vm,
@@ -43,13 +48,21 @@ def download_and_install_vm_dump_metrics(vm, rpm_file_name):
             ),
             shlex.split(f"sudo yum install -y ./{rpm_file_name}"),
         ],
+        wait_timeout=TIMEOUT_3MIN,
+        sleep=TIMEOUT_5SEC,
     )
 
 
 @pytest.fixture(scope="module")
-def enabled_downward_metrics_hco_featuregate(hyperconverged_resource_scope_module):
+def enabled_downward_metrics_hco_featuregate(admin_client, hyperconverged_resource_scope_module):
     with ResourceEditorValidateHCOReconcile(
-        patches={hyperconverged_resource_scope_module: {"spec": {"featureGates": {"downwardMetrics": True}}}},
+        admin_client=admin_client,
+        patches={
+            hyperconverged_resource_scope_module: hco_feature_gates_patch(
+                hco_resource=hyperconverged_resource_scope_module,
+                enable=["downwardMetrics"],
+            )
+        },
         list_resource_reconcile=[KubeVirt],
         wait_for_reconcile_post_update=True,
     ):
@@ -57,7 +70,7 @@ def enabled_downward_metrics_hco_featuregate(hyperconverged_resource_scope_modul
 
 
 @pytest.fixture(scope="module")
-def rpm_file_name(nodes_cpu_architecture):
+def rpm_file_name(is_s390x_cluster):
     soup_page = BeautifulSoup(
         markup=requests.get(RPMS_REPO_URL, headers=get_artifactory_header(), verify=False, timeout=TIMEOUT_30SEC).text,
         features="html.parser",
@@ -65,9 +78,7 @@ def rpm_file_name(nodes_cpu_architecture):
     rpm_file_names = [link.get("href") for link in soup_page.find_all("a", href=re.compile(r"\.rpm$"))]
     assert rpm_file_names, f"No RPM files found at the URL - {RPMS_REPO_URL}"
 
-    return next(
-        file_name for file_name in rpm_file_names if ("s390x" in file_name) == (nodes_cpu_architecture == "s390x")
-    )
+    return next(file_name for file_name in rpm_file_names if (S390X in file_name) == is_s390x_cluster)
 
 
 @pytest.fixture()
@@ -75,14 +86,14 @@ def vhostmd_vm1(
     request,
     unprivileged_client,
     namespace,
-    golden_image_data_source_scope_function,
+    latest_rhel_data_source,
     worker_node1,
 ):
     with vm_instance_from_template(
         request=request,
         unprivileged_client=unprivileged_client,
         namespace=namespace,
-        data_source=golden_image_data_source_scope_function,
+        data_source=latest_rhel_data_source,
         node_selector=get_node_selector_dict(node_selector=worker_node1.name),
     ) as vhostmd_vm1:
         vhostmd_vm1.start()
@@ -94,14 +105,14 @@ def vhostmd_vm2(
     request,
     unprivileged_client,
     namespace,
-    golden_image_data_source_scope_function,
+    latest_rhel_data_source,
     worker_node1,
 ):
     with vm_instance_from_template(
         request=request,
         unprivileged_client=unprivileged_client,
         namespace=namespace,
-        data_source=golden_image_data_source_scope_function,
+        data_source=latest_rhel_data_source,
         node_selector=get_node_selector_dict(node_selector=worker_node1.name),
     ) as vhostmd_vm2:
         vhostmd_vm2.start()
@@ -128,15 +139,9 @@ def run_vm_dump_metrics(vm):
 
 
 @pytest.mark.parametrize(
-    "golden_image_data_volume_scope_function, vhostmd_vm1, vhostmd_vm2,",
+    "vhostmd_vm1, vhostmd_vm2",
     [
         pytest.param(
-            {
-                "dv_name": RHEL_LATEST_OS,
-                "image": RHEL_LATEST["image_path"],
-                "storage_class": py_config["default_storage_class"],
-                "dv_size": RHEL_LATEST["dv_size"],
-            },
             {
                 "vm_name": "vhostmd1",
                 "vhostmd": True,

@@ -4,36 +4,43 @@ import shlex
 
 import bitmath
 import pytest
-from bitmath import parse_string_unsafe
-from ocp_resources.datavolume import DataVolume
+from ocp_resources.daemonset import DaemonSet
 from ocp_resources.deployment import Deployment
 from ocp_resources.infrastructure import Infrastructure
 from ocp_resources.performance_profile import PerformanceProfile
-from ocp_resources.storage_profile import StorageProfile
-from pytest_testconfig import py_config
-from timeout_sampler import TimeoutExpiredError, TimeoutSampler
 
+from tests.utils import (
+    verify_cpumanager_workers,
+    verify_hugepages_1gi,
+    verify_rwx_default_storage,
+)
 from tests.virt.node.gpu.constants import (
     GPU_CARDS_MAP,
+    NVIDIA_SANDBOX_VALIDATOR_DS,
+    NVIDIA_VGPU_DEVICE_MANAGER_DS,
     NVIDIA_VGPU_MANAGER_DS,
-)
-from tests.virt.node.gpu.utils import (
-    wait_for_manager_pods_deployed,
 )
 from tests.virt.utils import (
     get_allocatable_memory_per_node,
-    get_data_volume_template_dict_with_default_storage_class,
     get_non_terminated_pods,
-    get_or_create_golden_image_data_source,
     get_pod_memory_requests,
     patch_hco_cr_with_mdev_permitted_hostdevices,
     update_hco_memory_overcommit,
 )
-from utilities.constants import AMD, INTEL, TIMEOUT_1MIN, TIMEOUT_5SEC, NamespacesNames
-from utilities.exceptions import UnsupportedGPUDeviceError
-from utilities.infra import ExecCommandOnPod, get_nodes_with_label, label_nodes
+from utilities.constants.architecture import (
+    AMD,
+    INTEL,
+)
+from utilities.constants.namespaces import NamespacesNames
+from utilities.exceptions import ResourceValueError, UnsupportedGPUDeviceError
+from utilities.infra import get_nodes_with_label, get_resources_by_name_prefix
 from utilities.pytest_utils import exit_pytest_execution
-from utilities.virt import get_nodes_gpu_info, vm_instance_from_template
+from utilities.virt import (
+    get_data_volume_template_dict_with_default_storage_class,
+    get_nodes_gpu_info,
+    get_or_create_golden_image_data_source,
+    vm_instance_from_template,
+)
 
 LOGGER = logging.getLogger(__name__)
 
@@ -51,18 +58,14 @@ def virt_special_infra_sanity(
     nodes_cpu_virt_extension,
     workers_utility_pods,
     allocatable_memory_per_node_scope_session,
+    hugepages_gib_values,
 ):
     """Performs verification that cluster has all required capabilities based on collected tests."""
 
     def _verify_not_psi_cluster():
         LOGGER.info("Verifying tests run on BM cluster")
-        if Infrastructure(name="cluster").instance.status.platform == "OpenStack":
+        if Infrastructure(client=admin_client, name="cluster").platform == "OpenStack":
             failed_verifications_list.append("Cluster should be BM and not PSI")
-
-    def _verify_cpumanager_workers(_schedulable_nodes):
-        LOGGER.info("Verifing cluster nodes have CPU Manager labels")
-        if not any([node.labels.cpumanager == "true" for node in _schedulable_nodes]):
-            failed_verifications_list.append("Cluster does't have CPU Manager")
 
     def _verify_gpu(_gpu_nodes, _nodes_with_supported_gpus):
         LOGGER.info("Verifing cluster nodes have enough supported GPU cards")
@@ -75,7 +78,7 @@ def virt_special_infra_sanity(
 
     def _verfify_no_dpdk():
         LOGGER.info("Verifing cluster doesn't have DPDK enabled")
-        if PerformanceProfile(name="dpdk").exists:
+        if PerformanceProfile(client=admin_client, name="dpdk").exists:
             failed_verifications_list.append("Cluster has DPDK enabled (DPDK is incomatible with NVIDIA GPU)")
 
     def _verify_sriov(_sriov_workers):
@@ -98,21 +101,6 @@ def virt_special_infra_sanity(
             failed_verifications_list.append(
                 "Hardware virtualization related tests are supported only on cluster with INTEL/AMD based CPUs"
             )
-
-    def _verify_hugepages_1gi(_workers):
-        LOGGER.info("Verifing cluster has 1Gi hugepages enabled")
-        if not any([
-            parse_string_unsafe(worker.instance.status.allocatable["hugepages-1Gi"]) >= parse_string_unsafe("1Gi")
-            for worker in _workers
-        ]):
-            failed_verifications_list.append("Cluster does not have hugepages-1Gi")
-
-    def _verify_rwx_default_storage():
-        storage_class = py_config["default_storage_class"]
-        LOGGER.info(f"Verifing default storage class {storage_class} supports RWX mode")
-        access_modes = StorageProfile(client=admin_client, name=storage_class).first_claim_property_set_access_modes()
-        if not access_modes or access_modes[0] != DataVolume.AccessMode.RWX:
-            failed_verifications_list.append(f"Default storage class {storage_class} doesn't support RWX mode")
 
     def _verify_descheduler_operator_installed():
         descheduler_deployment = Deployment(
@@ -148,16 +136,25 @@ def virt_special_infra_sanity(
                 _schedulable_nodes=schedulable_nodes, _nodes_cpu_virt_extension=nodes_cpu_virt_extension
             )
         if any(item.get_closest_marker("cpu_manager") for item in request.session.items):
-            _verify_cpumanager_workers(_schedulable_nodes=schedulable_nodes)
+            try:
+                verify_cpumanager_workers(schedulable_nodes=schedulable_nodes)
+            except ResourceValueError as error:
+                failed_verifications_list.append(str(error))
         if any(item.get_closest_marker("gpu") for item in request.session.items):
             _verify_gpu(_gpu_nodes=gpu_nodes, _nodes_with_supported_gpus=nodes_with_supported_gpus)
             _verfify_no_dpdk()
         if any(item.get_closest_marker("sriov") for item in request.session.items):
             _verify_sriov(_sriov_workers=sriov_workers)
         if any(item.get_closest_marker("hugepages") for item in request.session.items):
-            _verify_hugepages_1gi(_workers=workers)
+            try:
+                verify_hugepages_1gi(hugepages_gib_values=hugepages_gib_values)
+            except ResourceValueError as error:
+                failed_verifications_list.append(str(error))
         if any(item.get_closest_marker("rwx_default_storage") for item in request.session.items):
-            _verify_rwx_default_storage()
+            try:
+                verify_rwx_default_storage(client=admin_client)
+            except ResourceValueError as error:
+                failed_verifications_list.append(str(error))
         if any(item.get_closest_marker("descheduler") for item in request.session.items):
             _verify_descheduler_operator_installed()
             _verify_psi_kernel_argument(_workers_utility_pods=workers_utility_pods)
@@ -225,55 +222,41 @@ def supported_gpu_device(workers_utility_pods, nodes_with_supported_gpus):
 
 
 @pytest.fixture(scope="session")
-def hco_cr_with_mdev_permitted_hostdevices_scope_session(hyperconverged_resource_scope_session, supported_gpu_device):
+def hco_cr_with_mdev_permitted_hostdevices_scope_session(
+    admin_client, hyperconverged_resource_scope_session, supported_gpu_device
+):
     yield from patch_hco_cr_with_mdev_permitted_hostdevices(
-        hyperconverged_resource=hyperconverged_resource_scope_session, supported_gpu_device=supported_gpu_device
+        admin_client=admin_client,
+        hyperconverged_resource=hyperconverged_resource_scope_session,
+        supported_gpu_device=supported_gpu_device,
     )
 
 
 @pytest.fixture(scope="session")
-def gpu_nodes_labeled_with_vm_vgpu(nodes_with_supported_gpus):
-    yield from label_nodes(nodes=nodes_with_supported_gpus, labels={"nvidia.com/gpu.workload.config": "vm-vgpu"})
+def nvidia_vgpu_manager_ds(admin_client):
+    return get_resources_by_name_prefix(
+        prefix=NVIDIA_VGPU_MANAGER_DS,
+        namespace=NamespacesNames.NVIDIA_GPU_OPERATOR,
+        api_resource_name=DaemonSet,
+    )[0]
 
 
 @pytest.fixture(scope="session")
-def vgpu_ready_nodes(admin_client, gpu_nodes_labeled_with_vm_vgpu):
-    wait_for_manager_pods_deployed(admin_client=admin_client, ds_name=NVIDIA_VGPU_MANAGER_DS)
-    yield gpu_nodes_labeled_with_vm_vgpu
+def nvidia_sandbox_validator_ds(admin_client):
+    return DaemonSet(
+        client=admin_client,
+        namespace=NamespacesNames.NVIDIA_GPU_OPERATOR,
+        name=NVIDIA_SANDBOX_VALIDATOR_DS,
+    )
 
 
 @pytest.fixture(scope="session")
-def non_existent_mdev_bus_nodes(workers_utility_pods, vgpu_ready_nodes):
-    """
-    Check if the mdev_bus needed for vGPU is available.
-
-    On the Worker Node on which GPU Device exists, check if the
-    mdev_bus needed for vGPU is available.
-    If it's not available, this means the nvidia-vgpu-manager-daemonset
-    Pod might not be in running state in the nvidia-gpu-operator namespace.
-    """
-    desired_bus = "mdev_bus"
-    non_existent_mdev_bus_nodes = []
-    for node in vgpu_ready_nodes:
-        pod_exec = ExecCommandOnPod(utility_pods=workers_utility_pods, node=node)
-        try:
-            for sample in TimeoutSampler(
-                wait_timeout=TIMEOUT_1MIN,
-                sleep=TIMEOUT_5SEC,
-                func=pod_exec.exec,
-                command=f"ls /sys/class | grep {desired_bus} || true",
-            ):
-                if sample:
-                    return
-        except TimeoutExpiredError:
-            non_existent_mdev_bus_nodes.append(node.name)
-    if non_existent_mdev_bus_nodes:
-        pytest.fail(
-            reason=(
-                f"On these nodes: {non_existent_mdev_bus_nodes} {desired_bus} is not available."
-                "Ensure that in 'nvidia-gpu-operator' namespace nvidia-vgpu-manager-daemonset Pod is Running."
-            )
-        )
+def nvidia_vgpu_device_manager_ds(admin_client):
+    return DaemonSet(
+        client=admin_client,
+        namespace=NamespacesNames.NVIDIA_GPU_OPERATOR,
+        name=NVIDIA_VGPU_DEVICE_MANAGER_DS,
+    )
 
 
 @pytest.fixture(scope="session")
@@ -355,42 +338,29 @@ def golden_image_data_volume_template_for_test_scope_class(request, golden_image
     )
 
 
-@pytest.fixture()
-def golden_image_data_source_for_test_scope_function(request, admin_client, golden_images_namespace):
-    yield from get_or_create_golden_image_data_source(
-        admin_client=admin_client, golden_images_namespace=golden_images_namespace, os_dict=request.param["os_dict"]
-    )
-
-
-@pytest.fixture()
-def golden_image_data_volume_template_for_test_scope_function(
-    request, golden_image_data_source_for_test_scope_function
-):
-    return get_data_volume_template_dict_with_default_storage_class(
-        data_source=golden_image_data_source_for_test_scope_function,
-        storage_class=getattr(request, "param", {}).get("storage_class"),
-    )
-
-
 @pytest.fixture(scope="class")
 def vm_for_test_from_template_scope_class(
     request,
     unprivileged_client,
     namespace,
     golden_image_data_volume_template_for_test_scope_class,
+    modern_cpu_for_migration,
 ):
     with vm_instance_from_template(
         request=request,
         unprivileged_client=unprivileged_client,
         namespace=namespace,
         data_volume_template=golden_image_data_volume_template_for_test_scope_class,
+        vm_cpu_model=modern_cpu_for_migration,
     ) as vm:
         yield vm
 
 
 @pytest.fixture(scope="class")
-def hco_memory_overcommit_increased(hyperconverged_resource_scope_class):
-    yield from update_hco_memory_overcommit(hco=hyperconverged_resource_scope_class, percentage=200)
+def hco_memory_overcommit_increased(admin_client, hyperconverged_resource_scope_class):
+    yield from update_hco_memory_overcommit(
+        admin_client=admin_client, hco=hyperconverged_resource_scope_class, percentage=200
+    )
 
 
 @pytest.fixture(scope="session")

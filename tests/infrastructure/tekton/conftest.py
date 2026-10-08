@@ -24,17 +24,16 @@ from tests.infrastructure.tekton.utils import (
     yaml_files_in_dir,
 )
 from utilities.artifactory import get_artifactory_config_map, get_artifactory_secret
-from utilities.constants import (
-    BREW_REGISTERY_SOURCE,
-    OS_FLAVOR_FEDORA,
+from utilities.constants.images import OS_FLAVOR_FEDORA
+from utilities.constants.tekton import (
     TEKTON_AVAILABLE_PIPELINEREF,
     TEKTON_AVAILABLE_TASKS,
-    TIMEOUT_1MIN,
+    WINDOWS_EFI_INSTALLER_STR,
+)
+from utilities.constants.timeouts import (
     TIMEOUT_2MIN,
     TIMEOUT_10MIN,
     TIMEOUT_30SEC,
-    TIMEOUT_50MIN,
-    WINDOWS_EFI_INSTALLER_STR,
 )
 from utilities.data_utils import base64_encode_str
 from utilities.infra import (
@@ -115,12 +114,20 @@ def csv_instance(csv_scope_session):
 
 
 @pytest.fixture(scope="session")
-def extracted_tekton_test_image(csv_instance):
-    annotation = csv_instance.metadata.annotations.get("test-images-nvrs", "")
-    for image in annotation.split(","):
-        if KUBEVIRT_TEKTON_AVAILABLE_TASKS_TEST in image:
-            return f"{BREW_REGISTERY_SOURCE}/rh-osbs/container-native-virtualization-{image.strip()}"
-    raise ValueError("Tekton test image not found in CSV annotations.")
+def tekton_test_image_name_and_digest(csv_scope_session):
+    test_images_nvrs = csv_scope_session.instance.metadata.annotations.get("test-images-nvrs")
+    for test_image in test_images_nvrs.split(","):
+        if KUBEVIRT_TEKTON_AVAILABLE_TASKS_TEST in test_image:
+            return test_image.strip()
+    raise ValueError(
+        f"{KUBEVIRT_TEKTON_AVAILABLE_TASKS_TEST} not found in CSV 'test-images-nvrs' annotation: {test_images_nvrs}"
+    )
+
+
+@pytest.fixture(scope="session")
+def tekton_test_image(tekton_test_image_name_and_digest, cnv_current_version):
+    major, minor = cnv_current_version.split(".")[:2]
+    return f"quay.io/openshift-virtualization/konflux-builds/v{major}-{minor}/{tekton_test_image_name_and_digest}"
 
 
 @pytest.fixture(scope="session")
@@ -132,11 +139,11 @@ def extracted_virtio_image_container(csv_instance):
 
 
 @pytest.fixture(scope="session")
-def extracted_kubevirt_tekton_resources(tekton_manifests_dir, extracted_tekton_test_image, generated_pulled_secret):
+def extracted_kubevirt_tekton_resources(tekton_manifests_dir, tekton_test_image, generated_pulled_secret):
     run_command(
         command=shlex.split(
             f"oc image extract --registry-config={generated_pulled_secret} "
-            f"--path release/*:{tekton_manifests_dir} {extracted_tekton_test_image}"
+            f"--path release/*:{tekton_manifests_dir} {tekton_test_image}"
         )
     )
 
@@ -234,8 +241,10 @@ def resource_editor_efi_pipelines(
 
 
 @pytest.fixture(scope="module")
-def custom_pipeline_namespace(admin_client):
-    yield from create_ns(name="test-custom-pipeline-ns", admin_client=admin_client)
+def custom_pipeline_namespace(unprivileged_client, admin_client):
+    yield from create_ns(
+        name="test-custom-pipeline-ns", admin_client=admin_client, unprivileged_client=unprivileged_client
+    )
 
 
 @pytest.fixture(scope="module")
@@ -327,15 +336,13 @@ def quay_disk_uploader_secret(admin_client, custom_pipeline_namespace):
 
 
 @pytest.fixture(scope="module")
-def vm_for_disk_uploader(unprivileged_client, custom_pipeline_namespace, golden_images_namespace):
+def vm_for_disk_uploader(admin_client, custom_pipeline_namespace, golden_images_namespace):
     with VirtualMachineForTests(
         name="fedora-vm-diskuploader",
         namespace=custom_pipeline_namespace.name,
-        client=unprivileged_client,
+        client=admin_client,
         data_volume_template=data_volume_template_with_source_ref_dict(
-            data_source=DataSource(
-                name=OS_FLAVOR_FEDORA, namespace=golden_images_namespace.name, client=unprivileged_client
-            ),
+            data_source=DataSource(name=OS_FLAVOR_FEDORA, namespace=golden_images_namespace.name, client=admin_client),
             storage_class=py_config["default_storage_class"],
         ),
         vm_instance_type_infer=True,
@@ -368,10 +375,15 @@ def pipelinerun_for_disk_uploader(
     vm_for_disk_uploader,
     request,
 ):
+    volumes = vm_for_disk_uploader.instance.spec.template.spec.volumes
+    dv_volume = next((dv for dv in volumes if "dataVolume" in dict(dv)), None)
+    if not dv_volume:
+        raise ValueError(f"No dataVolume found in VM {vm_for_disk_uploader.name} volumes")
+    dv_name = dv_volume.dataVolume.name
     pipeline_run_params = {
         EXPORT_SOURCE_KIND: request.param,
-        EXPORT_SOURCE_NAME: (vm_for_disk_uploader.name if request.param == "vm" else OS_FLAVOR_FEDORA),
-        VOLUME_NAME: OS_FLAVOR_FEDORA,
+        EXPORT_SOURCE_NAME: (vm_for_disk_uploader.name if request.param == "vm" else dv_name),
+        VOLUME_NAME: dv_name,
         IMAGE_DESTINATION: "quay.io/openshift-cnv/tekton-tasks",
         SECRET_NAME: quay_disk_uploader_secret.name,
     }
@@ -389,9 +401,7 @@ def pipelinerun_for_disk_uploader(
 
 @pytest.fixture()
 def final_status_pipelinerun(pipelinerun_from_pipeline_template):
-    return wait_for_final_status_pipelinerun(
-        pipelinerun=pipelinerun_from_pipeline_template, wait_timeout=TIMEOUT_50MIN, sleep_interval=TIMEOUT_1MIN
-    )
+    return wait_for_final_status_pipelinerun(pipelinerun=pipelinerun_from_pipeline_template)
 
 
 @pytest.fixture()

@@ -3,12 +3,16 @@ import os
 import ssl
 
 import requests
+from kubernetes.dynamic import DynamicClient
 from ocp_resources.config_map import ConfigMap
 from ocp_resources.secret import Secret
 from pytest_testconfig import config as py_config
 from timeout_sampler import TimeoutExpiredError, TimeoutSampler
 
-from utilities.constants import TIMEOUT_1MIN, TIMEOUT_5SEC
+from utilities.constants.timeouts import (
+    TIMEOUT_1MIN,
+    TIMEOUT_5SEC,
+)
 from utilities.data_utils import base64_encode_str
 
 LOGGER = logging.getLogger(__name__)
@@ -84,6 +88,7 @@ def get_artifactory_header() -> dict[str, str]:
 
 def get_artifactory_secret(
     namespace: str,
+    client: DynamicClient | None = None,
 ) -> Secret:
     """
     Create or retrieve an Artifactory authentication secret in the specified namespace.
@@ -94,6 +99,7 @@ def get_artifactory_secret(
 
     Args:
         namespace (str): The Kubernetes namespace where the secret should be created or retrieved.
+        client (DynamicClient | None): Optional Kubernetes client. If None, uses the default client.
 
     Returns:
         Secret: The Artifactory Secret resource object.
@@ -106,6 +112,7 @@ def get_artifactory_secret(
         namespace=namespace,
         accesskeyid=base64_encode_str(os.environ["ARTIFACTORY_USER"]),
         secretkey=base64_encode_str(os.environ["ARTIFACTORY_TOKEN"]),
+        client=client,
     )
     if not artifactory_secret.exists:
         artifactory_secret.deploy()
@@ -114,6 +121,7 @@ def get_artifactory_secret(
 
 def get_artifactory_config_map(
     namespace: str,
+    client: DynamicClient | None = None,
 ) -> ConfigMap:
     """
     Create or retrieve an Artifactory TLS certificate ConfigMap in the specified namespace.
@@ -125,6 +133,7 @@ def get_artifactory_config_map(
 
     Args:
         namespace (str): The Kubernetes namespace where the ConfigMap should be created or retrieved.
+        client (DynamicClient | None): Optional Kubernetes client. If None, uses the default client.
 
     Returns:
         ConfigMap: The Artifactory ConfigMap resource object containing the TLS certificate.
@@ -137,6 +146,7 @@ def get_artifactory_config_map(
         name="artifactory-configmap",
         namespace=namespace,
         data={"tlsregistry.crt": ssl.get_server_certificate(addr=(py_config["server_url"], 443))},
+        client=client,
     )
     if not artifactory_cm.exists:
         artifactory_cm.deploy()

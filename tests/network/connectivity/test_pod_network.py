@@ -4,7 +4,7 @@ VM to VM connectivity
 
 import pytest
 
-from utilities.constants import IPV4_STR, IPV6_STR
+from utilities.constants.networking import IPV4_STR, IPV6_STR
 from utilities.infra import get_node_selector_dict
 from utilities.network import (
     compose_cloud_init_data_dict,
@@ -17,7 +17,7 @@ from utilities.virt import VirtualMachineForTests, fedora_vm_body, vm_console_ru
 def pod_net_vma(
     namespace,
     unprivileged_client,
-    nic_models_matrix__module__,
+    pod_network_nic_model,
     cloud_init_ipv6_network_data,
     schedulable_nodes,
 ):
@@ -28,7 +28,7 @@ def pod_net_vma(
         name=name,
         node_selector=get_node_selector_dict(node_selector=node_selector),
         client=unprivileged_client,
-        network_model=nic_models_matrix__module__,
+        network_model=pod_network_nic_model,
         body=fedora_vm_body(name=name),
         cloud_init_data=cloud_init_ipv6_network_data,
     ) as vm:
@@ -40,7 +40,7 @@ def pod_net_vma(
 def pod_net_vmb(
     namespace,
     unprivileged_client,
-    nic_models_matrix__module__,
+    pod_network_nic_model,
     cloud_init_ipv6_network_data,
     schedulable_nodes,
 ):
@@ -51,7 +51,7 @@ def pod_net_vmb(
         name=name,
         node_selector=get_node_selector_dict(node_selector=node_selector),
         client=unprivileged_client,
-        network_model=nic_models_matrix__module__,
+        network_model=pod_network_nic_model,
         body=fedora_vm_body(name=name),
         cloud_init_data=cloud_init_ipv6_network_data,
     ) as vm:
@@ -72,10 +72,19 @@ def pod_net_running_vmb(pod_net_vmb):
 
 
 @pytest.fixture(scope="module")
-def cloud_init_ipv6_network_data(dual_stack_network_data):
-    return compose_cloud_init_data_dict(ipv6_network_data=dual_stack_network_data)
+def cloud_init_ipv6_network_data(ipv6_primary_interface_cloud_init_data):
+    return compose_cloud_init_data_dict(ipv6_network_data=ipv6_primary_interface_cloud_init_data)
 
 
+@pytest.mark.parametrize(
+    "pod_network_nic_model",
+    [
+        pytest.param("virtio", marks=[pytest.mark.s390x, pytest.mark.polarion("CNV-16553")], id="#virtio#"),
+        pytest.param("e1000e", marks=[pytest.mark.polarion("CNV-16554")], id="#e1000e#"),
+    ],
+    indirect=True,
+    scope="module",
+)
 @pytest.mark.parametrize(
     "ip_family",
     [
@@ -98,8 +107,7 @@ def cloud_init_ipv6_network_data(dual_stack_network_data):
 )
 @pytest.mark.gating
 @pytest.mark.single_nic
-@pytest.mark.s390x
-# Not marked as `conformance`; requires NMState
+# conformance candidate
 def test_connectivity_over_pod_network(
     ip_family,
     pod_net_vma,

@@ -6,13 +6,14 @@ import logging
 
 import pytest
 
-from tests.os_params import WINDOWS_10, WINDOWS_10_TEMPLATE_LABELS, WINDOWS_2019, WINDOWS_2019_TEMPLATE_LABELS
+from tests.os_params import WINDOWS_11, WINDOWS_11_TEMPLATE_LABELS, WINDOWS_2019, WINDOWS_2019_TEMPLATE_LABELS
 from tests.virt.node.gpu.constants import GPU_DEVICE_NAME_STR
 from tests.virt.node.gpu.utils import (
     restart_and_check_gpu_exists,
 )
-from tests.virt.utils import validate_pause_unpause_windows_vm, verify_gpu_device_exists_in_vm
+from tests.virt.utils import verify_gpu_device_exists_in_vm
 from utilities.constants import Images
+from utilities.guest_support import validate_pause_unpause_windows_vm
 
 pytestmark = [
     pytest.mark.post_upgrade,
@@ -31,14 +32,14 @@ TESTS_CLASS_NAME = "TestPCIPassthroughWinHostDevicesSpec"
     "golden_image_data_source_for_test_scope_class, gpu_vma",
     [
         pytest.param(
-            {"os_dict": WINDOWS_10},
+            {"os_dict": WINDOWS_11},
             {
-                "vm_name": "win10-passthrough-vm",
-                "template_labels": WINDOWS_10_TEMPLATE_LABELS,
+                "vm_name": "win11-passthrough-vm",
+                "template_labels": WINDOWS_11_TEMPLATE_LABELS,
                 "host_device": GPU_DEVICE_NAME_STR,
                 "cloned_dv_size": Images.Windows.DEFAULT_DV_SIZE,
             },
-            id="test_win10_pci_passthrough",
+            id="test_win11_pci_passthrough",
         ),
         pytest.param(
             {"os_dict": WINDOWS_2019},
@@ -53,6 +54,7 @@ TESTS_CLASS_NAME = "TestPCIPassthroughWinHostDevicesSpec"
     ],
     indirect=True,
 )
+@pytest.mark.windows
 class TestPCIPassthroughWinHostDevicesSpec:
     """
     Test PCI Passthrough with Windows VM using HostDevices Spec.

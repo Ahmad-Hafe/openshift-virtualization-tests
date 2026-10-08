@@ -92,6 +92,10 @@ Example for SNO cluster:
 
 `--tc-file=tests/global_config_sno.py --storage-class-matrix=lvms-vg1`
 
+### Running tests on multi-arch / heterogeneous clusters
+
+See [Multi-Architecture Clusters](MULTIARCH.md).
+
 #### Running tests with an admin client instead of an unprivileged client
 To run tests with an admin client only, pass `--tc=no_unprivileged_client:True` to pytest.
 
@@ -99,11 +103,7 @@ To run tests with an admin client only, pass `--tc=no_unprivileged_client:True` 
 ### Running tests using matrix fixtures
 
 Matrix fixtures can be added in global_config.py.
-You can run a test using a subset of a simple matrix (i.e flat list), example:
-
-```bash
---tc=ip_stack_version_matrix:ipv4
-```
+You can run a test using a subset of a simple matrix (i.e flat list).
 
 To run a test using a subset of a complex matrix (e.g list of dicts), you'll also need to add
 the following to `openshift-virtualization-tests/conftest.py`
@@ -180,6 +180,7 @@ To use jira plugin, you need to set the following environment variables:
 ```bash
 export PYTEST_JIRA_URL=<url>
 export PYTEST_JIRA_TOKEN=<your_token>
+export PYTEST_JIRA_USERNAME=<email>    # email associated with the Jira account
 ```
 
 ## Additional options
@@ -188,6 +189,7 @@ There are other parameters that can be passed to the test suite if needed.
 ```bash
 --tc-file=tests/global_config.py
 --tc-format=python
+--cpu-arch=amd64
 --junitxml /tmp/xunit_results.xml
 --jira
 ```

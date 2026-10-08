@@ -6,14 +6,59 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+from utilities.constants.architecture import (
+    AMD_64,
+    ARM_64,
+)
+from utilities.constants.instance_types import (
+    CENTOS_STREAM10_PREFERENCE,
+    RHEL10_PREFERENCE,
+)
+from utilities.exceptions import OsDictNotFoundError
 from utilities.os_utils import (
     CENTOS_OS_MAPPING,
     FEDORA_OS_MAPPING,
     RHEL_OS_MAPPING,
     WINDOWS_OS_MAPPING,
+    generate_latest_os_dict,
     generate_linux_instance_type_os_matrix,
     generate_os_matrix_dict,
+    get_windows_container_disk_path,
 )
+
+
+class TestGetWindowsContainerDiskPath:
+    """Test cases for get_windows_container_disk_path function"""
+
+    EXPECTED_DIR = "docker-local/kubevirt-common-instancetypes"
+
+    @pytest.mark.parametrize(
+        "os_value, expected_suffix",
+        [
+            pytest.param("win10", "windows10-container-disk:4.99", id="win10"),
+            pytest.param("win11", "windows11-container-disk:4.99", id="win11"),
+            pytest.param("win2k19", "windows2k19-container-disk:4.99", id="win2k19"),
+            pytest.param("win2k22", "windows2k22-container-disk:4.99", id="win2k22"),
+            pytest.param("win2k25", "windows2k25-container-disk:4.99", id="win2k25"),
+        ],
+    )
+    def test_get_windows_container_disk_path(self, os_value: str, expected_suffix: str):
+        """Test generating container disk path for valid Windows OS values"""
+        result = get_windows_container_disk_path(os_value=os_value)
+
+        assert result == f"{self.EXPECTED_DIR}/{expected_suffix}"
+
+    @pytest.mark.parametrize(
+        "os_value",
+        [
+            pytest.param("linux", id="linux"),
+            pytest.param("rhel9", id="rhel"),
+        ],
+    )
+    def test_get_windows_container_disk_path_invalid_os(self, os_value: str):
+        """Test error when os_value doesn't start with 'win'"""
+        with pytest.raises(ValueError, match="os_value must start with 'win'"):
+            get_windows_container_disk_path(os_value=os_value)
 
 
 class TestGenerateOsMatrixDict:
@@ -24,7 +69,7 @@ class TestGenerateOsMatrixDict:
         """Test RHEL OS matrix generation with single version"""
         mock_images.Rhel = mock_os_images["rhel"]
 
-        result = generate_os_matrix_dict("rhel", ["rhel-9-5"])
+        result = generate_os_matrix_dict(os_name="rhel", supported_operating_systems=["rhel-9-5"])
 
         assert len(result) == 1
         assert "rhel-9-5" in result[0]
@@ -43,14 +88,14 @@ class TestGenerateOsMatrixDict:
         """Test RHEL OS matrix generation with multiple versions"""
         mock_images.Rhel = mock_os_images["rhel"]
 
-        result = generate_os_matrix_dict("rhel", ["rhel-7-9", "rhel-8-10", "rhel-9-6"])
+        result = generate_os_matrix_dict(os_name="rhel", supported_operating_systems=["rhel-8-10", "rhel-9-6"])
 
-        assert len(result) == 3
+        assert len(result) == 2
 
-        # Check RHEL 7.9
-        rhel_79 = next(item for item in result if "rhel-7-9" in item)["rhel-7-9"]
-        assert rhel_79["os_version"] == "7.9"
-        assert rhel_79["image_name"] == "rhel-7.9.qcow2"
+        # Check RHEL 8.10
+        rhel_810 = next(item for item in result if "rhel-8-10" in item)["rhel-8-10"]
+        assert rhel_810["os_version"] == "8.10"
+        assert rhel_810["image_name"] == "rhel-8.10.qcow2"
 
         # Check RHEL 9.6 (latest)
         rhel_96 = next(item for item in result if "rhel-9-6" in item)["rhel-9-6"]
@@ -63,29 +108,29 @@ class TestGenerateOsMatrixDict:
         """Test Windows OS matrix generation with UEFI support"""
         mock_images.Windows = mock_os_images["windows"]
 
-        result = generate_os_matrix_dict("windows", ["win-10", "win-2016"])
+        result = generate_os_matrix_dict(os_name="windows", supported_operating_systems=["win-11", "win-2019"])
 
         assert len(result) == 2
 
-        # Check Windows 10 (UEFI + desktop workload)
-        win10 = next(item for item in result if "win-10" in item)["win-10"]
-        assert win10["os_version"] == "10"
-        assert win10["image_name"] == "win10.qcow2"
-        assert win10["image_path"] == "cnv-tests/windows-uefi-images/win10.qcow2"
-        assert win10["template_labels"]["workload"] == "desktop"
-        assert win10["template_labels"]["flavor"] == "medium"
+        # Check Windows 11 (no UEFI, desktop workload)
+        win11 = next(item for item in result if "win-11" in item)["win-11"]
+        assert win11["os_version"] == "11"
+        assert win11["image_name"] == "win11.qcow2"
+        assert win11["image_path"] == "cnv-tests/windows-images/win11.qcow2"
+        assert win11["template_labels"]["workload"] == "desktop"
+        assert win11["template_labels"]["flavor"] == "medium"
 
-        # Check Windows 2016 (UEFI + server workload)
-        win2016 = next(item for item in result if "win-2016" in item)["win-2016"]
-        assert win2016["image_path"] == "cnv-tests/windows-uefi-images/win2k16.qcow2"
-        assert win2016["template_labels"]["workload"] == "server"
+        # Check Windows 2019 (UEFI + server workload)
+        win2019 = next(item for item in result if "win-2019" in item)["win-2019"]
+        assert win2019["image_path"] == "cnv-tests/windows-uefi-images/win2k19.qcow2"
+        assert win2019["template_labels"]["workload"] == "server"
 
     @patch("utilities.os_utils.Images")
     def test_generate_windows_os_matrix_without_uefi(self, mock_images, mock_os_images):
         """Test Windows OS matrix generation without UEFI"""
         mock_images.Windows = mock_os_images["windows"]
 
-        result = generate_os_matrix_dict("windows", ["win-2022"])
+        result = generate_os_matrix_dict(os_name="windows", supported_operating_systems=["win-2022"])
 
         assert len(result) == 1
         win2022 = result[0]["win-2022"]
@@ -96,7 +141,7 @@ class TestGenerateOsMatrixDict:
         """Test Fedora OS matrix generation"""
         mock_images.Fedora = mock_os_images["fedora"]
 
-        result = generate_os_matrix_dict("fedora", ["fedora-43"])
+        result = generate_os_matrix_dict(os_name="fedora", supported_operating_systems=["fedora-43"])
 
         assert len(result) == 1
         fedora_config = result[0]["fedora-43"]
@@ -111,7 +156,7 @@ class TestGenerateOsMatrixDict:
         """Test CentOS OS matrix generation"""
         mock_images.Centos = mock_os_images["centos"]
 
-        result = generate_os_matrix_dict("centos", ["centos-stream-9"])
+        result = generate_os_matrix_dict(os_name="centos", supported_operating_systems=["centos-stream-9"])
 
         assert len(result) == 1
         centos_config = result[0]["centos-stream-9"]
@@ -122,7 +167,7 @@ class TestGenerateOsMatrixDict:
     def test_generate_os_matrix_unsupported_os(self):
         """Test error handling for unsupported OS"""
         with pytest.raises(ValueError, match="Unsupported OS: ubuntu"):
-            generate_os_matrix_dict("ubuntu", ["ubuntu-20-04"])
+            generate_os_matrix_dict(os_name="ubuntu", supported_operating_systems=["ubuntu-20-04"])
 
     def test_generate_os_matrix_empty_supported_versions(self, mock_os_images):
         """Test error handling for unsupported OS versions"""
@@ -130,7 +175,7 @@ class TestGenerateOsMatrixDict:
             mock_images.Rhel = mock_os_images["rhel"]
 
             with pytest.raises(ValueError, match="Unsupported OS versions: \\['rhel-6-1'\\] for rhel"):
-                generate_os_matrix_dict("rhel", ["rhel-6-1"])
+                generate_os_matrix_dict(os_name="rhel", supported_operating_systems=["rhel-6-1"])
 
     @patch("utilities.os_utils.Images")
     def test_generate_os_matrix_missing_images_class(self, mock_images):
@@ -140,7 +185,7 @@ class TestGenerateOsMatrixDict:
         mock_images.Rhel = None
 
         with pytest.raises(ValueError, match="Unsupported OS: rhel.*Make sure it is supported"):
-            generate_os_matrix_dict("rhel", ["rhel-9-5"])
+            generate_os_matrix_dict(os_name="rhel", supported_operating_systems=["rhel-9-5"])
 
     @patch("utilities.os_utils.Images")
     def test_generate_os_matrix_missing_latest_release(self, mock_images, mock_os_images):
@@ -152,7 +197,7 @@ class TestGenerateOsMatrixDict:
         mock_images.Rhel = mock_class
 
         with pytest.raises(ValueError, match="rhel is missing `LATEST_RELEASE_STR` attribute"):
-            generate_os_matrix_dict("rhel", ["rhel-9-5"])
+            generate_os_matrix_dict(os_name="rhel", supported_operating_systems=["rhel-9-5"])
 
     @patch("utilities.os_utils.Images")
     def test_generate_os_matrix_missing_default_dv_size(self, mock_images, mock_os_images):
@@ -164,7 +209,7 @@ class TestGenerateOsMatrixDict:
         mock_images.Rhel = mock_class
 
         with pytest.raises(ValueError, match="rhel is missing `DEFAULT_DV_SIZE` attribute"):
-            generate_os_matrix_dict("rhel", ["rhel-9-5"])
+            generate_os_matrix_dict(os_name="rhel", supported_operating_systems=["rhel-9-5"])
 
     @patch("utilities.os_utils.Images")
     def test_generate_os_matrix_missing_image_attribute(self, mock_images, mock_os_images):
@@ -177,7 +222,7 @@ class TestGenerateOsMatrixDict:
         mock_images.Rhel = mock_class
 
         with pytest.raises(ValueError, match="rhel is missing RHEL9_5_IMG attribute"):
-            generate_os_matrix_dict("rhel", ["rhel-9-5"])
+            generate_os_matrix_dict(os_name="rhel", supported_operating_systems=["rhel-9-5"])
 
     @patch("utilities.os_utils.Images")
     def test_generate_os_matrix_missing_dir_attribute(self, mock_images, mock_os_images):
@@ -191,7 +236,7 @@ class TestGenerateOsMatrixDict:
         mock_images.Rhel = mock_class
 
         with pytest.raises(ValueError, match="rhel is missing `DIR` attribute"):
-            generate_os_matrix_dict("rhel", ["rhel-9-5"])
+            generate_os_matrix_dict(os_name="rhel", supported_operating_systems=["rhel-9-5"])
 
     @patch("utilities.os_utils.Images")
     def test_generate_os_matrix_missing_uefi_dir_attribute(self, mock_images, mock_os_images):
@@ -199,13 +244,34 @@ class TestGenerateOsMatrixDict:
         mock_class = MagicMock()
         mock_class.LATEST_RELEASE_STR = "win2k25.qcow2"
         mock_class.DEFAULT_DV_SIZE = "60Gi"
-        mock_class.WIN10_IMG = "win10.qcow2"
+        mock_class.WIN2k19_IMG = "win2k19.qcow2"
         # Missing UEFI_WIN_DIR
         del mock_class.UEFI_WIN_DIR
         mock_images.Windows = mock_class
 
         with pytest.raises(ValueError, match="windows is missing `UEFI_WIN_DIR` attribute"):
-            generate_os_matrix_dict("windows", ["win-10"])
+            generate_os_matrix_dict(os_name="windows", supported_operating_systems=["win-2019"])
+
+    @patch("utilities.os_utils.ArchImages")
+    @patch("utilities.os_utils.Images")
+    def test_generate_os_matrix_dict_with_arch_adds_architecture_labels(
+        self, mock_images, mock_arch_images, mock_os_images
+    ):
+        """Test that passing arch adds architecture to template_labels and data source suffix"""
+        mock_images.Rhel = mock_os_images["rhel"]
+        # When arch is set, getattr(ArchImages, "AMD64") is used
+        mock_arch_images.AMD64 = mock_os_images["rhel"]
+
+        result = generate_os_matrix_dict(
+            os_name="rhel",
+            supported_operating_systems=["rhel-9-5"],
+            arch="amd64",
+        )
+
+        assert len(result) == 1
+        rhel_config = result[0]["rhel-9-5"]
+        assert rhel_config["template_labels"]["architecture"] == "amd64"
+        assert rhel_config["data_source"] == "rhel9-amd64"
 
 
 class TestGenerateInstanceTypeRhelOsMatrix:
@@ -274,6 +340,71 @@ class TestGenerateInstanceTypeRhelOsMatrix:
         rhel9_item = next(item for item in result if "rhel-9" in item)
         assert rhel9_item["rhel-9"]["latest_released"] is True
 
+    def test_arch_suffix_applied_to_preference_not_data_source(self):
+        """On homogeneous clusters arch_suffix is appended to preference but not DataSource."""
+        result = generate_linux_instance_type_os_matrix(
+            os_name="rhel",
+            preferences=[RHEL10_PREFERENCE],
+            arch_suffix=ARM_64,
+        )
+
+        config = result[0][f"{RHEL10_PREFERENCE}.{ARM_64}"]
+        assert config["preference"] == f"{RHEL10_PREFERENCE}.{ARM_64}"
+        assert config["DATA_SOURCE_NAME"] == "rhel10"
+
+    def test_multiarch_data_source_gets_arch_suffix(self):
+        """On multiarch clusters add_data_source_arch_suffix appends arch to DataSource."""
+        result = generate_linux_instance_type_os_matrix(
+            os_name="rhel",
+            preferences=[RHEL10_PREFERENCE],
+            arch_suffix=ARM_64,
+            add_data_source_arch_suffix=True,
+        )
+
+        config = result[0][f"{RHEL10_PREFERENCE}.{ARM_64}"]
+        assert config["preference"] == f"{RHEL10_PREFERENCE}.{ARM_64}"
+        assert config["DATA_SOURCE_NAME"] == f"rhel10-{ARM_64}"
+
+    def test_arch_suffix_omitted_from_preference_when_add_preference_arch_suffix_false(self):
+        """add_preference_arch_suffix=False keeps the preference plain. DataSource stays bare without add_data_source_arch_suffix."""
+        result = generate_linux_instance_type_os_matrix(
+            os_name="centos.stream",
+            preferences=[CENTOS_STREAM10_PREFERENCE],
+            arch_suffix=ARM_64,
+            add_preference_arch_suffix=False,
+        )
+
+        config = result[0][CENTOS_STREAM10_PREFERENCE]
+        assert config["preference"] == CENTOS_STREAM10_PREFERENCE, "preference must not include arch suffix"
+        assert config["DATA_SOURCE_NAME"] == "centos-stream10", (
+            "DataSource must be bare without add_data_source_arch_suffix"
+        )
+
+    def test_multiarch_amd64_bare_preference_suffixed_data_source(self):
+        """Multiarch + amd64: preference stays bare, DataSource gets the arch suffix (the fixed regression)."""
+        result = generate_linux_instance_type_os_matrix(
+            os_name="rhel",
+            preferences=[RHEL10_PREFERENCE],
+            arch_suffix=AMD_64,
+            add_preference_arch_suffix=False,
+            add_data_source_arch_suffix=True,
+        )
+
+        config = result[0][RHEL10_PREFERENCE]
+        assert config["preference"] == RHEL10_PREFERENCE, "preference must stay bare on amd64"
+        assert config["DATA_SOURCE_NAME"] == f"rhel10-{AMD_64}", "DataSource must carry arch suffix on multiarch"
+
+    def test_add_preference_arch_suffix_false_no_arch_suffix(self):
+        """add_preference_arch_suffix=False with no arch_suffix is a no-op."""
+        result_default = generate_linux_instance_type_os_matrix(
+            os_name="centos.stream", preferences=[CENTOS_STREAM10_PREFERENCE]
+        )
+        result_no_arch = generate_linux_instance_type_os_matrix(
+            os_name="centos.stream", preferences=[CENTOS_STREAM10_PREFERENCE], add_preference_arch_suffix=False
+        )
+
+        assert result_default == result_no_arch
+
 
 class TestOsMappingsConstants:
     """Test cases for OS mapping constants"""
@@ -282,13 +413,12 @@ class TestOsMappingsConstants:
         """Test RHEL OS mapping has correct structure"""
         assert "workload" in RHEL_OS_MAPPING
         assert "flavor" in RHEL_OS_MAPPING
-        assert "rhel-7-9" in RHEL_OS_MAPPING
         assert "rhel-8-10" in RHEL_OS_MAPPING
         assert "rhel-9-5" in RHEL_OS_MAPPING
         assert "rhel-9-6" in RHEL_OS_MAPPING
 
         # Check required keys in version entries
-        for version_key in ["rhel-7-9", "rhel-8-10", "rhel-9-5", "rhel-9-6"]:
+        for version_key in ["rhel-8-10", "rhel-9-5", "rhel-9-6"]:
             version_data = RHEL_OS_MAPPING[version_key]
             assert "image_name" in version_data
             assert "os_version" in version_data
@@ -300,8 +430,8 @@ class TestOsMappingsConstants:
         assert "flavor" in WINDOWS_OS_MAPPING
 
         # Check for UEFI flag where expected
-        assert WINDOWS_OS_MAPPING["win-10"]["uefi"] is True
-        assert WINDOWS_OS_MAPPING["win-2016"]["uefi"] is True
+        assert WINDOWS_OS_MAPPING["win-2019"]["uefi"] is True
+        assert "uefi" not in WINDOWS_OS_MAPPING["win-11"]
         assert "uefi" not in WINDOWS_OS_MAPPING["win-2022"]
 
     def test_fedora_os_mapping_structure(self):
@@ -315,3 +445,120 @@ class TestOsMappingsConstants:
         assert "workload" in CENTOS_OS_MAPPING
         assert "flavor" in CENTOS_OS_MAPPING
         assert "centos-stream-9" in CENTOS_OS_MAPPING
+
+
+class TestGenerateLatestOsDict:
+    """Test cases for generate_latest_os_dict function"""
+
+    def test_returns_latest_os_dict_when_found(self):
+        """Test returning the OS dict marked as latest_released"""
+        os_matrix = [
+            {"rhel-8-10": {"os_version": "8.10", "image_name": "rhel-8.10.qcow2"}},
+            {"rhel-9-6": {"os_version": "9.6", "image_name": "rhel-9.6.qcow2", "latest_released": True}},
+        ]
+
+        result = generate_latest_os_dict(os_matrix=os_matrix)
+
+        assert result == {"os_version": "9.6", "image_name": "rhel-9.6.qcow2", "latest_released": True}
+
+    def test_returns_latest_os_dict_from_first_position(self):
+        """Test finding latest_released when it's in the first matrix entry"""
+        os_matrix = [
+            {"fedora-43": {"os_version": "43", "latest_released": True}},
+            {"fedora-42": {"os_version": "42"}},
+        ]
+
+        result = generate_latest_os_dict(os_matrix=os_matrix)
+
+        assert result == {"os_version": "43", "latest_released": True}
+
+    def test_returns_latest_os_dict_from_middle_position(self):
+        """Test finding latest_released when it's in a middle matrix entry"""
+        os_matrix = [
+            {"rhel-7-9": {"os_version": "7.9"}},
+            {"rhel-9-6": {"os_version": "9.6", "latest_released": True}},
+            {"rhel-8-10": {"os_version": "8.10"}},
+        ]
+
+        result = generate_latest_os_dict(os_matrix=os_matrix)
+
+        assert result == {"os_version": "9.6", "latest_released": True}
+
+    def test_raises_error_when_no_latest_released(self):
+        """Test raising OsDictNotFoundError when no OS is marked as latest_released"""
+        os_matrix = [
+            {"rhel-8-10": {"os_version": "8.10"}},
+            {"rhel-9-5": {"os_version": "9.5"}},
+        ]
+
+        with pytest.raises(OsDictNotFoundError, match="No OS is marked as 'latest_released'"):
+            generate_latest_os_dict(os_matrix=os_matrix)
+
+    def test_raises_error_on_empty_list(self):
+        """Test raising OsDictNotFoundError when os_matrix is empty"""
+        with pytest.raises(OsDictNotFoundError, match="No OS is marked as 'latest_released'"):
+            generate_latest_os_dict(os_matrix=[])
+
+    def test_returns_first_latest_when_multiple_marked(self):
+        """Test returning the first latest_released when multiple OS dicts are marked"""
+        os_matrix = [
+            {"rhel-8-10": {"os_version": "8.10", "latest_released": True}},
+            {"rhel-9-6": {"os_version": "9.6", "latest_released": True}},
+        ]
+
+        result = generate_latest_os_dict(os_matrix=os_matrix)
+
+        assert result["os_version"] == "8.10"
+
+    def test_handles_complex_os_matrix_structure(self):
+        """Test with full OS matrix structure including all fields"""
+        os_matrix = [
+            {
+                "win-2022": {
+                    "os_version": "2022",
+                    "image_name": "win2022.qcow2",
+                    "image_path": "cnv-tests/windows-images/win2022.qcow2",
+                    "dv_size": "60Gi",
+                    "template_labels": {"os": "win2k22", "workload": "server", "flavor": "medium"},
+                    "data_source": "win2k22",
+                }
+            },
+            {
+                "win-2025": {
+                    "os_version": "2025",
+                    "image_name": "win2k25.qcow2",
+                    "image_path": "cnv-tests/windows-uefi-images/win2k25.qcow2",
+                    "dv_size": "60Gi",
+                    "template_labels": {"os": "win2k25", "workload": "server", "flavor": "medium"},
+                    "data_source": "win2k25",
+                    "latest_released": True,
+                }
+            },
+        ]
+
+        result = generate_latest_os_dict(os_matrix=os_matrix)
+
+        assert result["os_version"] == "2025"
+        assert result["image_name"] == "win2k25.qcow2"
+        assert result["latest_released"] is True
+
+    def test_handles_latest_released_false_value(self):
+        """Test that latest_released=False is not treated as latest"""
+        os_matrix = [
+            {"rhel-8-10": {"os_version": "8.10", "latest_released": False}},
+            {"rhel-9-6": {"os_version": "9.6", "latest_released": True}},
+        ]
+
+        result = generate_latest_os_dict(os_matrix=os_matrix)
+
+        assert result["os_version"] == "9.6"
+
+    def test_raises_error_when_all_latest_released_false(self):
+        """Test raising OsDictNotFoundError when all latest_released values are False"""
+        os_matrix = [
+            {"rhel-8-10": {"os_version": "8.10", "latest_released": False}},
+            {"rhel-9-5": {"os_version": "9.5", "latest_released": False}},
+        ]
+
+        with pytest.raises(OsDictNotFoundError, match="No OS is marked as 'latest_released'"):
+            generate_latest_os_dict(os_matrix=os_matrix)

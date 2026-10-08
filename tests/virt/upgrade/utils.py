@@ -1,35 +1,43 @@
 import logging
 from contextlib import contextmanager
 from datetime import datetime
+from typing import TYPE_CHECKING
 
 import pytest
+from kubernetes.dynamic import DynamicClient
 from ocp_resources.template import Template
 from ocp_resources.virtual_machine import VirtualMachine
+
+if TYPE_CHECKING:
+    from ocp_resources.cluster_service_version import ClusterServiceVersion
+
 from ocp_resources.virtual_machine_instance_migration import (
     VirtualMachineInstanceMigration,
 )
 from timeout_sampler import TimeoutExpiredError, TimeoutSampler
 
-from utilities.constants import (
-    DATA_SOURCE_NAME,
+from utilities.constants.components import VIRT_LAUNCHER
+from utilities.constants.hco import DATA_SOURCE_NAME
+from utilities.constants.timeouts import (
     TIMEOUT_3MIN,
     TIMEOUT_10SEC,
     TIMEOUT_180MIN,
 )
 from utilities.exceptions import ResourceMissingFieldError
-from utilities.infra import (
-    get_csv_by_name,
-    get_related_images_name_and_version,
-)
 from utilities.virt import (
     VirtualMachineForTestsFromTemplate,
-    get_vm_boot_time,
     wait_for_ssh_connectivity,
 )
 
 LOGGER = logging.getLogger(__name__)
 
 TIMESTAMP_FORMAT = "%Y-%m-%dT%H:%M:%SZ"
+
+
+def get_virt_launcher_images_from_csv(csv: ClusterServiceVersion) -> set[str]:
+    if images := {item["image"] for item in csv.instance.spec.relatedImages if VIRT_LAUNCHER in item["name"]}:
+        return images
+    raise ValueError(f"Image digests for {VIRT_LAUNCHER} not found")
 
 
 def verify_vms_ssh_connectivity(vms_list):
@@ -72,10 +80,12 @@ def get_src_pvc_default_name(template):
     raise ResourceMissingFieldError(f"Template {template.name} does not have a parameter {DATA_SOURCE_NAME}")
 
 
-def get_workload_update_migrations_list(namespaces):
-    workload_migrations = {}
+def get_workload_update_migrations_list(
+    namespaces: list[str], admin_client: DynamicClient
+) -> list[VirtualMachineInstanceMigration]:
+    workload_migrations: dict[str, VirtualMachineInstanceMigration] = {}
     for namespace in namespaces:
-        for migration_job in list(VirtualMachineInstanceMigration.get(namespace=namespace)):
+        for migration_job in list(VirtualMachineInstanceMigration.get(client=admin_client, namespace=namespace)):
             if migration_job.name.startswith("kubevirt-workload-update"):
                 job_instance = migration_job.instance
                 vmi_name = job_instance.spec.vmiName
@@ -96,8 +106,8 @@ def get_workload_update_migrations_list(namespaces):
     return list(workload_migrations.values())
 
 
-def vms_auto_migration_with_status_success(namespaces):
-    workload_migrations = get_workload_update_migrations_list(namespaces=namespaces)
+def vms_auto_migration_with_status_success(namespaces: list[str], admin_client: DynamicClient) -> list[str]:
+    workload_migrations = get_workload_update_migrations_list(namespaces=namespaces, admin_client=admin_client)
     return [
         migration_job.spec.vmiName
         for migration_job in workload_migrations
@@ -105,7 +115,7 @@ def vms_auto_migration_with_status_success(namespaces):
     ]
 
 
-def wait_for_automatic_vm_migrations(vm_list):
+def wait_for_automatic_vm_migrations(vm_list: list[VirtualMachine], admin_client: DynamicClient) -> bool:
     vm_names = [vm.name for vm in vm_list]
     vm_namespaces = list({vm.namespace for vm in vm_list})
     LOGGER.info(f"Checking VMIMs for vms: {vm_names}")
@@ -115,6 +125,7 @@ def wait_for_automatic_vm_migrations(vm_list):
         sleep=TIMEOUT_10SEC,
         func=vms_auto_migration_with_status_success,
         namespaces=vm_namespaces,
+        admin_client=admin_client,
     )
 
     sample = None
@@ -124,25 +135,22 @@ def wait_for_automatic_vm_migrations(vm_list):
             if all(vm in sample for vm in vm_names):
                 return True
     except TimeoutExpiredError:
-        vms_with_failed_vmim = list(set(vm_names) - set(sample))
+        vms_with_failed_vmim = list(set(vm_names) - set(sample or []))
         LOGGER.error(
             f"Migratable vms: {vm_names}, vms with completed automatic workload update: "
             f"{sample}, and vms with failed automatic workload update: {vms_with_failed_vmim}"
         )
         raise
+    return False
 
 
-def validate_vms_pod_updated(admin_client, hco_namespace, hco_target_csv_name, vm_list):
-    csv = get_csv_by_name(
-        admin_client=admin_client,
-        namespace=hco_namespace.name,
-        csv_name=hco_target_csv_name,
-    )
-    target_related_images = get_related_images_name_and_version(csv=csv)
+def validate_vms_pod_updated(
+    expected_virt_launcher_images: set[str], vm_list: list[VirtualMachine]
+) -> list[dict[str, str]]:
     return [
         {pod.name: pod.instance.spec.containers[0].image}
         for pod in [vm.vmi.virt_launcher_pod for vm in vm_list]
-        if pod.instance.spec.containers[0].image not in target_related_images.values()
+        if pod.instance.spec.containers[0].image not in expected_virt_launcher_images
     ]
 
 
@@ -162,13 +170,6 @@ def verify_run_strategy_vmi_status(run_strategy_vmi_list):
     if vmi_failed:
         pytest.fail(f"VMI in wrong state:\n {vmi_failed}")
     return run_strategy_vmi_list
-
-
-def verify_windows_boot_time(windows_vm, initial_boot_time):
-    current_boot_time = get_vm_boot_time(vm=windows_vm)
-    assert initial_boot_time == current_boot_time, (
-        f"Boot time for Windows VM changed:\n initial: {initial_boot_time}\n current: {current_boot_time}"
-    )
 
 
 @contextmanager

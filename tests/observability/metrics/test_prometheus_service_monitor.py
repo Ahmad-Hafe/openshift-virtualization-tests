@@ -1,14 +1,14 @@
 import pytest
 from ocp_resources.service_monitor import ServiceMonitor
 
-from utilities.constants import VIRT_OPERATOR
+from utilities.constants.components import VIRT_OPERATOR
 
 
 @pytest.fixture()
 def kubevirt_prometheus_service_monitor_list(admin_client):
     return list(
         ServiceMonitor.get(
-            dyn_client=admin_client,
+            client=admin_client,
             label_selector=f"{ServiceMonitor.ApiGroup.APP_KUBERNETES_IO}/managed-by={VIRT_OPERATOR}",
         )
     )

@@ -28,7 +28,7 @@ if "utilities.ssp" in sys.modules:
     del sys.modules["utilities.ssp"]
 
 # Import after setting up mocks to avoid circular dependency
-from utilities.ssp import (  # noqa: E402
+from utilities.ssp import (
     cluster_instance_type_for_hot_plug,
     create_custom_template_from_url,
     get_cim_instance_json,
@@ -177,7 +177,7 @@ class TestGetDataImportCrons:
         result = get_data_import_crons(mock_admin_client, mock_namespace)
 
         assert result == [mock_cron1, mock_cron2]
-        mock_dic_class.get.assert_called_once_with(dyn_client=mock_admin_client, namespace=mock_namespace.name)
+        mock_dic_class.get.assert_called_once_with(client=mock_admin_client, namespace=mock_namespace.name)
 
 
 class TestGetSspResource:
@@ -218,7 +218,7 @@ class TestIsSspPodRunning:
     @patch("utilities.ssp.utilities.infra.get_pod_by_name_prefix")
     def test_is_ssp_pod_running_true(self, mock_get_pod):
         """Test SSP pod is running"""
-        mock_dyn_client = MagicMock()
+        mock_client = MagicMock()
         mock_namespace = MagicMock()
         mock_namespace.name = "test-namespace"
 
@@ -228,14 +228,14 @@ class TestIsSspPodRunning:
         mock_pod.instance.status.containerStatuses = [{"ready": True}]
         mock_get_pod.return_value = mock_pod
 
-        result = is_ssp_pod_running(mock_dyn_client, mock_namespace)
+        result = is_ssp_pod_running(mock_client, mock_namespace)
 
         assert result is True
 
     @patch("utilities.ssp.utilities.infra.get_pod_by_name_prefix")
     def test_is_ssp_pod_running_false_not_running(self, mock_get_pod):
         """Test SSP pod is not running"""
-        mock_dyn_client = MagicMock()
+        mock_client = MagicMock()
         mock_namespace = MagicMock()
         mock_namespace.name = "test-namespace"
 
@@ -244,7 +244,7 @@ class TestIsSspPodRunning:
         mock_pod.Status.RUNNING = "Running"
         mock_get_pod.return_value = mock_pod
 
-        result = is_ssp_pod_running(mock_dyn_client, mock_namespace)
+        result = is_ssp_pod_running(mock_client, mock_namespace)
 
         assert result is False
 
@@ -256,7 +256,7 @@ class TestVerifySspPodIsRunning:
     @patch("utilities.ssp.TimeoutSampler")
     def test_verify_ssp_pod_is_running_success(self, mock_sampler, mock_is_running):
         """Test successful verification of SSP pod running"""
-        mock_dyn_client = MagicMock()
+        mock_client = MagicMock()
         mock_namespace = MagicMock()
 
         mock_is_running.return_value = True
@@ -264,7 +264,7 @@ class TestVerifySspPodIsRunning:
         mock_sampler_instance.__iter__ = MagicMock(return_value=iter([True, True, True]))
         mock_sampler.return_value = mock_sampler_instance
 
-        result = verify_ssp_pod_is_running(mock_dyn_client, mock_namespace)
+        result = verify_ssp_pod_is_running(mock_client, mock_namespace)
 
         assert result is None
         mock_sampler.assert_called_once()
@@ -273,7 +273,7 @@ class TestVerifySspPodIsRunning:
     @patch("utilities.ssp.TimeoutSampler")
     def test_verify_ssp_pod_is_running_timeout(self, mock_sampler, mock_is_running):
         """Test timeout when SSP pod is not running"""
-        mock_dyn_client = MagicMock()
+        mock_client = MagicMock()
         mock_namespace = MagicMock()
 
         mock_is_running.return_value = False
@@ -282,7 +282,7 @@ class TestVerifySspPodIsRunning:
         mock_sampler.return_value = mock_sampler_instance
 
         with pytest.raises(TimeoutExpiredError):
-            verify_ssp_pod_is_running(mock_dyn_client, mock_namespace)
+            verify_ssp_pod_is_running(mock_client, mock_namespace)
 
 
 class TestWaitForSspConditions:
@@ -547,8 +547,9 @@ class TestClusterInstanceTypeForHotPlug:
         """Test successful creation of cluster instance type for hot plug"""
         mock_instance_type = MagicMock()
         mock_instance_type_class.return_value = mock_instance_type
+        mock_client = MagicMock()
 
-        result = cluster_instance_type_for_hot_plug(guest_sockets=2, cpu_model="host-model")
+        result = cluster_instance_type_for_hot_plug(client=mock_client, guest_sockets=2, cpu_model="host-model")
 
         assert result == mock_instance_type
         mock_instance_type_class.assert_called_once()
@@ -558,8 +559,9 @@ class TestClusterInstanceTypeForHotPlug:
         """Test cluster instance type creation with None CPU model"""
         mock_instance_type = MagicMock()
         mock_instance_type_class.return_value = mock_instance_type
+        mock_client = MagicMock()
 
-        result = cluster_instance_type_for_hot_plug(guest_sockets=4, cpu_model=None)
+        result = cluster_instance_type_for_hot_plug(client=mock_client, guest_sockets=4, cpu_model=None)
 
         assert result == mock_instance_type
         mock_instance_type_class.assert_called_once()

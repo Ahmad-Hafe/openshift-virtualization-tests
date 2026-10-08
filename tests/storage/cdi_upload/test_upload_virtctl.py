@@ -1,5 +1,3 @@
-# -*- coding: utf-8 -*-
-
 """
 Upload using virtctl
 """
@@ -14,15 +12,21 @@ from ocp_resources.route import Route
 from ocp_resources.storage_class import StorageClass
 from pytest_testconfig import config as py_config
 
+from libs.net.cluster import is_ipv6_single_stack_cluster
+from tests.os_params import RHEL_LATEST
+from tests.storage.cdi_upload.utils import get_storage_profile_minimum_supported_pvc_size
+from tests.storage.stop_status_utils import dv_stop_status_restart_threshold
 from tests.storage.utils import assert_use_populator, create_windows_vm_validate_guest_agent_info
-from utilities.constants import CDI_UPLOADPROXY, TIMEOUT_1MIN, Images
+from utilities.constants import Images
+from utilities.constants.components import CDI_UPLOADPROXY
+from utilities.constants.pytest import QUARANTINED
+from utilities.constants.timeouts import TIMEOUT_1MIN
 from utilities.storage import (
     ErrorMsg,
     check_upload_virtctl_result,
     create_dummy_first_consumer_pod,
     create_vm_from_dv,
     get_downloaded_artifact,
-    sc_is_hpp_with_immediate_volume_binding,
     sc_volume_binding_mode_is_wffc,
     virtctl_upload_dv,
 )
@@ -39,18 +43,12 @@ LOCAL_PATH = f"/tmp/{Images.Cdi.QCOW2_IMG}"
 LATEST_WINDOWS_OS_DICT = py_config.get("latest_windows_os_dict", {})
 
 
-def get_population_method_by_provisioner(storage_class, cluster_csi_drivers_names):
+def get_population_method_by_provisioner(storage_class, cluster_csi_drivers_names, client):
     return (
         POPULATED_STR
-        if StorageClass(name=storage_class).instance.get("provisioner") in cluster_csi_drivers_names
+        if StorageClass(name=storage_class, client=client).instance.get("provisioner") in cluster_csi_drivers_names
         else NON_CSI_POPULATED_STR
     )
-
-
-@pytest.fixture(scope="function")
-def skip_no_reencrypt_route(upload_proxy_route):
-    if not upload_proxy_route.termination == "reencrypt":
-        pytest.skip("Skip testing. The upload proxy route is not re-encrypt.")
 
 
 @pytest.mark.sno
@@ -60,6 +58,7 @@ def test_successful_virtctl_upload_no_url(unprivileged_client, namespace, tmpdir
     get_downloaded_artifact(remote_name=f"{Images.Cdi.DIR}/{Images.Cdi.QCOW2_IMG}", local_name=local_name)
     pvc_name = "cnv-2192"
     with virtctl_upload_dv(
+        client=namespace.client,
         namespace=namespace.name,
         name=pvc_name,
         size=DEFAULT_DV_SIZE,
@@ -88,6 +87,7 @@ def test_successful_virtctl_upload_no_route(
     get_downloaded_artifact(remote_name=f"{Images.Cdi.DIR}/{Images.Cdi.QCOW2_IMG}", local_name=local_name)
     pvc_name = "cnv-2191"
     with virtctl_upload_dv(
+        client=namespace.client,
         namespace=namespace.name,
         name=pvc_name,
         size="1Gi",
@@ -115,6 +115,7 @@ def test_image_upload_with_overridden_url(
     local_name = f"{tmpdir}/{Images.Cdi.QCOW2_IMG}"
     get_downloaded_artifact(remote_name=f"{Images.Cdi.DIR}/{Images.Cdi.QCOW2_IMG}", local_name=local_name)
     with virtctl_upload_dv(
+        client=namespace.client,
         namespace=namespace.name,
         name=pvc_name,
         size=DEFAULT_DV_SIZE,
@@ -129,10 +130,13 @@ def test_image_upload_with_overridden_url(
 @pytest.mark.sno
 @pytest.mark.polarion("CNV-3031")
 @pytest.mark.s390x
+@pytest.mark.xfail(
+    reason=f"{QUARANTINED}: Test fails when running from container; tracked in CNV-18870",
+    run=False,
+)
 def test_virtctl_image_upload_with_ca(
     unprivileged_client,
     enabled_ca,
-    skip_no_reencrypt_route,
     tmpdir,
     namespace,
 ):
@@ -140,6 +144,7 @@ def test_virtctl_image_upload_with_ca(
     get_downloaded_artifact(remote_name=f"{Images.Cdi.DIR}/{Images.Cdi.QCOW2_IMG}", local_name=local_path)
     pvc_name = "cnv-3031"
     with virtctl_upload_dv(
+        client=namespace.client,
         namespace=namespace.name,
         name=pvc_name,
         size=DEFAULT_DV_SIZE,
@@ -165,6 +170,7 @@ def test_virtctl_image_upload_dv(
     """
     dv_name = f"cnv-3724-{storage_class_name_immediate_binding_scope_module}"
     with virtctl_upload_dv(
+        client=namespace.client,
         namespace=namespace.name,
         name=dv_name,
         size=DEFAULT_DV_SIZE,
@@ -195,6 +201,7 @@ def test_virtctl_image_upload_dv(
 )
 @pytest.mark.s390x
 def test_virtctl_image_upload_with_exist_dv_image(
+    admin_client,
     data_volume_multi_storage_scope_function,
     storage_class_name_scope_function,
     download_image,
@@ -206,6 +213,7 @@ def test_virtctl_image_upload_with_exist_dv_image(
     """
     dv_name = data_volume_multi_storage_scope_function.name
     with virtctl_upload_dv(
+        client=namespace.client,
         namespace=namespace.name,
         name=dv_name,
         size=DEFAULT_DV_SIZE,
@@ -222,6 +230,7 @@ def test_virtctl_image_upload_with_exist_dv_image(
                 populated=get_population_method_by_provisioner(
                     storage_class=storage_class_name_scope_function,
                     cluster_csi_drivers_names=cluster_csi_drivers_names,
+                    client=admin_client,
                 ),
             ),
         )
@@ -235,8 +244,13 @@ def test_virtctl_image_upload_pvc(download_image, namespace, storage_class_name_
     """
     Check that virtctl can create a new PVC and upload an image to it
     """
+    if is_ipv6_single_stack_cluster():
+        pytest.xfail(
+            reason=f"{QUARANTINED}: virtctl image-upload PVC fails on IPv6 single-stack cluster; tracked in CNV-81258"
+        )
     pvc_name = "cnv-3728"
     with virtctl_upload_dv(
+        client=namespace.client,
         namespace=namespace.name,
         pvc=True,
         name=pvc_name,
@@ -246,7 +260,7 @@ def test_virtctl_image_upload_pvc(download_image, namespace, storage_class_name_
         insecure=True,
     ) as res:
         check_upload_virtctl_result(result=res)
-        pvc = PersistentVolumeClaim(namespace=namespace.name, name=pvc_name)
+        pvc = PersistentVolumeClaim(namespace=namespace.name, name=pvc_name, client=namespace.client)
         assert pvc.bound()
 
 
@@ -254,7 +268,9 @@ def test_virtctl_image_upload_pvc(download_image, namespace, storage_class_name_
 class TestVirtctlUploadExistingDV:
     @pytest.mark.polarion("CNV-3725")
     def test_virtctl_image_upload_to_existing_dv_and_create_vm(self, unprivileged_client, uploaded_dv_scope_class):
-        uploaded_dv_scope_class.wait_for_dv_success()
+        uploaded_dv_scope_class.wait_for_dv_success(
+            stop_status_func=dv_stop_status_restart_threshold, dv=uploaded_dv_scope_class
+        )
         with create_vm_from_dv(dv=uploaded_dv_scope_class, client=unprivileged_client, start=True):
             pass
 
@@ -274,23 +290,25 @@ def empty_pvc(
     namespace,
     storage_class_matrix__module__,
     storage_class_name_scope_module,
-    worker_node1,
 ):
+    storage_profile_minimum_supported_pvc_size = get_storage_profile_minimum_supported_pvc_size(
+        storage_class_name=storage_class_name_scope_module,
+        client=namespace.client,
+    )
+    sc_config = storage_class_matrix__module__[storage_class_name_scope_module]
     with PersistentVolumeClaim(
         name="empty-pvc",
         namespace=namespace.name,
         storage_class=storage_class_name_scope_module,
-        volume_mode=storage_class_matrix__module__[storage_class_name_scope_module]["volume_mode"],
-        accessmodes=storage_class_matrix__module__[storage_class_name_scope_module]["access_mode"],
-        size=DEFAULT_DV_SIZE,
-        hostpath_node=worker_node1.name
-        if sc_is_hpp_with_immediate_volume_binding(sc=storage_class_name_scope_module)
-        else None,
+        volume_mode=sc_config["volume_mode"],
+        accessmodes=sc_config["access_mode"],
+        size=storage_profile_minimum_supported_pvc_size or DEFAULT_DV_SIZE,
+        client=namespace.client,
     ) as pvc:
-        if sc_volume_binding_mode_is_wffc(sc=storage_class_name_scope_module):
+        if sc_volume_binding_mode_is_wffc(sc=storage_class_name_scope_module, client=namespace.client):
             # For PVC to bind on WFFC, it must be consumed
             # (this was previously solved by hard coding hostpath_node at all times)
-            create_dummy_first_consumer_pod(pvc=pvc)
+            create_dummy_first_consumer_pod(client=namespace.client, pvc=pvc)
         pvc.wait_for_status(status=PersistentVolumeClaim.Status.BOUND, timeout=60)
         yield pvc
 
@@ -302,12 +320,12 @@ def test_virtctl_image_upload_with_exist_pvc(
     download_image,
     namespace,
     storage_class_name_scope_module,
-    schedulable_nodes,
 ):
     """
     Check that virtctl can upload an local disk image to an existing empty PVC
     """
     with virtctl_upload_dv(
+        client=namespace.client,
         namespace=namespace.name,
         name=empty_pvc.name,
         size=DEFAULT_DV_SIZE,
@@ -318,13 +336,14 @@ def test_virtctl_image_upload_with_exist_pvc(
         no_create=True,
     ) as res:
         check_upload_virtctl_result(result=res)
-        if not sc_volume_binding_mode_is_wffc(sc=storage_class_name_scope_module):
+        if not sc_volume_binding_mode_is_wffc(sc=storage_class_name_scope_module, client=namespace.client):
             with VirtualMachineForTests(
                 name="cnv-3727-vm",
                 namespace=empty_pvc.namespace,
                 os_flavor=Images.Cirros.OS_FLAVOR,
                 memory_guest=Images.Cirros.DEFAULT_MEMORY_SIZE,
                 pvc=empty_pvc,
+                client=namespace.client,
             ) as vm:
                 running_vm(vm=vm, wait_for_interfaces=False)
 
@@ -332,6 +351,7 @@ def test_virtctl_image_upload_with_exist_pvc(
 @pytest.mark.polarion("CNV-3729")
 @pytest.mark.s390x
 def test_virtctl_image_upload_with_exist_pvc_image(
+    admin_client,
     download_image,
     namespace,
     storage_class_name_scope_module,
@@ -342,6 +362,7 @@ def test_virtctl_image_upload_with_exist_pvc_image(
     """
     pvc_name = f"cnv-3729-{storage_class_name_scope_module}"
     with virtctl_upload_dv(
+        client=namespace.client,
         namespace=namespace.name,
         name=pvc_name,
         size=DEFAULT_DV_SIZE,
@@ -351,6 +372,7 @@ def test_virtctl_image_upload_with_exist_pvc_image(
     ) as res:
         check_upload_virtctl_result(result=res)
         with virtctl_upload_dv(
+            client=namespace.client,
             namespace=namespace.name,
             name=pvc_name,
             size=DEFAULT_DV_SIZE,
@@ -367,6 +389,7 @@ def test_virtctl_image_upload_with_exist_pvc_image(
                     populated=get_population_method_by_provisioner(
                         storage_class=storage_class_name_scope_module,
                         cluster_csi_drivers_names=cluster_csi_drivers_names,
+                        client=admin_client,
                     ),
                 ),
             )
@@ -386,6 +409,7 @@ def test_virtctl_image_upload_dv_with_exist_pvc(
     - PVC with the same name already exists.
     """
     with virtctl_upload_dv(
+        client=namespace.client,
         namespace=namespace.name,
         name=empty_pvc.name,
         size=DEFAULT_DV_SIZE,
@@ -400,7 +424,47 @@ def test_virtctl_image_upload_dv_with_exist_pvc(
         )
 
 
+@pytest.mark.polarion("CNV-16270")
+@pytest.mark.usefixtures("primary_udn_for_upload", "download_image")
+def test_virtctl_image_upload_dv_in_pudn_namespace(
+    admin_client,
+    udn_namespace_for_dv_upload,
+    storage_class_name_immediate_binding_scope_module,
+):
+    """
+    Test that uploading a disk image to a DataVolume succeeds in a namespace
+    with a primary User Defined Network (UDN).
+
+    Jira: https://redhat.atlassian.net/browse/CNV-58018 # <skip-jira-utils-check>
+
+    Preconditions:
+        - Namespace with a primary UDN label
+        - Layer2 User Defined Network with role "Primary" in the namespace
+
+    Steps:
+        1. Upload a disk image to a DataVolume in the UDN namespace via virtctl
+
+    Expected:
+        - Upload completes successfully
+        - DataVolume phase is "Succeeded"
+    """
+    dv_name = f"cnv-16270-{storage_class_name_immediate_binding_scope_module}"
+    with virtctl_upload_dv(
+        client=udn_namespace_for_dv_upload.client,
+        namespace=udn_namespace_for_dv_upload.name,
+        name=dv_name,
+        size=DEFAULT_DV_SIZE,
+        image_path=LOCAL_PATH,
+        storage_class=storage_class_name_immediate_binding_scope_module,
+        insecure=True,
+    ) as res:
+        check_upload_virtctl_result(result=res)
+        dv = DataVolume(namespace=udn_namespace_for_dv_upload.name, name=dv_name, client=admin_client)
+        dv.wait_for_dv_success(timeout=TIMEOUT_1MIN)
+
+
 @pytest.mark.tier3
+@pytest.mark.windows
 @pytest.mark.parametrize(
     ("uploaded_dv_with_immediate_binding", "vm_params"),
     [
@@ -415,6 +479,8 @@ def test_virtctl_image_upload_dv_with_exist_pvc(
                 "template_labels": LATEST_WINDOWS_OS_DICT.get("template_labels"),
                 "ssh": True,
                 "os_version": LATEST_WINDOWS_OS_DICT.get("os_version"),
+                "tpm_params": {"persistent": True},
+                "efi_params": {"persistent": True},
             },
             marks=(pytest.mark.polarion("CNV-3410")),
         ),
@@ -440,8 +506,8 @@ def test_successful_vm_from_uploaded_dv_windows(
     [
         pytest.param(
             {
-                "image_path": py_config["latest_rhel_os_dict"]["image_path"],
-                "image_file": py_config["latest_rhel_os_dict"]["image_name"],
+                "image_path": RHEL_LATEST.get("image_path"),
+                "image_file": RHEL_LATEST.get("image_name"),
             },
             marks=(pytest.mark.polarion("CNV-4512")),
         ),
@@ -449,7 +515,6 @@ def test_successful_vm_from_uploaded_dv_windows(
     indirect=True,
 )
 @pytest.mark.s390x
-@pytest.mark.jira("CNV-74020", run=False)
 def test_print_response_body_on_error_upload_virtctl(
     namespace, download_specified_image, storage_class_name_scope_module
 ):
@@ -459,6 +524,7 @@ def test_print_response_body_on_error_upload_virtctl(
     """
     dv_name = f"cnv-4512-{storage_class_name_scope_module}"
     with virtctl_upload_dv(
+        client=namespace.client,
         namespace=namespace.name,
         name=dv_name,
         size="3G",

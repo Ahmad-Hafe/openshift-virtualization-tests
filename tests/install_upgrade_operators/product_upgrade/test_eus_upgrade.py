@@ -8,6 +8,11 @@ from utilities.infra import get_related_images_name_and_version
 
 LOGGER = logging.getLogger(__name__)
 
+pytestmark = pytest.mark.usefixtures(
+    "nodes_taints_before_upgrade",
+    "nodes_labels_before_upgrade",
+)
+
 
 @pytest.mark.product_upgrade_test
 @pytest.mark.upgrade
@@ -20,8 +25,6 @@ class TestEUSToEUSUpgrade:
         self,
         admin_client,
         hco_namespace,
-        migratable_vms,
-        eus_target_cnv_version,
         eus_cnv_upgrade_path,
         eus_paused_worker_mcp,
         eus_paused_workload_update,
@@ -30,14 +33,14 @@ class TestEUSToEUSUpgrade:
         upgraded_odf,
         non_eus_to_target_eus_ocp_upgraded,
         non_eus_to_target_eus_cnv_upgraded,
-        eus_created_target_hco_csv,
+        created_target_hco_csv,
         eus_unpaused_workload_update,
         eus_unpaused_worker_mcp,
     ):
         LOGGER.info("Validate EUS to EUS upgrade process")
         verify_upgrade_cnv(
-            dyn_client=admin_client,
+            client=admin_client,
             hco_namespace=hco_namespace,
-            expected_images=get_related_images_name_and_version(csv=eus_created_target_hco_csv).values(),
+            expected_images=get_related_images_name_and_version(csv=created_target_hco_csv).values(),
         )
         LOGGER.info("EUS post upgrade validation completed.")

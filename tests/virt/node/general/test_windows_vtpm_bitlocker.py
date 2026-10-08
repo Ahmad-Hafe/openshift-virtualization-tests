@@ -1,5 +1,8 @@
+from __future__ import annotations
+
 import logging
 import shlex
+from typing import TYPE_CHECKING
 
 import pytest
 from ocp_resources.template import Template
@@ -9,7 +12,10 @@ from timeout_sampler import TimeoutExpiredError, TimeoutSampler
 
 from tests.os_params import WINDOWS_11, WINDOWS_2022
 from tests.utils import update_hco_with_persistent_storage_config
-from utilities.constants import TIMEOUT_2MIN, TIMEOUT_40MIN
+from utilities.constants.timeouts import (
+    TIMEOUT_2MIN,
+    TIMEOUT_40MIN,
+)
 from utilities.virt import (
     VirtualMachineForTestsFromTemplate,
     get_windows_os_dict,
@@ -17,6 +23,9 @@ from utilities.virt import (
     restart_vm_wait_for_running_vm,
     running_vm,
 )
+
+if TYPE_CHECKING:
+    from kubernetes.dynamic import DynamicClient
 
 pytestmark = [pytest.mark.tier3, pytest.mark.ibm_bare_metal, pytest.mark.special_infra, pytest.mark.high_resource_vm]
 
@@ -31,6 +40,7 @@ def verify_tpm_in_os(vm):
             r"wmic /namespace:\\root\cimv2\security\microsofttpm path Win32_Tpm get IsEnabled_InitialValue",
             posix=False,
         ),
+        wait_timeout=TIMEOUT_2MIN,
     )[0]
     assert "TRUE" in vtpm_enabled, "TPM is not present/enabled in OS!"
 
@@ -48,9 +58,7 @@ def enable_bitlocker(vm):
         try:
             for sample in sampler:
                 if sample:
-                    if all([
-                        True if msg in sample[0] else False for msg in ["100.0%", "Fully Encrypted", "Protection On"]
-                    ]):
+                    if all(msg in sample[0] for msg in ["100.0%", "Fully Encrypted", "Protection On"]):
                         return
         except TimeoutExpiredError:
             LOGGER.error("Failed to encrypt disk")
@@ -60,17 +68,27 @@ def enable_bitlocker(vm):
         run_ssh_commands(
             host=vm.ssh_exec,
             commands=shlex.split('powershell -c "install-windowsfeature bitlocker"'),
+            wait_timeout=TIMEOUT_2MIN,
         )
         restart_vm_wait_for_running_vm(vm=vm)
 
-    run_ssh_commands(host=vm.ssh_exec, commands=shlex.split('powershell -c "initialize-tpm"'))
-    run_ssh_commands(host=vm.ssh_exec, commands=shlex.split("manage-bde -on c: -s"))
+    run_ssh_commands(
+        host=vm.ssh_exec,
+        commands=shlex.split('powershell -c "initialize-tpm"'),
+        wait_timeout=TIMEOUT_2MIN,
+    )
+    run_ssh_commands(
+        host=vm.ssh_exec,
+        commands=shlex.split("manage-bde -on c: -s"),
+        wait_timeout=TIMEOUT_2MIN,
+    )
     _wait_encryption_finish(vm=vm)
 
 
 @pytest.fixture(scope="class")
 def file_system_persistent_storage_hco_config(
     request,
+    admin_client,
     hyperconverged_resource_scope_module,
     rwx_fs_available_storage_classes_names,
 ):
@@ -82,6 +100,7 @@ def file_system_persistent_storage_hco_config(
         storage_class = py_config["default_storage_class"]
 
     with update_hco_with_persistent_storage_config(
+        admin_client=admin_client,
         hco_cr=hyperconverged_resource_scope_module,
         storage_class=storage_class,
     ):
@@ -98,7 +117,7 @@ def windows_vtpm_vm(
     modern_cpu_for_migration,
 ):
     windows_version = request.param["windows_version"]
-    presistent_enabled = {"persistent": True}
+    persistent_enabled = {"persistent": True}
     with VirtualMachineForTestsFromTemplate(
         name=f"{windows_version}-vtpm-vm",
         labels=Template.generate_template_labels(
@@ -107,9 +126,10 @@ def windows_vtpm_vm(
         namespace=namespace.name,
         client=unprivileged_client,
         data_volume_template=golden_image_data_volume_template_for_test_scope_class,
-        tpm_params=presistent_enabled,
-        efi_params=presistent_enabled,
+        tpm_params=persistent_enabled,
+        efi_params=persistent_enabled,
         cpu_model=modern_cpu_for_migration,
+        exclude_from_descheduler=True,
     ) as vm:
         running_vm(vm=vm)
         verify_tpm_in_os(vm=vm)
@@ -123,8 +143,10 @@ def bitlocker_encrypted_vm(windows_vtpm_vm):
 
 
 @pytest.fixture(scope="class")
-def migrated_encrypted_vm(bitlocker_encrypted_vm):
-    migrate_vm_and_verify(vm=bitlocker_encrypted_vm, check_ssh_connectivity=True)
+def migrated_encrypted_vm(
+    admin_client: DynamicClient, bitlocker_encrypted_vm: VirtualMachineForTestsFromTemplate
+) -> VirtualMachineForTestsFromTemplate:
+    migrate_vm_and_verify(vm=bitlocker_encrypted_vm, client=admin_client, check_ssh_connectivity=True)
     return bitlocker_encrypted_vm
 
 
@@ -146,13 +168,14 @@ def migrated_encrypted_vm(bitlocker_encrypted_vm):
     ],
     indirect=True,
 )
+@pytest.mark.windows
 class TestBitLockerVTPM:
     @pytest.mark.dependency(name=f"{TESTS_CLASS_NAME}::persistent_tpm")
     @pytest.mark.polarion("CNV-10318")
-    def test_persistent_tpm(self, windows_vtpm_vm):
-        xml_dict_tpm = windows_vtpm_vm.privileged_vmi.xml_dict["domain"]["devices"]["tpm"]
+    def test_persistent_tpm(self, admin_client, windows_vtpm_vm):
+        xml_dict_tpm = windows_vtpm_vm.vmi.get_xml_dict(privileged_client=admin_client)["domain"]["devices"]["tpm"]
         assert xml_dict_tpm["@model"] == "tpm-crb", "TPM model should be tpm-crb!"
-        assert xml_dict_tpm["backend"].get("@persistent_state") == "yes", "TPM is not peristent state in dumpxml!"
+        assert xml_dict_tpm["backend"].get("@persistent_state") == "yes", "TPM is not persistent state in dumpxml!"
 
     @pytest.mark.dependency(
         name=f"{TESTS_CLASS_NAME}::bitlocker_encryption",

@@ -13,7 +13,14 @@ from tests.os_params import (
     WINDOWS_2019,
     WINDOWS_2019_OS,
 )
-from utilities.constants import LINUX_BRIDGE, TCP_TIMEOUT_30SEC, TIMEOUT_12MIN, VIRTIO, Images
+from utilities.constants import Images
+from utilities.constants.networking import LINUX_BRIDGE
+from utilities.constants.timeouts import (
+    TCP_TIMEOUT_30SEC,
+    TIMEOUT_2MIN,
+    TIMEOUT_12MIN,
+)
+from utilities.constants.virt import VIRTIO
 from utilities.network import network_device, network_nad
 from utilities.storage import get_storage_class_dict_from_matrix
 from utilities.virt import (
@@ -87,8 +94,8 @@ class CustomWindowsVM(VirtualMachineForTestsFromTemplate):
         })
 
 
-def assert_firmware_uuid_in_domxml(vm, uuid):
-    xml_domain = vm.privileged_vmi.xml_dict["domain"]
+def assert_firmware_uuid_in_domxml(vm, uuid, admin_client):
+    xml_domain = vm.vmi.get_xml_dict(privileged_client=admin_client)["domain"]
     assert xml_domain.get("uuid", "").lower() == uuid.lower(), f"Firmware UUID not found in domxml for {vm.name}"
 
 
@@ -100,13 +107,16 @@ def initialize_and_format_windows_drive(vm, disk_number, partition_number, drive
             for cmd in [
                 f'powershell -command "initialize-disk -number {disk_number}"',
                 f'powershell -command "new-partition -disknumber {disk_number} -usemaximumsize"',
-                f'powershell -command "set-partition -disknumber {disk_number} -partitionnumber {partition_number} '
-                f'-newdriveletter {drive_letter}"',
+                (
+                    f'powershell -command "set-partition -disknumber {disk_number} '
+                    f'-partitionnumber {partition_number} -newdriveletter {drive_letter}"'
+                ),
                 f'powershell -command "format-volume -driveletter {drive_letter} -filesystem NTFS"',
             ]
         ],
         get_pty=True,
         tcp_timeout=TCP_TIMEOUT_30SEC,
+        wait_timeout=TIMEOUT_2MIN,
     )
 
 
@@ -177,7 +187,7 @@ def custom_windows_vm(
         pytest.param(
             {
                 "os_dict": {
-                    "data_source": WINDOWS_2019_OS,
+                    "data_source": WINDOWS_2019.get("data_source"),
                     "image_path": f"{Images.Windows.HA_DIR}/{Images.Windows.WIN2k19_HA_IMG}",
                     "dv_size": "100Gi",
                 }
@@ -188,6 +198,7 @@ def custom_windows_vm(
     ],
     indirect=True,
 )
+@pytest.mark.windows
 class TestCustomWindowsOptions:
     @pytest.mark.polarion("CNV-7496")
     @pytest.mark.dependency(name=f"{TESTS_CLASS_NAME}::boot")
@@ -196,8 +207,8 @@ class TestCustomWindowsOptions:
 
     @pytest.mark.polarion("CNV-7960")
     @pytest.mark.dependency(name=f"{TESTS_CLASS_NAME}::domxml", depends=[f"{TESTS_CLASS_NAME}::boot"])
-    def test_windows_custom_options_fw_uuid_in_domxml(self, custom_windows_vm):
-        assert_firmware_uuid_in_domxml(vm=custom_windows_vm, uuid=FIRMWARE_UUID)
+    def test_windows_custom_options_fw_uuid_in_domxml(self, admin_client, custom_windows_vm):
+        assert_firmware_uuid_in_domxml(vm=custom_windows_vm, uuid=FIRMWARE_UUID, admin_client=admin_client)
 
     @pytest.mark.polarion("CNV-7956")
     @pytest.mark.dependency(

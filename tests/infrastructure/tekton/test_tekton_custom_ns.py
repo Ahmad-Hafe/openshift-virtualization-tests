@@ -10,9 +10,14 @@ from ocp_resources.task import Task
 from tests.infrastructure.tekton.utils import (
     wait_for_tekton_resource_availability,
 )
-from utilities.constants import WIN_2K22, WIN_2K25, WIN_10, WIN_11
+from utilities.constants.virt import (
+    WIN_2K22,
+    WIN_2K25,
+    WIN_10,
+    WIN_11,
+)
 
-pytestmark = [pytest.mark.tier3, pytest.mark.special_infra]
+pytestmark = [pytest.mark.tier3, pytest.mark.special_infra, pytest.mark.tekton]
 
 
 @pytest.mark.usefixtures("extracted_kubevirt_tekton_resources", "processed_yaml_files")
@@ -47,6 +52,7 @@ class TestTektonResources:
         )
 
 
+@pytest.mark.windows
 @pytest.mark.dependency(depends=["TestTektonResources"])
 class TestTektonEfiPipelineExecution:
     @pytest.mark.parametrize(

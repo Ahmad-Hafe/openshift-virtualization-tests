@@ -1,20 +1,15 @@
 from __future__ import annotations
 
 import logging
-import re
 import shlex
 from contextlib import contextmanager
-from typing import Any, Generator
 
 import bitmath
 from kubernetes.dynamic import DynamicClient
-from ocp_resources.data_source import DataSource
 from ocp_resources.kubevirt import KubeVirt
-from ocp_resources.namespace import Namespace
 from ocp_resources.pod import Pod
 from ocp_resources.resource import Resource
 from pyhelper_utils.shell import run_ssh_commands
-from pytest_testconfig import config as py_config
 from timeout_sampler import TimeoutExpiredError, TimeoutSampler
 
 from tests.virt.node.gpu.constants import (
@@ -24,20 +19,14 @@ from tests.virt.node.gpu.constants import (
     VGPU_DEVICE_NAME_STR,
     VGPU_PRETTY_NAME_STR,
 )
-from utilities.artifactory import get_test_artifact_server_url
-from utilities.constants import (
-    DATA_SOURCE_STR,
-    DEFAULT_HCO_CONDITIONS,
-    OS_FLAVOR_WINDOWS,
-    OS_PROC_NAME,
+from utilities.constants.hco import DEFAULT_HCO_CONDITIONS
+from utilities.constants.images import OS_FLAVOR_WINDOWS
+from utilities.constants.timeouts import (
     TCP_TIMEOUT_30SEC,
     TIMEOUT_1MIN,
     TIMEOUT_1SEC,
     TIMEOUT_2MIN,
-    TIMEOUT_3MIN,
     TIMEOUT_5SEC,
-    TIMEOUT_15SEC,
-    TIMEOUT_30MIN,
     TIMEOUT_30SEC,
 )
 from utilities.hco import (
@@ -46,21 +35,13 @@ from utilities.hco import (
     update_hco_annotations,
     wait_for_hco_conditions,
 )
-from utilities.storage import (
-    create_dv,
-    create_or_update_data_source,
-    data_volume_template_with_source_ref_dict,
-)
 from utilities.virt import (
     VirtualMachineForTests,
     fetch_pid_from_linux_vm,
-    fetch_pid_from_windows_vm,
     get_vm_boot_time,
     kill_processes_by_name_linux,
     migrate_vm_and_verify,
-    pause_unpause_vm_and_check_connectivity,
     start_and_fetch_processid_on_linux_vm,
-    start_and_fetch_processid_on_windows_vm,
     verify_vm_migrated,
     wait_for_migration_finished,
     wait_for_updated_kv_value,
@@ -72,6 +53,7 @@ LOGGER = logging.getLogger(__name__)
 @contextmanager
 def append_feature_gate_to_hco(feature_gate, resource, client, namespace):
     with update_hco_annotations(
+        admin_client=client,
         resource=resource,
         path="developerConfiguration/featureGates",
         value=feature_gate,
@@ -90,7 +72,7 @@ def append_feature_gate_to_hco(feature_gate, resource, client, namespace):
             hco_namespace=namespace,
             expected_conditions={
                 **DEFAULT_HCO_CONDITIONS,
-                **{"TaintedConfiguration": Resource.Condition.Status.TRUE},
+                "TaintedConfiguration": Resource.Condition.Status.TRUE,
             },
         )
         yield
@@ -112,11 +94,13 @@ def get_stress_ng_pid(ssh_exec, windows=False):
     stress = "stress-ng"
     LOGGER.info(f"Get pid of {stress}")
     command_prefix = "wsl" if windows else ""
+    tcp_timeout = TIMEOUT_1MIN if windows else TCP_TIMEOUT_30SEC
 
     return run_ssh_commands(
         host=ssh_exec,
         commands=shlex.split(f"{command_prefix} bash -c 'pgrep {stress}'"),
-        tcp_timeout=TCP_TIMEOUT_30SEC,
+        tcp_timeout=tcp_timeout,
+        wait_timeout=TIMEOUT_2MIN,
     )[0].split("\n")[0]
 
 
@@ -130,89 +114,26 @@ def verify_stress_ng_pid_not_changed(vm, initial_pid, windows=False):
     )
 
 
-def verify_wsl2_guest_running(vm, timeout=TIMEOUT_3MIN):
-    def _get_wsl2_running_status():
-        guests_status = run_ssh_commands(
-            host=vm.ssh_exec,
-            commands=shlex.split("powershell.exe -command wsl -l -v"),
-            tcp_timeout=TCP_TIMEOUT_30SEC,
-        )[0]
-        guests_status = guests_status.replace("\x00", "")
-        LOGGER.info(guests_status)
-        return re.search(r".*(Running).*\n", guests_status) is not None
-
-    sampler = TimeoutSampler(wait_timeout=timeout, sleep=TIMEOUT_5SEC, func=_get_wsl2_running_status)
-    try:
-        for sample in sampler:
-            if sample:
-                return True
-    except TimeoutExpiredError:
-        LOGGER.error("WSL2 guest is not running in the VM!")
-        raise
-
-
-def verify_wsl2_guest_works(vm: VirtualMachineForTests) -> None:
-    """
-    Verifies that WSL2 is functioning on windows vm.
-    Args:
-        vm: An instance of `VirtualMachineForTests`
-    Raises:
-        TimeoutExpiredError: If WSL2 fails to return the expected output within
-            the specified timeout period.
-    """
-    echo_string = "TEST"
-    samples = TimeoutSampler(
-        wait_timeout=TIMEOUT_1MIN,
-        sleep=TIMEOUT_15SEC,
-        func=run_ssh_commands,
-        host=vm.ssh_exec,
-        commands=shlex.split(f"wsl echo {echo_string}"),
-    )
-    try:
-        for sample in samples:
-            if sample and echo_string in sample[0]:
-                return
-    except TimeoutExpiredError:
-        LOGGER.error(f"VM {vm.name} failed to start WSL2")
-        raise
-
-
-def start_stress_on_vm(vm, stress_command):
-    LOGGER.info(f"Running memory load in VM {vm.name}")
-    if "windows" in vm.name:
-        verify_wsl2_guest_running(vm=vm)
-        verify_wsl2_guest_works(vm=vm)
-        command = f"wsl nohup bash -c '{stress_command}'"
-    else:
-        run_ssh_commands(host=vm.ssh_exec, commands=shlex.split("sudo dnf install -y stress-ng"))
-        command = stress_command
-    run_ssh_commands(
-        host=vm.ssh_exec,
-        commands=shlex.split(command),
-        tcp_timeout=TCP_TIMEOUT_30SEC,
-    )
-
-
-def migrate_and_verify_multi_vms(vm_list):
+def migrate_and_verify_multi_vms(client: DynamicClient, vm_list: list[VirtualMachineForTests]) -> None:
     vms_dict = {}
     failed_migrations_list = []
 
     for vm in vm_list:
         vms_dict[vm.name] = {
             "node_before": vm.vmi.node,
-            "vm_mig": migrate_vm_and_verify(vm=vm, wait_for_migration_success=False),
+            "vm_mig": migrate_vm_and_verify(vm=vm, client=client, wait_for_migration_success=False),
         }
 
     for vm in vm_list:
         migration = vms_dict[vm.name]["vm_mig"]
-        wait_for_migration_finished(namespace=vm.namespace, migration=migration)
+        wait_for_migration_finished(migration=migration)
         migration.clean_up()
 
     for vm in vm_list:
         vm_sources = vms_dict[vm.name]
         try:
             verify_vm_migrated(vm=vm, node_before=vm_sources["node_before"])
-        except AssertionError | TimeoutExpiredError:
+        except AssertionError, TimeoutExpiredError:
             failed_migrations_list.append(vm.name)
 
     assert not failed_migrations_list, f"Some VMs failed to migrate - {failed_migrations_list}"
@@ -278,25 +199,12 @@ def flatten_dict(dictionary, parent_key=""):
     return dict(items)
 
 
-def kill_processes_by_name_windows(vm, process_name):
-    cmd = shlex.split(f"taskkill /F /IM {process_name}")
-    run_ssh_commands(host=vm.ssh_exec, commands=cmd, tcp_timeout=TCP_TIMEOUT_30SEC)
-
-
-def validate_pause_unpause_windows_vm(vm: VirtualMachineForTests, pre_pause_pid: int | None = None) -> None:
-    proc_name = OS_PROC_NAME["windows"]
-    if not pre_pause_pid:
-        pre_pause_pid = start_and_fetch_processid_on_windows_vm(vm=vm, process_name=proc_name)
-    pause_unpause_vm_and_check_connectivity(vm=vm)
-    post_pause_pid = fetch_pid_from_windows_vm(vm=vm, process_name=proc_name)
-    kill_processes_by_name_windows(vm=vm, process_name=proc_name)
-    assert post_pause_pid == pre_pause_pid, (
-        f"PID mismatch!\nPre pause PID is: {pre_pause_pid}\nPost pause PID is: {post_pause_pid}"
+def wait_for_virt_launcher_pod(vmi, privileged_client: DynamicClient):
+    samples = TimeoutSampler(
+        wait_timeout=TIMEOUT_30SEC,
+        sleep=TIMEOUT_1SEC,
+        func=lambda: vmi.get_virt_launcher_pod(privileged_client=privileged_client),
     )
-
-
-def wait_for_virt_launcher_pod(vmi):
-    samples = TimeoutSampler(wait_timeout=TIMEOUT_30SEC, sleep=TIMEOUT_1SEC, func=lambda: vmi.virt_launcher_pod)
     try:
         for sample in samples:
             if sample:
@@ -306,7 +214,7 @@ def wait_for_virt_launcher_pod(vmi):
         raise
 
 
-def validate_machine_type(vm, expected_machine_type):
+def validate_machine_type(vm, expected_machine_type, admin_client):
     vm_machine_type = vm.instance.spec.template.spec.domain.machine.type
     vmi_machine_type = vm.vmi.instance.spec.domain.machine.type
 
@@ -314,30 +222,33 @@ def validate_machine_type(vm, expected_machine_type):
         "Created VM's machine type does not match the request. "
         f"Expected: {expected_machine_type} VM: {vm_machine_type}, VMI: {vmi_machine_type}"
     )
-    vmi_xml_machine_type = vm.privileged_vmi.xml_dict["domain"]["os"]["type"]["@machine"]
+    vmi_xml_machine_type = vm.vmi.get_xml_dict(privileged_client=admin_client)["domain"]["os"]["type"]["@machine"]
     assert vmi_xml_machine_type == expected_machine_type, (
         f"libvirt machine type {vmi_xml_machine_type} does not match expected type {expected_machine_type}"
     )
 
 
-def patch_hco_cr_with_mdev_permitted_hostdevices(hyperconverged_resource, supported_gpu_device):
+def patch_hco_cr_with_mdev_permitted_hostdevices(admin_client, hyperconverged_resource, supported_gpu_device):
     required_keys = [MDEV_TYPE_STR, MDEV_NAME_STR, VGPU_DEVICE_NAME_STR]
     missing_keys = [key for key in required_keys if key not in supported_gpu_device]
     if missing_keys:
         raise ValueError(f"Missing required keys in supported_gpu_device: {missing_keys}")
     with ResourceEditorValidateHCOReconcile(
+        admin_client=admin_client,
         patches={
             hyperconverged_resource: {
                 "spec": {
-                    "mediatedDevicesConfiguration": {"mediatedDeviceTypes": [supported_gpu_device[MDEV_TYPE_STR]]},
-                    "permittedHostDevices": {
-                        "mediatedDevices": [
-                            {
-                                "mdevNameSelector": supported_gpu_device[MDEV_NAME_STR],
-                                "resourceName": supported_gpu_device[VGPU_DEVICE_NAME_STR],
-                            }
-                        ]
-                    },
+                    "virtualization": {
+                        "permittedHostDevices": {
+                            "mediatedDevices": [
+                                {
+                                    "externalResourceProvider": True,
+                                    "mdevNameSelector": supported_gpu_device[MDEV_NAME_STR],
+                                    "resourceName": supported_gpu_device[VGPU_DEVICE_NAME_STR],
+                                }
+                            ]
+                        },
+                    }
                 }
             }
         },
@@ -366,6 +277,7 @@ def get_num_gpu_devices_in_rhel_vm(vm):
                 "-c",
                 '/sbin/lspci -nnk | grep -E "controller.+NVIDIA" | wc -l',
             ],
+            wait_timeout=TIMEOUT_2MIN,
         )[0].strip()
     )
 
@@ -375,6 +287,7 @@ def get_gpu_device_name_from_windows_vm(vm):
         host=vm.ssh_exec,
         commands=[shlex.split("wmic path win32_VideoController get name")],
         tcp_timeout=TCP_TIMEOUT_30SEC,
+        wait_timeout=TIMEOUT_2MIN,
     )[0]
 
 
@@ -474,17 +387,38 @@ def get_pod_memory_requests(pod_instance):
 def get_non_terminated_pods(client, node):
     return list(
         Pod.get(
-            dyn_client=client,
+            client=client,
             field_selector=f"spec.nodeName={node.name},status.phase!=Succeeded,status.phase!=Failed",
         )
     )
+
+
+def get_pci_addresses(vm: VirtualMachineForTests) -> list[str]:
+    """Get sorted PCI device lines visible to the guest.
+
+    Each line pairs a BDF address with its device description, enabling
+    detection of both address shifts and device swaps on failure.
+
+    Args:
+        vm: Running VM with SSH access.
+
+    Returns:
+        Sorted list of lspci lines (e.g. ["00:01.0 Display controller: ..."]).
+    """
+    output = run_ssh_commands(
+        host=vm.ssh_exec,
+        commands=["lspci"],
+    )[0].strip()
+    addresses = output.splitlines()
+    LOGGER.info(f"PCI addresses for VM {vm.name}: {addresses}")
+    return addresses
 
 
 def get_boot_time_for_multiple_vms(vm_list):
     return {vm.name: get_vm_boot_time(vm=vm) for vm in vm_list}
 
 
-def verify_linux_boot_time(vm_list, initial_boot_time):
+def verify_guest_boot_time(vm_list, initial_boot_time):
     rebooted_vms = {}
     for vm in vm_list:
         current_boot_time = get_vm_boot_time(vm=vm)
@@ -493,65 +427,15 @@ def verify_linux_boot_time(vm_list, initial_boot_time):
     assert not rebooted_vms, f"Boot time changed for VMs:\n {rebooted_vms}"
 
 
-def get_or_create_golden_image_data_source(
-    admin_client: DynamicClient, golden_images_namespace: Namespace, os_dict: dict[str, Any]
-) -> Generator[DataSource, None, None]:
-    """Retrieves or creates a DataSource object in golden image namespace specified in the OS matrix.
-
-    Args:
-        admin_client (DynamicClient): Kubernetes dynamic client.
-        golden_images_namespace (Namespace): Namespace where golden images are stored.
-        os_dict (dict[str, Any]): dict of os params
-
-    Yields:
-        DataSource: DataSource object.
-    """
-
-    data_source_name = os_dict.get(DATA_SOURCE_STR, "dummy")
-
-    data_source = DataSource(client=admin_client, name=data_source_name, namespace=golden_images_namespace.name)
-    if data_source.exists and data_source.source.exists:
-        LOGGER.info(f"DataSource {data_source_name} already exists and has a source pvc/snapshot.")
-        yield data_source
-    else:
-        LOGGER.warning(f"No DataSource {data_source_name} found or it doesn't have a source pvc/snapshot.")
-
-        with create_dv(
-            dv_name=data_source_name,
-            namespace=golden_images_namespace.name,
-            storage_class=py_config["default_storage_class"],
-            url=f"{get_test_artifact_server_url()}{os_dict['image_path']}",
-            size=os_dict["dv_size"],
-            client=admin_client,
-        ) as dv:
-            dv.wait_for_dv_success(timeout=TIMEOUT_30MIN)
-            yield from create_or_update_data_source(admin_client=admin_client, dv=dv)
-
-
-def get_data_volume_template_dict_with_default_storage_class(
-    data_source: DataSource, storage_class: str | None = None
-) -> dict[str, dict]:
-    """
-    Generates a dataVolumeTemplate dict with the py_config based storage class.
-
-    Args:
-        data_source (DataSource): The data source object used to create the data volume template.
-        storage_class (str, optional): Storage class name.
-
-    Returns:
-        dict[str, dict]: A dict representing the dataVolumeTemplate to be used in VM spec.
-    """
-    data_volume_template = data_volume_template_with_source_ref_dict(data_source=data_source)
-    data_volume_template["spec"]["storage"]["storageClassName"] = storage_class or py_config["default_storage_class"]
-    return data_volume_template
-
-
-def update_hco_memory_overcommit(hco, percentage):
+def update_hco_memory_overcommit(admin_client, hco, percentage):
     with ResourceEditorValidateHCOReconcile(
+        admin_client=admin_client,
         patches={
             hco: {
                 "spec": {
-                    "higherWorkloadDensity": {"memoryOvercommitPercentage": percentage},
+                    "virtualization": {
+                        "higherWorkloadDensity": {"memoryOvercommitPercentage": percentage},
+                    }
                 }
             }
         },

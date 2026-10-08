@@ -5,7 +5,10 @@ from typing import Any
 
 from ocp_resources.datavolume import DataVolume
 
-from utilities.constants import HPP_CAPABILITIES, StorageClassNames
+from utilities.constants.storage import (
+    HPP_CAPABILITIES,
+    StorageClassNames,
+)
 from utilities.storage import HppCsiStorageClass
 
 LOGGER = logging.getLogger(__name__)
@@ -19,6 +22,7 @@ class StorageClass:
     snapshot: bool
     online_resize: bool
     wffc: bool
+    data_import_cron_source_format: str = ""
 
 
 class StorageClassConfig:
@@ -26,7 +30,7 @@ class StorageClassConfig:
         self.name = name
         self.storage_config = self.get_storage_config()
 
-    def supported_storage_classes(self) -> list["StorageClass"]:
+    def supported_storage_classes(self) -> list[StorageClass]:
         return [
             StorageClass(
                 name=StorageClassNames.CEPH_RBD_VIRTUALIZATION,

@@ -1,15 +1,16 @@
-# -*- coding: utf-8 -*-
-
 """
 Pytest conftest file for CNV CDI tests
 """
 
 import base64
+import copy
+import ipaddress
 import logging
 import os
 import ssl
 
 import pytest
+import shortuuid
 from kubernetes.dynamic.exceptions import ResourceNotFoundError
 from ocp_resources.cdi import CDI
 from ocp_resources.config_map import ConfigMap
@@ -17,10 +18,8 @@ from ocp_resources.csi_driver import CSIDriver
 from ocp_resources.data_source import DataSource
 from ocp_resources.deployment import Deployment
 from ocp_resources.exceptions import ExecOnPodError
-from ocp_resources.resource import ResourceEditor
 from ocp_resources.route import Route
 from ocp_resources.secret import Secret
-from ocp_resources.storage_class import StorageClass
 from ocp_resources.virtual_machine_cluster_instancetype import (
     VirtualMachineClusterInstancetype,
 )
@@ -33,7 +32,6 @@ from timeout_sampler import TimeoutExpiredError, TimeoutSampler
 
 from tests.storage.constants import (
     CIRROS_QCOW2_IMG,
-    HPP_STORAGE_CLASSES,
     HTTPS_CONFIG_MAP_NAME,
     INTERNAL_HTTP_CONFIGMAP_NAME,
 )
@@ -45,20 +43,15 @@ from tests.storage.utils import (
     is_hpp_cr_legacy,
 )
 from tests.utils import create_cirros_vm
+from utilities.architecture import get_multiarch_cpu_arch
 from utilities.artifactory import get_artifactory_config_map, get_artifactory_secret
-from utilities.constants import (
-    CDI_OPERATOR,
-    CDI_UPLOADPROXY,
-    CNV_TEST_SERVICE_ACCOUNT,
-    CNV_TESTS_CONTAINER,
-    OS_FLAVOR_RHEL,
-    RHEL10_PREFERENCE,
-    SECURITY_CONTEXT,
-    TIMEOUT_1MIN,
-    TIMEOUT_5SEC,
-    U1_SMALL,
-    Images,
-)
+from utilities.constants import Images
+from utilities.constants.cluster import CNV_TEST_SERVICE_ACCOUNT, KUBERNETES_ARCH_LABEL
+from utilities.constants.components import CDI_OPERATOR, CDI_UPLOADPROXY
+from utilities.constants.images import OS_FLAVOR_FEDORA, OS_FLAVOR_RHEL
+from utilities.constants.instance_types import PREFERENCE_STR, U1_SMALL
+from utilities.constants.networking import SECURITY_CONTEXT
+from utilities.constants.timeouts import TIMEOUT_1MIN, TIMEOUT_5SEC, TIMEOUT_30MIN
 from utilities.hco import (
     ResourceEditorValidateHCOReconcile,
     hco_cr_jsonpatch_annotations_dict,
@@ -67,8 +60,11 @@ from utilities.infra import (
     INTERNAL_HTTP_SERVER_ADDRESS,
     ExecCommandOnPod,
 )
-from utilities.jira import is_jira_open
-from utilities.storage import data_volume_template_with_source_ref_dict, get_downloaded_artifact, write_file_via_ssh
+from utilities.storage import (
+    data_volume_template_with_source_ref_dict,
+    get_downloaded_artifact,
+    write_file_via_ssh,
+)
 from utilities.virt import VirtualMachineForTests, running_vm
 
 LOGGER = logging.getLogger(__name__)
@@ -87,7 +83,7 @@ INTERNAL_HTTP_TEMPLATE = {
         "containers": [
             {
                 "name": "http",
-                "image": "quay.io/openshift-cnv/qe-cnv-tests-internal-http:v1.1.0",
+                "image": "quay.io/openshift-cnv/qe-cnv-tests-internal-http:v1.2.0",
                 "imagePullPolicy": "Always",
                 "command": ["/usr/sbin/nginx"],
                 "readinessProbe": {
@@ -113,19 +109,21 @@ INTERNAL_HTTP_TEMPLATE = {
 def hpp_resources(request, admin_client):
     rcs_object = request.param
     LOGGER.info(f"Get all resources with kind: {rcs_object.kind}")
-    resource_list = list(rcs_object.get(dyn_client=admin_client))
+    resource_list = list(rcs_object.get(client=admin_client))
     return [rcs for rcs in resource_list if rcs.name.startswith("hostpath-")]
 
 
 @pytest.fixture(scope="module")
 def internal_http_configmap(namespace, internal_http_service, workers_utility_pods, worker_node1, admin_client):
     svc_ip = internal_http_service.instance.to_dict()["spec"]["clusterIP"]
+    ip = ipaddress.ip_address(address=svc_ip)
+    connect_addr = f"[{ip}]:443" if ip.version == 6 else f"{ip}:443"
 
     def _fetch_cert():
         try:
             return ExecCommandOnPod(utility_pods=workers_utility_pods, node=worker_node1).exec(
                 command=(
-                    f"openssl s_client -showcerts -connect {svc_ip}:443 </dev/null 2>/dev/null | "
+                    f"openssl s_client -showcerts -connect {connect_addr} </dev/null 2>/dev/null | "
                     "sed -n '/-----BEGIN/,/-----END/p'"
                 )
             )
@@ -171,11 +169,15 @@ def internal_http_deployment(cnv_tests_utilities_namespace, admin_client):
     Deploy internal HTTP server Deployment into the cnv_tests_utilities_namespace namespace.
     This Deployment deploys a pod that runs an HTTP server
     """
+    template = copy.deepcopy(INTERNAL_HTTP_TEMPLATE)
+    if cpu_arch := get_multiarch_cpu_arch():
+        template["spec"]["nodeSelector"] = {KUBERNETES_ARCH_LABEL: cpu_arch}
+
     with Deployment(
         name="internal-http",
         namespace=cnv_tests_utilities_namespace.name,
         selector=INTERNAL_HTTP_SELECTOR,
-        template=INTERNAL_HTTP_TEMPLATE,
+        template=template,
         replicas=1,
         client=admin_client,
     ) as dep:
@@ -202,7 +204,7 @@ def images_internal_http_server(internal_http_deployment, internal_http_service)
 
 @pytest.fixture()
 def upload_proxy_route(admin_client):
-    routes = Route.get(dyn_client=admin_client)
+    routes = Route.get(client=admin_client)
     upload_route = None
     for route in routes:
         if route.exposed_service == CDI_UPLOADPROXY:
@@ -211,15 +213,8 @@ def upload_proxy_route(admin_client):
     yield upload_route
 
 
-@pytest.fixture(scope="session")
-def skip_test_if_no_hpp_sc(cluster_storage_classes):
-    existing_hpp_sc = [sc.name for sc in cluster_storage_classes if sc.name in HPP_STORAGE_CLASSES]
-    if not existing_hpp_sc:
-        pytest.skip(f"This test runs only on one of the hpp storage classes: {HPP_STORAGE_CLASSES}")
-
-
 @pytest.fixture()
-def uploadproxy_route_deleted(hco_namespace):
+def uploadproxy_route_deleted(admin_client, hco_namespace):
     """
     Delete uploadproxy route from kubevirt-hyperconverged namespace.
 
@@ -227,26 +222,28 @@ def uploadproxy_route_deleted(hco_namespace):
     Once the cdi-operator is terminated, route is deleted to perform the test.
     """
     ns = hco_namespace.name
-    deployment = Deployment(name=CDI_OPERATOR, namespace=ns)
+    deployment = Deployment(name=CDI_OPERATOR, namespace=ns, client=admin_client)
     try:
         deployment.scale_replicas(replica_count=0)
         deployment.wait_for_replicas(deployed=False)
-        Route(name=CDI_UPLOADPROXY, namespace=ns).delete(wait=True)
+        Route(name=CDI_UPLOADPROXY, namespace=ns, client=admin_client).delete(wait=True)
         yield
     finally:
         deployment.scale_replicas(replica_count=1)
         deployment.wait_for_replicas()
-        Route(name=CDI_UPLOADPROXY, namespace=ns).wait()
+        Route(name=CDI_UPLOADPROXY, namespace=ns, client=admin_client).wait()
 
 
 @pytest.fixture()
 def cdi_config_upload_proxy_overridden(
+    admin_client,
     hco_namespace,
     hyperconverged_resource_scope_function,
     cdi_config,
     new_route_created,
 ):
     with ResourceEditorValidateHCOReconcile(
+        admin_client=admin_client,
         patches={
             hyperconverged_resource_scope_function: hco_cr_jsonpatch_annotations_dict(
                 component="cdi",
@@ -261,11 +258,12 @@ def cdi_config_upload_proxy_overridden(
 
 
 @pytest.fixture()
-def new_route_created(hco_namespace):
-    existing_route = Route(name=CDI_UPLOADPROXY, namespace=hco_namespace.name)
+def new_route_created(admin_client, hco_namespace):
+    existing_route = Route(name=CDI_UPLOADPROXY, namespace=hco_namespace.name, client=admin_client)
     route = Route(
         name="newuploadroute-cdi",
         namespace=hco_namespace.name,
+        client=admin_client,
         destination_ca_cert=existing_route.ca_cert,
         service=CDI_UPLOADPROXY,
     )
@@ -296,69 +294,16 @@ def download_image():
     get_downloaded_artifact(remote_name=f"{Images.Cdi.DIR}/{Images.Cdi.QCOW2_IMG}", local_name=LOCAL_PATH)
 
 
-def _skip_block_volumemode(storage_class_matrix):
-    storage_class = [*storage_class_matrix][0]
-    if storage_class_matrix[storage_class]["volume_mode"] == "Block":
-        pytest.skip("Test is not supported on Block volume mode")
-
-
-@pytest.fixture(scope="module")
-def skip_block_volumemode_scope_module(storage_class_matrix__module__):
-    _skip_block_volumemode(storage_class_matrix=storage_class_matrix__module__)
-
-
 @pytest.fixture()
 def default_fs_overhead(cdi_config):
     return float(cdi_config.instance.status.filesystemOverhead["global"])
 
 
 @pytest.fixture()
-def unset_predefined_scratch_sc(hyperconverged_resource_scope_module, cdi_config):
-    if cdi_config.instance.spec.scratchSpaceStorageClass:
-        empty_scratch_space_spec = {"spec": {"scratchSpaceStorageClass": ""}}
-        with ResourceEditorValidateHCOReconcile(
-            patches={hyperconverged_resource_scope_module: empty_scratch_space_spec},
-            list_resource_reconcile=[CDI],
-        ):
-            LOGGER.info(f"wait for {empty_scratch_space_spec} in CDIConfig")
-            for sample in TimeoutSampler(
-                wait_timeout=20,
-                sleep=1,
-                func=lambda: not cdi_config.instance.spec.scratchSpaceStorageClass,
-            ):
-                if sample:
-                    break
-            yield
-    else:
-        yield
-
-
-@pytest.fixture()
-def default_sc_as_fallback_for_scratch(unset_predefined_scratch_sc, admin_client, cdi_config, default_sc):
-    # Based on py_config["default_storage_class"], update default SC, if needed
-    if default_sc:
-        yield default_sc
-    else:
-        for sc in StorageClass.get(dyn_client=admin_client, name=py_config["default_storage_class"]):
-            assert sc, f"The cluster does not include {py_config['default_storage_class']} storage class"
-            with ResourceEditor(
-                patches={
-                    sc: {
-                        "metadata": {
-                            "annotations": {StorageClass.Annotations.IS_DEFAULT_CLASS: "true"},
-                            "name": sc.name,
-                        }
-                    }
-                }
-            ):
-                yield sc
-
-
-@pytest.fixture()
 def router_cert_secret(admin_client):
     router_secret = "router-certs-default"
     for secret in Secret.get(
-        dyn_client=admin_client,
+        client=admin_client,
         name=router_secret,
         namespace="openshift-ingress",
     ):
@@ -375,14 +320,7 @@ def temp_router_cert(tmpdir, router_cert_secret):
 
 
 @pytest.fixture()
-def skip_from_container_if_jira_18870_not_closed():
-    jira_id = "CNV-18870"
-    if os.environ.get(CNV_TESTS_CONTAINER) and is_jira_open(jira_id=jira_id):
-        pytest.skip(f"Skipping the test because it's running from the container and jira card {jira_id} not closed")
-
-
-@pytest.fixture()
-def enabled_ca(skip_from_container_if_jira_18870_not_closed, temp_router_cert):
+def enabled_ca(temp_router_cert):
     update_ca_trust_command = "sudo update-ca-trust"
     ca_path = "/etc/pki/ca-trust/source/anchors/"
     # copy to the trusted secure list and update
@@ -414,28 +352,22 @@ def hpp_cr_suffix_scope_session(is_hpp_cr_legacy_scope_session):
 
 
 @pytest.fixture(scope="session")
-def hpp_daemonset_scope_session(hco_namespace, hpp_cr_suffix_scope_session):
-    yield get_hpp_daemonset(hco_namespace=hco_namespace, hpp_cr_suffix=hpp_cr_suffix_scope_session)
+def hpp_daemonset_scope_session(hco_namespace, hpp_cr_suffix_scope_session, admin_client):
+    yield get_hpp_daemonset(
+        hco_namespace=hco_namespace, hpp_cr_suffix=hpp_cr_suffix_scope_session, admin_client=admin_client
+    )
 
 
 @pytest.fixture(scope="module")
-def hpp_daemonset_scope_module(hco_namespace, hpp_cr_suffix_scope_module):
-    yield get_hpp_daemonset(hco_namespace=hco_namespace, hpp_cr_suffix=hpp_cr_suffix_scope_module)
+def hpp_daemonset_scope_module(hco_namespace, hpp_cr_suffix_scope_module, admin_client):
+    yield get_hpp_daemonset(
+        hco_namespace=hco_namespace, hpp_cr_suffix=hpp_cr_suffix_scope_module, admin_client=admin_client
+    )
 
 
 @pytest.fixture()
 def rhel_vm_name(request):
     return request.param["vm_name"]
-
-
-@pytest.fixture(scope="session")
-def available_hpp_storage_class(skip_test_if_no_hpp_sc, cluster_storage_classes):
-    """
-    Get an HPP storage class if there is any in the cluster
-    """
-    for storage_class in cluster_storage_classes:
-        if storage_class.name in HPP_STORAGE_CLASSES:
-            return storage_class
 
 
 @pytest.fixture(scope="module")
@@ -459,7 +391,7 @@ def rhel_vm_for_snapshot(
     admin_client,
     namespace,
     rhel_vm_name,
-    rhel10_data_source_scope_session,
+    latest_rhel_data_source,
     snapshot_storage_class_name_scope_module,
 ):
     """Create a RHEL VM with using DataSource that supports snapshots"""
@@ -469,9 +401,12 @@ def rhel_vm_for_snapshot(
         client=admin_client,
         os_flavor=OS_FLAVOR_RHEL,
         vm_instance_type=VirtualMachineClusterInstancetype(client=admin_client, name=U1_SMALL),
-        vm_preference=VirtualMachineClusterPreference(client=admin_client, name=RHEL10_PREFERENCE),
+        vm_preference=VirtualMachineClusterPreference(
+            client=admin_client,
+            name=py_config["latest_instance_type_rhel_os_dict"][PREFERENCE_STR],
+        ),
         data_volume_template=data_volume_template_with_source_ref_dict(
-            data_source=rhel10_data_source_scope_session,
+            data_source=latest_rhel_data_source,
             storage_class=snapshot_storage_class_name_scope_module,
         ),
     ) as vm:
@@ -552,11 +487,6 @@ def data_volume_template_metadata(multi_storage_cirros_vm):
     return multi_storage_cirros_vm.data_volume_template["metadata"]
 
 
-@pytest.fixture()
-def storage_class_name_scope_function(storage_class_matrix__function__):
-    return [*storage_class_matrix__function__][0]
-
-
 @pytest.fixture(scope="module")
 def storage_class_name_scope_module(storage_class_matrix__module__):
     return [*storage_class_matrix__module__][0]
@@ -585,3 +515,23 @@ def rhel10_data_source_scope_module(golden_images_namespace):
         client=golden_images_namespace.client,
         ensure_exists=True,
     )
+
+
+@pytest.fixture(scope="module")
+def fedora_data_source_scope_module(golden_images_namespace):
+    return DataSource(
+        namespace=golden_images_namespace.name,
+        name=OS_FLAVOR_FEDORA,
+        client=golden_images_namespace.client,
+        ensure_exists=True,
+    )
+
+
+@pytest.fixture(scope="class")
+def unique_suffix():
+    return shortuuid.ShortUUID().random(length=4).lower()
+
+
+@pytest.fixture(scope="class")
+def dv_wait_timeout(request):
+    return request.param.get("dv_wait_timeout") if hasattr(request, "param") else TIMEOUT_30MIN

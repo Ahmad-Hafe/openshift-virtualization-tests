@@ -122,16 +122,21 @@ if "utilities.data_collector" in sys.modules:
 
 # Circular dependencies are already mocked in conftest.py
 
-# Now import the real data_collector module functions
+from ocp_resources.virtual_machine import VirtualMachine
+
+from utilities.constants.timeouts import TIMEOUT_10MIN
 from utilities.data_collector import (
     BASE_DIRECTORY_NAME,
+    _get_cnv_must_gather_image,
     collect_alerts_data,
     collect_default_cnv_must_gather_with_vm_gather,
+    collect_must_gather_for_vm,
     collect_ocp_must_gather,
     collect_vnc_screenshot_for_vms,
     get_data_collector_base,
     get_data_collector_base_directory,
     get_data_collector_dir,
+    get_scope_identifier,
     prepare_pytest_item_data_dir,
     set_data_collector_directory,
     set_data_collector_values,
@@ -274,7 +279,7 @@ class TestWriteToFile:
         mock_file_open.assert_called_once_with("/test/dir/test.txt", "a")
 
     @patch("os.makedirs")
-    @patch("builtins.open", side_effect=IOError("Permission denied"))
+    @patch("builtins.open", side_effect=OSError("Permission denied"))
     @patch("utilities.data_collector.LOGGER")
     def test_write_to_file_exception_handling(self, mock_logger, mock_file_open, mock_makedirs):
         """Test write_to_file handles exceptions gracefully"""
@@ -298,7 +303,7 @@ class TestSetDataCollectorDirectory:
         set_data_collector_directory(mock_item, "/output/dir")
 
         mock_prepare_dir.assert_called_once_with(item=mock_item, output_dir="/output/dir")
-        from utilities.data_collector import py_config
+        from utilities.data_collector import py_config  # noqa: PLC0415
 
         assert py_config["data_collector"]["collector_directory"] == "/prepared/dir/path"
 
@@ -338,12 +343,15 @@ class TestCollectVncScreenshotForVms:
     @patch("utilities.data_collector.get_data_collector_base_directory")
     @patch("utilities.data_collector.utilities.infra.run_virtctl_command")
     @patch("utilities.data_collector.shlex.split")
-    def test_collect_vnc_screenshot_for_vms(self, mock_shlex, mock_run_virtctl, mock_get_base_dir):
-        """Test collect_vnc_screenshot_for_vms runs virtctl command"""
+    def test_collect_vnc_screenshot_for_vms_running(self, mock_shlex, mock_run_virtctl, mock_get_base_dir):
+        """Test collect_vnc_screenshot_for_vms takes screenshot when VM is Running"""
         mock_get_base_dir.return_value = "/base/dir"
         mock_shlex.return_value = ["vnc", "screenshot", "test-vm", "-f", "/base/dir/test-ns-test-vm.png"]
-
-        collect_vnc_screenshot_for_vms("test-vm", "test-ns")
+        mock_vm = MagicMock()
+        mock_vm.name = "test-vm"
+        mock_vm.namespace = "test-ns"
+        mock_vm.instance.get.return_value = {"printableStatus": VirtualMachine.Status.RUNNING}
+        collect_vnc_screenshot_for_vms(vm=mock_vm)
 
         mock_get_base_dir.assert_called_once()
         expected_command = "vnc screenshot test-vm -f /base/dir/test-ns-test-vm.png"
@@ -351,6 +359,124 @@ class TestCollectVncScreenshotForVms:
         mock_run_virtctl.assert_called_once_with(
             command=["vnc", "screenshot", "test-vm", "-f", "/base/dir/test-ns-test-vm.png"], namespace="test-ns"
         )
+
+    @patch("utilities.data_collector.utilities.infra.run_virtctl_command")
+    def test_collect_vnc_screenshot_for_vms_skips_error_status(self, mock_run_virtctl):
+        """Test collect_vnc_screenshot_for_vms skips screenshot when VM is in error state"""
+        mock_vm = MagicMock()
+        mock_vm.name = "test-vm"
+        mock_vm.instance.get.return_value = {"printableStatus": VirtualMachine.Status.ERR_IMAGE_PULL}
+        collect_vnc_screenshot_for_vms(vm=mock_vm)
+
+        mock_run_virtctl.assert_not_called()
+
+
+class TestGetCnvMustGatherImage:
+    """Test cases for _get_cnv_must_gather_image helper"""
+
+    @patch("utilities.data_collector.utilities.hco.get_installed_hco_csv")
+    @patch("utilities.data_collector.Namespace")
+    def test_returns_must_gather_image(self, mock_namespace_class, mock_get_csv):
+        """Test _get_cnv_must_gather_image resolves the correct image URL"""
+        mock_client = MagicMock()
+        mock_csv = MagicMock()
+        mock_csv.instance.spec.relatedImages = [
+            {"name": "some-image", "image": "quay.io/test/some:latest"},
+            {"name": "must-gather-image", "image": "quay.io/test/must-gather:latest"},
+            {"name": "cnv-must-gather-debug", "image": "quay.io/test/debug-gather:latest"},
+        ]
+        mock_get_csv.return_value = mock_csv
+
+        with patch("utilities.data_collector.py_config", {"hco_namespace": "test-hco-ns"}):
+            result = _get_cnv_must_gather_image(admin_client=mock_client)
+
+        assert result == "quay.io/test/must-gather:latest"
+        mock_namespace_class.assert_called_once_with(client=mock_client, name="test-hco-ns")
+
+    @patch("utilities.data_collector.utilities.hco.get_installed_hco_csv")
+    @patch("utilities.data_collector.Namespace")
+    def test_raises_index_error_when_no_must_gather_image(self, mock_namespace_class, mock_get_csv):
+        """Test _get_cnv_must_gather_image raises IndexError when no image matches"""
+        mock_client = MagicMock()
+        mock_csv = MagicMock()
+        mock_csv.instance.spec.relatedImages = [
+            {"name": "some-image", "image": "quay.io/test/some:latest"},
+        ]
+        mock_get_csv.return_value = mock_csv
+
+        with patch("utilities.data_collector.py_config", {"hco_namespace": "test-hco-ns"}):
+            with pytest.raises(IndexError):
+                _get_cnv_must_gather_image(admin_client=mock_client)
+
+
+class TestCollectMustGatherForVm:
+    """Test cases for collect_must_gather_for_vm function"""
+
+    @patch("utilities.data_collector.datetime")
+    @patch("utilities.data_collector._get_cnv_must_gather_image")
+    @patch("utilities.data_collector.cache_admin_client")
+    @patch("utilities.data_collector.get_data_collector_dir")
+    @patch("utilities.data_collector.run_must_gather")
+    def test_collects_vm_incident(
+        self, mock_run_must_gather, mock_get_dir, mock_cache_client, mock_get_image, mock_datetime
+    ):
+        """Test must-gather runs --vm-incident scoped to the VM"""
+        mock_get_dir.return_value = "/collect/dir"
+        mock_client = MagicMock()
+        mock_cache_client.return_value = mock_client
+        mock_get_image.return_value = "quay.io/test/must-gather:latest"
+        mock_datetime.now.return_value.strftime.return_value = "2026-08-26T12:00:00Z"
+        mock_vm = MagicMock()
+        mock_vm.name = "test-vm"
+        mock_vm.namespace = "test-ns"
+
+        collect_must_gather_for_vm(vm=mock_vm)
+
+        mock_cache_client.assert_called_once()
+        mock_get_image.assert_called_once_with(admin_client=mock_client)
+        mock_run_must_gather.assert_called_once_with(
+            image_url="quay.io/test/must-gather:latest",
+            target_base_dir="/collect/dir/vm_must_gather",
+            script_name="NS=test-ns VM=test-vm /usr/bin/gather",
+            flag_names="vm-incident,incident-time=2026-08-26T12:00:00Z",
+            timeout=f"{TIMEOUT_10MIN}s",
+            command_timeout=TIMEOUT_10MIN,
+        )
+
+    @patch("utilities.data_collector.datetime")
+    @patch("utilities.data_collector._get_cnv_must_gather_image")
+    @patch("utilities.data_collector.cache_admin_client")
+    @patch("utilities.data_collector.get_data_collector_dir")
+    @patch("utilities.data_collector.run_must_gather")
+    def test_collects_vm_incident_with_explicit_admin_client(
+        self, mock_run_must_gather, mock_get_dir, mock_cache_client, mock_get_image, mock_datetime
+    ):
+        """Test must-gather uses explicit admin_client instead of cache when provided"""
+        mock_get_dir.return_value = "/collect/dir"
+        explicit_client = MagicMock()
+        mock_get_image.return_value = "quay.io/test/must-gather:latest"
+        mock_datetime.now.return_value.strftime.return_value = "2026-08-26T12:00:00Z"
+        mock_vm = MagicMock()
+        mock_vm.name = "test-vm"
+        mock_vm.namespace = "test-ns"
+
+        collect_must_gather_for_vm(vm=mock_vm, admin_client=explicit_client)
+
+        mock_cache_client.assert_not_called()
+        mock_get_image.assert_called_once_with(admin_client=explicit_client)
+
+    @patch("utilities.data_collector.LOGGER")
+    @patch("utilities.data_collector.cache_admin_client")
+    def test_gather_failure_does_not_raise(self, mock_cache_client, mock_logger):
+        """Test must-gather failures are logged and do not raise"""
+        mock_cache_client.side_effect = RuntimeError("must-gather failed")
+        mock_vm = MagicMock()
+        mock_vm.name = "test-vm"
+
+        collect_must_gather_for_vm(vm=mock_vm)
+
+        mock_logger.exception.assert_called_once()
+        assert "test-vm" in mock_logger.exception.call_args[0][0]
 
 
 class TestCollectOcpMustGather:
@@ -377,46 +503,21 @@ class TestCollectOcpMustGather:
 class TestCollectDefaultCnvMustGatherWithVmGather:
     """Test cases for collect_default_cnv_must_gather_with_vm_gather function"""
 
-    @patch("utilities.data_collector.utilities.hco.get_installed_hco_csv")
-    @patch("utilities.data_collector.Namespace")
-    @patch("utilities.data_collector.py_config", {"hco_namespace": "test-hco-ns"})
+    @patch("utilities.data_collector._get_cnv_must_gather_image")
     @patch("utilities.data_collector.run_must_gather")
     @patch("utilities.data_collector.LOGGER")
-    def test_collect_default_cnv_must_gather_with_vm_gather(
-        self, mock_logger, mock_run_must_gather, mock_namespace_class, mock_get_csv
-    ):
+    def test_collect_default_cnv_must_gather_with_vm_gather(self, mock_logger, mock_run_must_gather, mock_get_image):
         """Test collect_default_cnv_must_gather_with_vm_gather"""
-        # Setup mocks
         mock_client = MagicMock()
+        mock_get_image.return_value = "quay.io/test/must-gather:latest"
 
-        mock_namespace = MagicMock()
-        mock_namespace_class.return_value = mock_namespace
+        collect_default_cnv_must_gather_with_vm_gather(
+            since_time=1800,
+            target_dir="/target/dir",
+            admin_client=mock_client,
+        )
 
-        mock_csv = MagicMock()
-        mock_csv.name = "cnv-csv-v1.0.0"
-        # Setup related images to test must-gather image selection logic
-        # The function filters images where name contains "must-gather" and selects the FIRST match
-        # Expected behavior: "must-gather-image" should be selected (first image with "must-gather" in name)
-        mock_csv.instance.spec.relatedImages = [
-            {"name": "some-image", "image": "quay.io/test/some:latest"},  # Will be ignored (no "must-gather")
-            {
-                "name": "must-gather-image",
-                "image": "quay.io/test/must-gather:latest",
-            },  # EXPECTED: Selected (first match)
-            {"name": "cnv-must-gather-debug", "image": "quay.io/test/debug-gather:latest"},  # Would match but not first
-        ]
-        mock_get_csv.return_value = mock_csv
-
-        collect_default_cnv_must_gather_with_vm_gather(1800, "/target/dir", admin_client=mock_client)
-
-        mock_namespace_class.assert_called_once_with(name="test-hco-ns")
-        mock_get_csv.assert_called_once_with(admin_client=mock_client, hco_namespace=mock_namespace)
-
-        # ASSERTION: Verify the expected must-gather image selection behavior
-        # The function should select "quay.io/test/must-gather:latest" because:
-        # 1. It filters relatedImages where image["name"] contains "must-gather"
-        # 2. It takes the first ([0]) matching image from the filtered list
-        # 3. "must-gather-image" is the first image in the list with "must-gather" in its name
+        mock_get_image.assert_called_once_with(admin_client=mock_client)
         mock_run_must_gather.assert_called_once_with(
             image_url="quay.io/test/must-gather:latest",
             target_base_dir="/target/dir",
@@ -441,7 +542,7 @@ class TestPrepareDataDir:
         mock_item.name = "test_my_function"
         mock_item.fspath.dirname = "/home/user/git/test-repo/tests/test_dir"
         mock_item.fspath.basename = "test_something.py"
-        mock_item.session.config.inicfg.get.return_value = "tests"
+        mock_item.session.config.getini.return_value = ["tests"]
 
         result = prepare_pytest_item_data_dir(mock_item, "/output")
 
@@ -453,35 +554,10 @@ class TestPrepareDataDir:
         """Test prepare_pytest_item_data_dir raises assertion when testpaths is missing"""
         mock_item = MagicMock()
         mock_item.cls = None  # Set cls to None explicitly
-        mock_item.session.config.inicfg.get.return_value = None
+        mock_item.session.config.getini.return_value = []
 
         with pytest.raises(AssertionError, match="pytest.ini must include testpaths"):
             prepare_pytest_item_data_dir(mock_item, "/output")
-
-    @patch("os.makedirs")
-    @patch("os.path.split")
-    def test_prepare_pytest_item_data_dir_with_configvalue(self, mock_split, mock_makedirs):
-        """Test prepare_pytest_item_data_dir with pytest 9 ConfigValue object"""
-        mock_split.return_value = ("/some/path", "test_dir")
-
-        # Mock pytest 9's ConfigValue object
-        class ConfigValue:
-            def __init__(self, value):
-                self.value = value
-
-        # Mock pytest item
-        mock_item = MagicMock()
-        mock_item.cls.__name__ = "TestMyClass"
-        mock_item.name = "test_my_function"
-        mock_item.fspath.dirname = "/home/user/git/test-repo/tests/test_dir"
-        mock_item.fspath.basename = "test_something.py"
-        mock_item.session.config.inicfg.get.return_value = ConfigValue("tests")
-
-        result = prepare_pytest_item_data_dir(mock_item, "/output")
-
-        expected_path = "/output/test_dir/test_something/TestMyClass/test_my_function"
-        assert result == expected_path
-        mock_makedirs.assert_called_once_with(expected_path, exist_ok=True)
 
     @patch("os.makedirs")
     @patch("os.path.split")
@@ -495,13 +571,68 @@ class TestPrepareDataDir:
         mock_item.name = "test_function"
         mock_item.fspath.dirname = "/home/user/git/test-repo/tests/test_dir"
         mock_item.fspath.basename = "test_something.py"
-        mock_item.session.config.inicfg.get.return_value = "tests"
+        mock_item.session.config.getini.return_value = ["tests"]
 
         result = prepare_pytest_item_data_dir(mock_item, "/output")
 
         expected_path = "/output/test_dir/test_something/test_function"
         assert result == expected_path
         mock_makedirs.assert_called_once_with(expected_path, exist_ok=True)
+
+
+class TestGetScopeIdentifier:
+    """Test cases for get_scope_identifier function"""
+
+    def test_get_scope_identifier_module_scope(self):
+        """Test get_scope_identifier with module scope"""
+        mock_node = MagicMock()
+        mock_node.fspath = "/path/to/test_module.py"
+
+        result = get_scope_identifier(node=mock_node, scope_value="module")
+
+        assert result == "/path/to/test_module.py"
+
+    def test_get_scope_identifier_class_scope_with_parent(self):
+        """Test get_scope_identifier with class scope and parent exists"""
+        mock_node = MagicMock()
+        mock_node.fspath = "/path/to/test_file.py"
+        mock_parent = MagicMock()
+        mock_parent.name = "TestMyClass"
+        mock_node.parent = mock_parent
+
+        result = get_scope_identifier(node=mock_node, scope_value="class")
+
+        assert result == "/path/to/test_file.py::TestMyClass"
+
+    def test_get_scope_identifier_class_scope_without_parent(self):
+        """Test get_scope_identifier with class scope and no parent"""
+        mock_node = MagicMock()
+        mock_node.fspath = "/path/to/test_file.py"
+        mock_node.parent = None
+
+        result = get_scope_identifier(node=mock_node, scope_value="class")
+
+        assert result == "/path/to/test_file.py"
+
+    def test_get_scope_identifier_test_scope(self):
+        """Test get_scope_identifier with test scope (None)"""
+        mock_node = MagicMock()
+        mock_node.fspath = "/path/to/test_file.py"
+        mock_node.name = "test_my_function"
+
+        result = get_scope_identifier(node=mock_node, scope_value=None)
+
+        assert result == "/path/to/test_file.py::test_my_function"
+
+    def test_get_scope_identifier_test_scope_explicit(self):
+        """Test get_scope_identifier with explicit test scope value"""
+        mock_node = MagicMock()
+        mock_node.fspath = "/path/to/test_file.py"
+        mock_node.name = "test_another_function"
+
+        result = get_scope_identifier(node=mock_node, scope_value="test")
+
+        assert result == "/path/to/test_file.py::test_another_function"
 
 
 class TestConstants:

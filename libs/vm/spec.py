@@ -10,6 +10,7 @@ from ocp_resources.virtual_machine import VirtualMachine
 class VMSpec:
     template: Template
     runStrategy: str = VirtualMachine.RunStrategy.HALTED  # noqa: N815
+    dataVolumeTemplates: list[dict[str, Any]] | None = None  # noqa: N815
 
 
 @dataclass
@@ -27,6 +28,7 @@ class Metadata:
 @dataclass
 class VMISpec:
     domain: Domain
+    architecture: str | None = None
     networks: list[Network] | None = None
     volumes: list[Volume] | None = None
     terminationGracePeriodSeconds: int | None = None  # noqa: N815
@@ -48,6 +50,7 @@ class CPU:
 @dataclass
 class Memory:
     guest: str
+    maxGuest: str | None = None  # noqa: N815
 
 
 @dataclass
@@ -55,6 +58,7 @@ class Devices:
     disks: list[SpecDisk] | None = None
     interfaces: list[Interface] | None = None
     rng: dict[Any, Any] | None = None
+    autoattachPodInterface: bool | None = None  # noqa: N815
 
 
 @dataclass
@@ -74,8 +78,10 @@ class Interface:
     masquerade: dict[Any, Any] | None = None
     bridge: dict[Any, Any] | None = None
     sriov: dict[Any, Any] | None = None
+    passtBinding: dict[Any, Any] | None = None  # noqa: N815
     binding: NetBinding | None = None
     state: str | None = None
+    macAddress: str | None = None  # noqa: N815
 
 
 @dataclass
@@ -97,7 +103,24 @@ class Multus:
 
 @dataclass
 class Affinity:
-    podAntiAffinity: PodAntiAffinity  # noqa: N815
+    podAntiAffinity: PodAntiAffinity | None = None  # noqa: N815
+    podAffinity: PodAffinity | None = None  # noqa: N815
+    nodeAffinity: NodeAffinity | None = None  # noqa: N815
+
+
+@dataclass
+class NodeAffinity:
+    requiredDuringSchedulingIgnoredDuringExecution: NodeSelectorTerms  # noqa: N815
+
+
+@dataclass
+class NodeSelectorTerms:
+    nodeSelectorTerms: list[NodeSelectorTerm]  # noqa: N815
+
+
+@dataclass
+class NodeSelectorTerm:
+    matchExpressions: list[LabelSelectorRequirement]  # noqa: N815
 
 
 @dataclass
@@ -106,10 +129,16 @@ class PodAntiAffinity:
 
 
 @dataclass
+class PodAffinity:
+    requiredDuringSchedulingIgnoredDuringExecution: list[PodAffinityTerm]  # noqa: N815
+
+
+@dataclass
 class PodAffinityTerm:
     labelSelector: LabelSelector  # noqa: N815
     topologyKey: str  # noqa: N815
     namespaceSelector: dict[str, Any] | None = None  # noqa: N815
+    namespaces: list[str] | None = None
 
 
 @dataclass
@@ -121,7 +150,7 @@ class LabelSelector:
 class LabelSelectorRequirement:
     operator: str
     key: str
-    values: list[str]
+    values: list[str] | None = None
 
 
 @dataclass
@@ -129,6 +158,12 @@ class Volume:
     name: str
     containerDisk: ContainerDisk | None = None  # noqa: N815
     cloudInitNoCloud: CloudInitNoCloud | None = None  # noqa: N815
+    dataVolume: DataVolumeRef | None = None  # noqa: N815
+
+
+@dataclass
+class DataVolumeRef:
+    name: str
 
 
 @dataclass

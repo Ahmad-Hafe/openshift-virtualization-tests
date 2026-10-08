@@ -25,14 +25,18 @@ from tests.storage.restricted_namespace_cloning.constants import (
     VERBS_SRC_SA,
     VM_FOR_TEST,
 )
+from tests.storage.stop_status_utils import dv_stop_status_restart_threshold
 from tests.storage.utils import (
     create_cluster_role,
     create_role_binding,
     set_permissions,
 )
-from utilities.constants import PVC, UNPRIVILEGED_USER, Images
+from utilities.constants import Images
+from utilities.constants.images import OS_FLAVOR_FEDORA
+from utilities.constants.pytest import UNPRIVILEGED_USER
+from utilities.constants.storage import BIND_IMMEDIATE_ANNOTATION, PVC
 from utilities.infra import create_ns
-from utilities.storage import create_dv
+from utilities.storage import construct_datavolume_source_dict, create_dv, get_dv_size_from_datasource
 from utilities.virt import VirtualMachineForTests, running_vm
 
 
@@ -42,14 +46,15 @@ def destination_namespace(admin_client):
 
 
 @pytest.fixture(scope="module")
-def restricted_namespace_service_account(destination_namespace):
-    with ServiceAccount(name="vm-service-account", namespace=destination_namespace.name) as sa:
+def restricted_namespace_service_account(destination_namespace, admin_client):
+    with ServiceAccount(name="vm-service-account", namespace=destination_namespace.name, client=admin_client) as sa:
         yield sa
 
 
 @pytest.fixture(scope="module")
-def cluster_role_for_creating_pods():
+def cluster_role_for_creating_pods(admin_client):
     with create_cluster_role(
+        client=admin_client,
         name="pod-creator",
         api_groups=[""],
         verbs=CREATE,
@@ -58,26 +63,60 @@ def cluster_role_for_creating_pods():
         yield cluster_role_pod_creator
 
 
+@pytest.fixture(scope="module")
+def dv_cloned_from_datasource(
+    request,
+    namespace,
+    storage_class_name_scope_module,
+    fedora_data_source_scope_module,
+):
+    """
+    Create a source DV in the test namespace by cloning from the golden image DataSource.
+    When cloning from a DataSource, the target DV must be at least as large as the source.
+    """
+    dv_name = request.param["dv_name"]
+    dv_size = get_dv_size_from_datasource(data_source=fedora_data_source_scope_module)
+
+    with create_dv(
+        dv_name=f"{dv_name}-{storage_class_name_scope_module}",
+        namespace=namespace.name,
+        source_ref={
+            "kind": fedora_data_source_scope_module.kind,
+            "name": fedora_data_source_scope_module.name,
+            "namespace": fedora_data_source_scope_module.namespace,
+        },
+        size=dv_size,
+        storage_class=storage_class_name_scope_module,
+        client=namespace.client,
+    ) as dv:
+        dv.wait_for_dv_success(stop_status_func=dv_stop_status_restart_threshold, dv=dv)
+        yield dv
+
+
 @pytest.fixture()
-def data_volume_clone_settings(destination_namespace, data_volume_multi_storage_scope_module):
-    storage_class = data_volume_multi_storage_scope_module.storage_class
+def data_volume_clone_settings(unprivileged_client, destination_namespace, dv_cloned_from_datasource):
+    storage_class = dv_cloned_from_datasource.storage_class
     dv = DataVolume(
         name=f"{TARGET_DV}-{storage_class}",
         namespace=destination_namespace.name,
-        source=PVC,
-        size=data_volume_multi_storage_scope_module.size,
-        source_pvc=data_volume_multi_storage_scope_module.name,
-        source_namespace=data_volume_multi_storage_scope_module.namespace,
+        source_dict=construct_datavolume_source_dict(
+            source=PVC,
+            source_pvc_name=dv_cloned_from_datasource.name,
+            source_pvc_namespace=dv_cloned_from_datasource.namespace,
+        ),
+        size=dv_cloned_from_datasource.size,
         storage_class=storage_class,
         api_name="storage",
+        client=unprivileged_client,
     )
     dv.to_dict()
     return dv
 
 
 @pytest.fixture()
-def restricted_role_binding_for_vms_in_destination_namespace(destination_namespace):
+def restricted_role_binding_for_vms_in_destination_namespace(destination_namespace, admin_client):
     with create_role_binding(
+        client=admin_client,
         name="allow-unprivileged-client-to-run-vms-on-dst-ns",
         namespace=destination_namespace.name,
         subjects_kind="User",
@@ -90,8 +129,11 @@ def restricted_role_binding_for_vms_in_destination_namespace(destination_namespa
 
 
 @pytest.fixture()
-def perm_src_service_account(request, namespace, destination_namespace, restricted_namespace_service_account):
+def perm_src_service_account(
+    request, namespace, destination_namespace, restricted_namespace_service_account, admin_client
+):
     with set_permissions(
+        client=admin_client,
         role_name="datavolume-cluster-role-src",
         role_api_groups=[DataVolume.api_group],
         verbs=request.param[VERBS_SRC_SA],
@@ -106,8 +148,11 @@ def perm_src_service_account(request, namespace, destination_namespace, restrict
 
 
 @pytest.fixture()
-def perm_destination_service_account(request, destination_namespace, restricted_namespace_service_account):
+def perm_destination_service_account(
+    request, destination_namespace, restricted_namespace_service_account, admin_client
+):
     with set_permissions(
+        client=admin_client,
         role_name="datavolume-cluster-role-dst",
         role_api_groups=[DataVolume.api_group],
         verbs=request.param[VERBS_DST_SA],
@@ -122,14 +167,15 @@ def perm_destination_service_account(request, destination_namespace, restricted_
 
 
 @pytest.fixture(scope="module")
-def fail_when_no_unprivileged_client_available(unprivileged_client):
-    if not unprivileged_client:
+def fail_when_no_unprivileged_client_available(unprivileged_client, admin_client):
+    if unprivileged_client is admin_client:
         pytest.fail("No unprivileged_client available, failing the test")
 
 
 @pytest.fixture()
-def permissions_datavolume_source(request, namespace):
+def permissions_datavolume_source(request, namespace, admin_client):
     with set_permissions(
+        client=admin_client,
         role_name="datavolume-cluster-role-source",
         role_api_groups=[DataVolume.api_group],
         verbs=request.param[VERBS_SRC],
@@ -143,8 +189,9 @@ def permissions_datavolume_source(request, namespace):
 
 
 @pytest.fixture()
-def permissions_datavolume_destination(request, destination_namespace):
+def permissions_datavolume_destination(request, destination_namespace, admin_client):
     with set_permissions(
+        client=admin_client,
         role_name="datavolume-cluster-role-destination",
         role_api_groups=[DataVolume.api_group],
         verbs=request.param[VERBS_DST],
@@ -158,8 +205,9 @@ def permissions_datavolume_destination(request, destination_namespace):
 
 
 @pytest.fixture()
-def permissions_pvc_source(namespace):
+def permissions_pvc_source(namespace, admin_client):
     with set_permissions(
+        client=admin_client,
         role_name="pvc-cluster-role-source",
         role_api_groups=[PersistentVolumeClaim.api_group],
         verbs=LIST_GET,
@@ -173,8 +221,9 @@ def permissions_pvc_source(namespace):
 
 
 @pytest.fixture()
-def permissions_pvc_destination(destination_namespace):
+def permissions_pvc_destination(destination_namespace, admin_client):
     with set_permissions(
+        client=admin_client,
         role_name="pvc-cluster-role-destination",
         role_api_groups=[PersistentVolumeClaim.api_group],
         verbs=LIST_GET,
@@ -193,8 +242,10 @@ def permission_src_service_account_for_creating_pods(
     destination_namespace,
     restricted_namespace_service_account,
     cluster_role_for_creating_pods,
+    admin_client,
 ):
     with create_role_binding(
+        client=admin_client,
         name="service-account-can-create-pods-on-src",
         namespace=namespace.name,
         subjects_kind=restricted_namespace_service_account.kind,
@@ -208,9 +259,10 @@ def permission_src_service_account_for_creating_pods(
 
 @pytest.fixture()
 def permission_destination_service_account_for_creating_pods(
-    destination_namespace, restricted_namespace_service_account, cluster_role_for_creating_pods
+    destination_namespace, restricted_namespace_service_account, cluster_role_for_creating_pods, admin_client
 ):
     with create_role_binding(
+        client=admin_client,
         name="service-account-can-create-pods-on-destination",
         namespace=destination_namespace.name,
         subjects_kind=restricted_namespace_service_account.kind,
@@ -226,20 +278,22 @@ def permission_destination_service_account_for_creating_pods(
 def dv_cloned_by_unprivileged_user_in_the_same_namespace(
     request,
     storage_class_name_scope_module,
-    data_volume_multi_storage_scope_module,
+    dv_cloned_from_datasource,
     unprivileged_client,
     permissions_datavolume_source,
 ):
-    namespace = data_volume_multi_storage_scope_module.namespace
+    namespace = dv_cloned_from_datasource.namespace
     with create_dv(
         dv_name=f"{request.param['dv_name']}-{storage_class_name_scope_module}",
         namespace=namespace,
         source=PVC,
-        size=data_volume_multi_storage_scope_module.size,
-        source_pvc=data_volume_multi_storage_scope_module.pvc.name,
-        source_namespace=namespace,
+        size=dv_cloned_from_datasource.size,
+        source_pvc_name=dv_cloned_from_datasource.pvc.name,
+        source_pvc_namespace=namespace,
         client=unprivileged_client,
         storage_class=storage_class_name_scope_module,
+        consume_wffc=False,
+        annotations=BIND_IMMEDIATE_ANNOTATION,
     ) as cdv:
         yield cdv
 
@@ -248,7 +302,7 @@ def dv_cloned_by_unprivileged_user_in_the_same_namespace(
 def dv_destination_cloned_from_pvc(
     request,
     storage_class_name_scope_module,
-    data_volume_multi_storage_scope_module,
+    dv_cloned_from_datasource,
     destination_namespace,
     unprivileged_client,
     permissions_datavolume_source,
@@ -258,13 +312,15 @@ def dv_destination_cloned_from_pvc(
         dv_name=f"{request.param['dv_name']}-{storage_class_name_scope_module}",
         namespace=destination_namespace.name,
         source=PVC,
-        size=data_volume_multi_storage_scope_module.size,
-        source_pvc=data_volume_multi_storage_scope_module.pvc.name,
-        source_namespace=data_volume_multi_storage_scope_module.namespace,
+        size=dv_cloned_from_datasource.size,
+        source_pvc_name=dv_cloned_from_datasource.pvc.name,
+        source_pvc_namespace=dv_cloned_from_datasource.namespace,
         client=unprivileged_client,
         storage_class=storage_class_name_scope_module,
+        consume_wffc=False,
+        annotations=BIND_IMMEDIATE_ANNOTATION,
     ) as cdv:
-        cdv.wait_for_dv_success()
+        cdv.wait_for_dv_success(stop_status_func=dv_stop_status_restart_threshold, dv=cdv)
         yield cdv
 
 
@@ -279,23 +335,19 @@ def vm_for_restricted_namespace_cloning_test(
     with VirtualMachineForTests(
         name=VM_FOR_TEST,
         namespace=destination_namespace.name,
-        os_flavor=Images.Cirros.OS_FLAVOR,
+        os_flavor=OS_FLAVOR_FEDORA,
         service_accounts=[restricted_namespace_service_account.name],
         client=unprivileged_client,
-        memory_guest=Images.Cirros.DEFAULT_MEMORY_SIZE,
+        memory_guest=Images.Fedora.DEFAULT_MEMORY_SIZE,
         data_volume_template=data_volume_clone_settings.res,
     ) as vm:
-        running_vm(vm=vm, wait_for_interfaces=False)
+        running_vm(vm=vm)
         yield vm
 
 
 @pytest.fixture()
-def user_has_get_permissions_in_source_namespace(
-    namespace, unprivileged_client, data_volume_multi_storage_scope_module
-):
-    _ = DataVolume(
-        namespace=namespace.name, name=data_volume_multi_storage_scope_module.name, client=unprivileged_client
-    ).instance
+def user_has_get_permissions_in_source_namespace(namespace, unprivileged_client, dv_cloned_from_datasource):
+    _ = DataVolume(namespace=namespace.name, name=dv_cloned_from_datasource.name, client=unprivileged_client).instance
 
 
 @pytest.fixture()

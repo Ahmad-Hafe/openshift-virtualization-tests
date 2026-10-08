@@ -8,7 +8,10 @@ from tests.install_upgrade_operators.crypto_policy.constants import (
     MANAGED_CRS_LIST,
     TLS_CUSTOM_PROFILE,
 )
-from utilities.constants import TLS_CUSTOM_POLICY, TLS_SECURITY_PROFILE
+from utilities.constants.hco import (
+    TLS_CUSTOM_POLICY,
+    TLS_SECURITY_PROFILE,
+)
 from utilities.hco import ResourceEditorValidateHCOReconcile
 
 LOGGER = logging.getLogger(__name__)
@@ -17,6 +20,7 @@ pytestmark = pytest.mark.s390x
 
 @pytest.mark.polarion("CNV-9367")
 def test_set_hco_crypto_failed_without_required_cipher(
+    admin_client,
     hyperconverged_resource_scope_function,
 ):
     """
@@ -29,9 +33,10 @@ def test_set_hco_crypto_failed_without_required_cipher(
         "ECDHE-ECDSA-AES256-GCM-SHA384",
         "ECDHE-RSA-AES256-GCM-SHA384",
     ]
-    tls_spec = {"spec": {TLS_SECURITY_PROFILE: tls_custom_profile}}
+    tls_spec = {"spec": {"security": {TLS_SECURITY_PROFILE: tls_custom_profile}}}
     with pytest.raises(ForbiddenError, match=r"missing an HTTP/2-required"):
         with ResourceEditorValidateHCOReconcile(
+            admin_client=admin_client,
             patches={hyperconverged_resource_scope_function: tls_spec},
             list_resource_reconcile=MANAGED_CRS_LIST,
             wait_for_reconcile_post_update=True,
@@ -42,13 +47,18 @@ def test_set_hco_crypto_failed_without_required_cipher(
 
 
 @pytest.mark.polarion("CNV-10551")
-def test_set_ciphers_for_tlsv13(hyperconverged_resource_scope_function):
+def test_set_ciphers_for_tlsv13(admin_client, hyperconverged_resource_scope_function):
     error_string = r"custom ciphers cannot be selected when minTLSVersion is VersionTLS13"
     tls_custom_profile = copy.deepcopy(TLS_CUSTOM_PROFILE)
     tls_custom_profile[TLS_CUSTOM_POLICY]["minTLSVersion"] = "VersionTLS13"
     with pytest.raises(ForbiddenError, match=error_string):
         with ResourceEditorValidateHCOReconcile(
-            patches={hyperconverged_resource_scope_function: {"spec": {TLS_SECURITY_PROFILE: tls_custom_profile}}}
+            admin_client=admin_client,
+            patches={
+                hyperconverged_resource_scope_function: {
+                    "spec": {"security": {TLS_SECURITY_PROFILE: tls_custom_profile}}
+                }
+            },
         ):
             LOGGER.error(
                 "Setting HCO with custom tlsSecurityProfile with TLS Version 1.3 "

@@ -8,7 +8,11 @@ import pytest
 from ocp_resources.pod import Pod
 
 from tests.virt.cluster.utils import verify_pods_priority_class_value
-from utilities.constants import VIRT_API, VIRT_CONTROLLER, VIRT_HANDLER
+from utilities.constants.components import (
+    VIRT_API,
+    VIRT_CONTROLLER,
+    VIRT_HANDLER,
+)
 
 pytestmark = [
     pytest.mark.post_upgrade,
@@ -27,7 +31,7 @@ def virt_pods(request, admin_client, hco_namespace):
     podprefix = request.param
     pods_list = list(
         Pod.get(
-            dyn_client=admin_client,
+            client=admin_client,
             namespace=hco_namespace.name,
             label_selector=f"kubevirt.io={podprefix}",
         )

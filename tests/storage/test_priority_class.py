@@ -8,6 +8,7 @@ from tests.os_params import RHEL_LATEST
 from tests.storage.utils import get_importer_pod
 from utilities.artifactory import get_test_artifact_server_url
 from utilities.constants import Images
+from utilities.storage import construct_datavolume_source_dict
 from utilities.virt import VirtualMachineForTests, fedora_vm_body
 
 
@@ -31,15 +32,16 @@ def priority_class(request, admin_client):
 @pytest.fixture()
 def dv_dict(namespace, priority_class, unprivileged_client):
     dv = DataVolume(
-        source="http",
+        source_dict=construct_datavolume_source_dict(
+            source="http",
+            url=f"{get_test_artifact_server_url()}{RHEL_LATEST['image_path']}",
+        ),
         name="priority-dv",
         namespace=namespace.name,
-        url=f"{get_test_artifact_server_url()}{RHEL_LATEST['image_path']}",
         size=RHEL_LATEST["dv_size"],
         storage_class=py_config["default_storage_class"],
-        volume_mode=py_config["default_volume_mode"],
-        access_modes=py_config["default_access_mode"],
         client=unprivileged_client,
+        api_name="storage",
     )
     dv.to_dict()
     dv_priority_class = priority_class["dv_priority_class"]
@@ -75,7 +77,7 @@ def vm_with_priority_class(
 
 @pytest.fixture()
 def importer_pod(admin_client, namespace):
-    return get_importer_pod(dyn_client=admin_client, namespace=namespace.name)
+    return get_importer_pod(client=admin_client, namespace=namespace.name)
 
 
 @pytest.mark.sno

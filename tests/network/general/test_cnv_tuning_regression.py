@@ -1,7 +1,7 @@
 import pytest
 
-from tests.network.libs.ip import random_ipv4_address
-from utilities.constants import LINUX_BRIDGE
+from libs.net.ip import random_ipv4_address
+from utilities.constants.networking import LINUX_BRIDGE
 from utilities.infra import get_node_selector_dict
 from utilities.network import compose_cloud_init_data_dict, network_device, network_nad
 from utilities.virt import VirtualMachineForTests, fedora_vm_body
@@ -21,7 +21,7 @@ def linux_bridge_nad(admin_client, namespace):
 
 
 @pytest.fixture()
-def linux_bridge_device(admin_client, worker_node1, linux_bridge_nad):
+def linux_bridge_device(nmstate_dependent_placeholder, admin_client, worker_node1, linux_bridge_nad):
     with network_device(
         interface_type=LINUX_BRIDGE,
         nncp_name="cnv-tuning-nncp",
@@ -36,9 +36,7 @@ def linux_bridge_device(admin_client, worker_node1, linux_bridge_nad):
 def cnv_tuning_vm(unprivileged_client, worker_node1, linux_bridge_nad, linux_bridge_device):
     name = "tuning-vma"
     networks = {"net1": linux_bridge_nad.name}
-    network_data_data = {
-        "ethernets": {"eth1": {"addresses": [f"{random_ipv4_address(net_seed=0, host_address=1)}/24"]}}
-    }
+    network_data_data = {"ethernets": {"eth1": {"addresses": [str(random_ipv4_address(net_seed=0, host_address=1))]}}}
 
     with VirtualMachineForTests(
         namespace=linux_bridge_nad.namespace,

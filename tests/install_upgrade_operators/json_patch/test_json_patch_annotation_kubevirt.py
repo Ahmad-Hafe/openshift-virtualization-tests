@@ -27,6 +27,7 @@ pytestmark = [pytest.mark.arm64, pytest.mark.s390x]
 @pytest.fixture(scope="class")
 def json_patched_kubevirt(admin_client, hco_namespace, prometheus, hyperconverged_resource_scope_class):
     with update_hco_annotations(
+        admin_client=admin_client,
         resource=hyperconverged_resource_scope_class,
         path=PATH_KUBEVIRT,
         value={DISABLE_TLS: True},
@@ -54,7 +55,7 @@ class TestKubevirtJsonPatch:
             admin_client=admin_client,
             hco_namespace=hco_namespace,
             expected_conditions={
-                **{"TaintedConfiguration": Resource.Condition.Status.TRUE},
+                "TaintedConfiguration": Resource.Condition.Status.TRUE,
             },
         )
         validate_kubevirt_json_patch(kubevirt_resource=kubevirt_resource)

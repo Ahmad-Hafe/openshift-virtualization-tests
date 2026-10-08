@@ -1,22 +1,27 @@
 import logging
 import re
-from typing import Set
+from typing import TYPE_CHECKING
 
-from ocp_resources.node import Node
 from ocp_resources.resource import Resource
+from pytest_testconfig import config as py_config
 
-from utilities.constants import (
+from utilities.constants.cluster import (
     CPU_MODEL_LABEL_PREFIX,
-    EXCLUDED_CPU_MODELS,
-    EXCLUDED_OLD_CPU_MODELS,
     KUBERNETES_ARCH_LABEL,
 )
+from utilities.constants.cpu_models import (
+    EXCLUDED_CPU_MODELS,
+    EXCLUDED_OLD_CPU_MODELS,
+)
+
+if TYPE_CHECKING:
+    from ocp_resources.node import Node
 
 LOGGER = logging.getLogger(__name__)
 HOST_MODEL_CPU_LABEL = f"host-model-cpu.node.{Resource.ApiGroup.KUBEVIRT_IO}"
 
 
-def get_nodes_cpu_model(nodes: list[Node]) -> dict[str, dict[str, Set[str]]]:
+def get_nodes_cpu_model(nodes: list[Node]) -> dict[str, dict[str, set[str]]]:
     """Checks the CPU model labels on each node and returns a dictionary of nodes and supported CPU models.
 
     Args:
@@ -28,7 +33,7 @@ def get_nodes_cpu_model(nodes: list[Node]) -> dict[str, dict[str, Set[str]]]:
         excludes old CPU models.
     """
 
-    nodes_cpu_model: dict[str, dict[str, Set[str]]] = {"common": {}, "modern": {}}
+    nodes_cpu_model: dict[str, dict[str, set[str]]] = {"common": {}, "modern": {}}
     for node in nodes:
         nodes_cpu_model["common"][node.name] = set()
         nodes_cpu_model["modern"][node.name] = set()
@@ -79,6 +84,11 @@ def get_host_model_cpu(nodes: list[Node]) -> dict[str, str]:
         AssertionError: If not all nodes have the host-model-cpu label.
     """
     nodes_host_model_cpu = {}
+
+    # filter nodes by architecture
+    nodes = [node for node in nodes if node.labels.get(KUBERNETES_ARCH_LABEL) == py_config["cpu_arch"]]
+    assert nodes, f"No nodes found for cpu_arch={py_config['cpu_arch']}"
+    LOGGER.info(f"Nodes found for cpu_arch={py_config['cpu_arch']}: {nodes}")
     for node in nodes:
         for label, value in node.labels.items():
             match_object = re.match(rf"{HOST_MODEL_CPU_LABEL}/(.*)", label)
@@ -113,7 +123,7 @@ def find_common_cpu_model_for_live_migration(cluster_cpu: str | None, host_cpu_m
     return None
 
 
-def get_common_cpu_from_nodes(cluster_cpus: Set[str]) -> str | None:
+def get_common_cpu_from_nodes(cluster_cpus: set[str]) -> str | None:
     """Receives a set of unique common CPUs between all schedulable nodes and returns one from the set.
 
     Args:
@@ -122,21 +132,6 @@ def get_common_cpu_from_nodes(cluster_cpus: Set[str]) -> str | None:
     Returns:
         A single CPU model string from the set if available, None if the set is empty.
     """
-    return next(iter(cluster_cpus)) if cluster_cpus else None
-
-
-def get_nodes_cpu_architecture(nodes: list[Node]) -> str:
-    """Gets the CPU architecture from cluster nodes.
-
-    Args:
-        nodes: List of Node objects to extract architecture information from.
-
-    Returns:
-        CPU architecture string (e.g., "x86_64", "arm64", "s390x").
-
-    Raises:
-        AssertionError: If nodes have mixed CPU architectures.
-    """
-    nodes_cpu_arch = {node.labels[KUBERNETES_ARCH_LABEL] for node in nodes}
-    assert len(nodes_cpu_arch) == 1, "Mixed CPU architectures in the cluster is not supported"
-    return next(iter(nodes_cpu_arch))
+    common_cpu_model = next(iter(cluster_cpus)) if cluster_cpus else None
+    LOGGER.info(f"Common CPU used is {common_cpu_model}")
+    return common_cpu_model

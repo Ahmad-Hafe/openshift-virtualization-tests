@@ -1,4 +1,7 @@
+from __future__ import annotations
+
 import logging
+from typing import TYPE_CHECKING
 
 import pytest
 from ocp_resources.kubevirt import KubeVirt
@@ -6,10 +9,18 @@ from ocp_resources.resource import Resource, ResourceEditor
 from timeout_sampler import TimeoutExpiredError, TimeoutSampler
 
 from tests.utils import create_vms
-from utilities.constants import TIMEOUT_5MIN, TIMEOUT_30SEC
+from utilities.constants.timeouts import (
+    TIMEOUT_5MIN,
+    TIMEOUT_30SEC,
+)
 from utilities.hco import ResourceEditorValidateHCOReconcile
 from utilities.infra import ExecCommandOnPod, label_nodes
 from utilities.virt import migrate_vm_and_verify, running_vm
+
+if TYPE_CHECKING:
+    from kubernetes.dynamic import DynamicClient
+
+    from utilities.virt import VirtualMachineForTests
 
 LOGGER = logging.getLogger(__name__)
 
@@ -88,11 +99,16 @@ def wait_for_pages_to_scan_value_to_grow(utility_pods, node, initial_value):
 
 
 @pytest.fixture(scope="class")
-def ksm_enabled_in_hco(hyperconverged_resource_scope_class):
+def ksm_enabled_in_hco(admin_client, hyperconverged_resource_scope_class):
     with ResourceEditorValidateHCOReconcile(
+        admin_client=admin_client,
         patches={
             hyperconverged_resource_scope_class: {
-                "spec": {"ksmConfiguration": {"nodeLabelSelector": {"matchLabels": KERNEL_SAMEPAGE_MERGING_TEST_LABEL}}}
+                "spec": {
+                    "virtualization": {
+                        "ksmConfiguration": {"nodeLabelSelector": {"matchLabels": KERNEL_SAMEPAGE_MERGING_TEST_LABEL}}
+                    }
+                }
             }
         },
         list_resource_reconcile=[KubeVirt],
@@ -144,12 +160,13 @@ def ksm_deactivated_on_node(worker_node1, workers_utility_pods):
 
 
 @pytest.fixture(scope="class")
-def vms_for_ksm_test(namespace):
+def vms_for_ksm_test(namespace, cpu_for_migration):
     # We need several VMs for sharing memory
     vms_list = create_vms(
         name_prefix="ksm-test-vm",
         namespace_name=namespace.name,
         node_selector_labels=KERNEL_SAMEPAGE_MERGING_TEST_LABEL,
+        cpu_model=cpu_for_migration,
     )
     for vm in vms_list:
         running_vm(vm=vm)
@@ -170,7 +187,6 @@ def pages_to_scan_initial_value(worker_node1, workers_utility_pods):
 @pytest.mark.usefixtures(
     "ksm_enabled_in_hco",
     "ksm_label_added_to_worker1",
-    "cluster_cpu_model_scope_class",
     "vms_for_ksm_test",
     "ksm_override_annotation_added_to_worker1",
 )
@@ -194,8 +210,11 @@ class TestKernelSamepageMerging:
     @pytest.mark.rwx_default_storage
     @pytest.mark.polarion("CNV-10523")
     @pytest.mark.dependency(depends=["test_ksm_activated_when_node_under_pressure"])
-    def test_migrate_vm_when_ksm_active(self, ksm_label_added_to_worker2, vms_for_ksm_test):
-        migrate_vm_and_verify(vm=vms_for_ksm_test[0])
+    @pytest.mark.usefixtures("ksm_label_added_to_worker2")
+    def test_migrate_vm_when_ksm_active(
+        self, admin_client: DynamicClient, vms_for_ksm_test: list[VirtualMachineForTests]
+    ):
+        migrate_vm_and_verify(vm=vms_for_ksm_test[0], client=admin_client)
 
     @pytest.mark.polarion("CNV-10524")
     @pytest.mark.dependency(depends=["test_ksm_activated_when_node_under_pressure"])

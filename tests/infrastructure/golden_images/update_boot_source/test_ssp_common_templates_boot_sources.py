@@ -11,15 +11,21 @@ from tests.infrastructure.golden_images.utils import (
     assert_missing_golden_image_pvc,
     assert_os_version_mismatch_in_vm,
 )
-from utilities.artifactory import (
-    cleanup_artifactory_secret_and_config_map,
-    get_artifactory_config_map,
-    get_artifactory_secret,
+from utilities.constants import Images
+from utilities.constants.architecture import MULTIARCH
+from utilities.constants.images import (
+    OS_FLAVOR_FEDORA,
+    ArchImages,
 )
-from utilities.constants import OS_FLAVOR_FEDORA, RHEL9_STR, TIMEOUT_5MIN, TIMEOUT_5SEC, Images
+from utilities.constants.storage import BIND_IMMEDIATE_ANNOTATION
+from utilities.constants.timeouts import (
+    TIMEOUT_5MIN,
+    TIMEOUT_5SEC,
+)
 from utilities.infra import (
     validate_os_info_vmi_vs_linux_os,
 )
+from utilities.storage import construct_datavolume_source_dict
 from utilities.virt import VirtualMachineForTestsFromTemplate, running_vm
 
 LOGGER = logging.getLogger(__name__)
@@ -79,13 +85,28 @@ def auto_update_boot_source_vm(
 
 
 @pytest.fixture()
-def vm_without_boot_source(unprivileged_client, namespace, rhel9_data_source_scope_session):
+def fedora_boot_source_data_source(unprivileged_client, golden_images_namespace):
+    data_source_name = (
+        f"{OS_FLAVOR_FEDORA}-{py_config['cpu_arch']}"
+        if py_config.get("cluster_type") == MULTIARCH
+        else OS_FLAVOR_FEDORA
+    )
+    return DataSource(
+        client=unprivileged_client,
+        name=data_source_name,
+        namespace=golden_images_namespace.name,
+        ensure_exists=True,
+    )
+
+
+@pytest.fixture()
+def vm_without_boot_source(unprivileged_client, namespace, fedora_boot_source_data_source):
     with VirtualMachineForTestsFromTemplate(
-        name=f"{rhel9_data_source_scope_session.name}-vm",
+        name=f"{fedora_boot_source_data_source.name}-vm",
         namespace=namespace.name,
         client=unprivileged_client,
-        labels=template_labels(os="rhel9.0"),
-        data_source=rhel9_data_source_scope_session,
+        labels=template_labels(os=OS_FLAVOR_FEDORA),
+        data_source=fedora_boot_source_data_source,
         non_existing_pvc=True,
     ) as vm:
         vm.start()
@@ -94,45 +115,39 @@ def vm_without_boot_source(unprivileged_client, namespace, rhel9_data_source_sco
 
 
 @pytest.fixture()
-def opted_out_rhel9_data_source(rhel9_data_source_scope_session):
-    LOGGER.info(f"Wait for DataSource {rhel9_data_source_scope_session.name} to opt out")
+def opted_out_fedora_data_source(fedora_boot_source_data_source):
+    LOGGER.info(f"Wait for DataSource {fedora_boot_source_data_source.name} to opt out")
     try:
         for sample in TimeoutSampler(
             wait_timeout=TIMEOUT_5MIN,
             sleep=TIMEOUT_5SEC,
-            func=lambda: rhel9_data_source_scope_session.source.name == RHEL9_STR,
+            func=lambda: fedora_boot_source_data_source.source.name == fedora_boot_source_data_source.name,
         ):
             if sample:
                 return
     except TimeoutExpiredError:
-        LOGGER.error(f"{rhel9_data_source_scope_session.name} DataSource source was not updated.")
+        LOGGER.error(f"{fedora_boot_source_data_source.name} DataSource source was not updated.")
         raise
 
 
 @pytest.fixture()
-def rhel9_dv(admin_client, golden_images_namespace, rhel9_data_source_scope_session, rhel9_http_image_url):
-    artifactory_secret = get_artifactory_secret(namespace=golden_images_namespace.name)
-    artifactory_config_map = get_artifactory_config_map(namespace=golden_images_namespace.name)
+def imported_fedora_dv(admin_client, golden_images_namespace, fedora_boot_source_data_source):
+    fedora_registry_url = f"docker://{getattr(ArchImages, py_config['cpu_arch'].upper()).Fedora.FEDORA_CONTAINER_IMAGE}"
     with DataVolume(
         client=admin_client,
-        name=rhel9_data_source_scope_session.source.name,
+        name=fedora_boot_source_data_source.name,
         namespace=golden_images_namespace.name,
-        url=rhel9_http_image_url,
-        secret=artifactory_secret,
-        cert_configmap=artifactory_config_map.name,
-        source="http",
-        size=Images.Rhel.DEFAULT_DV_SIZE,
-        storage_class=py_config["default_storage_class"],
-        bind_immediate_annotation=True,
         api_name="storage",
+        source_dict=construct_datavolume_source_dict(source="registry", url=fedora_registry_url),
+        size=Images.Fedora.DEFAULT_DV_SIZE,
+        storage_class=py_config["default_storage_class"],
+        annotations=BIND_IMMEDIATE_ANNOTATION,
     ) as dv:
         dv.wait_for_dv_success()
         yield dv
-    cleanup_artifactory_secret_and_config_map(
-        artifactory_secret=artifactory_secret, artifactory_config_map=artifactory_config_map
-    )
 
 
+@pytest.mark.arm64
 @pytest.mark.polarion("CNV-7586")
 def test_vm_from_auto_update_boot_source(
     auto_update_boot_source_vm,
@@ -150,6 +165,7 @@ def test_vm_from_auto_update_boot_source(
 
 
 @pytest.mark.polarion("CNV-7565")
+@pytest.mark.s390x
 def test_common_templates_boot_source_reference(base_templates):
     source_ref_str = "sourceRef"
     LOGGER.info(f"Verify all common templates use {source_ref_str} in dataVolumeTemplates")
@@ -161,14 +177,15 @@ def test_common_templates_boot_source_reference(base_templates):
     assert not failed_templates, f"Some templates do not use {source_ref_str}, templates: {failed_templates}"
 
 
+@pytest.mark.arm64
 @pytest.mark.polarion("CNV-7535")
 def test_vm_with_uploaded_golden_image_opt_out(
     admin_client,
     golden_images_namespace,
     disabled_common_boot_image_import_hco_spec_scope_function,
-    opted_out_rhel9_data_source,
+    opted_out_fedora_data_source,
     vm_without_boot_source,
-    rhel9_dv,
+    imported_fedora_dv,
 ):
-    LOGGER.info(f"Test VM with manually uploaded {rhel9_dv.name} golden image DV")
+    LOGGER.info(f"Test VM with manually uploaded {imported_fedora_dv.name} golden image DV")
     running_vm(vm=vm_without_boot_source)

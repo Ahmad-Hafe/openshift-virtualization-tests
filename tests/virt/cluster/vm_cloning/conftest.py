@@ -6,12 +6,12 @@ from ocp_resources.virtual_machine_cluster_preference import (
     VirtualMachineClusterPreference,
 )
 
-from utilities.constants import (
-    OS_FLAVOR_RHEL,
+from utilities.constants import Images
+from utilities.constants.images import OS_FLAVOR_RHEL
+from utilities.constants.instance_types import (
     RHEL9_PREFERENCE,
     RHEL_WITH_INSTANCETYPE_AND_PREFERENCE,
     U1_SMALL,
-    Images,
 )
 from utilities.virt import (
     VirtualMachineForCloning,
@@ -46,8 +46,8 @@ def rhel_vm_with_instancetype_and_preference_for_cloning(namespace, unprivileged
         image=Images.Rhel.RHEL9_REGISTRY_GUEST_IMG,
         namespace=namespace.name,
         client=unprivileged_client,
-        vm_instance_type=VirtualMachineClusterInstancetype(name=U1_SMALL),
-        vm_preference=VirtualMachineClusterPreference(name=RHEL9_PREFERENCE),
+        vm_instance_type=VirtualMachineClusterInstancetype(client=unprivileged_client, name=U1_SMALL),
+        vm_preference=VirtualMachineClusterPreference(client=unprivileged_client, name=RHEL9_PREFERENCE),
         os_flavor=OS_FLAVOR_RHEL,
     ) as vm:
         running_vm(vm=vm)
@@ -56,16 +56,20 @@ def rhel_vm_with_instancetype_and_preference_for_cloning(namespace, unprivileged
 
 @pytest.fixture()
 def cloning_job_scope_function(request, unprivileged_client, namespace):
-    yield from create_vm_cloning_job(
+    with create_vm_cloning_job(
         name=f"clone-job-{request.param['source_name']}",
         client=unprivileged_client,
         namespace=namespace.name,
         source_name=request.param["source_name"],
         label_filters=request.param.get("label_filters"),
         annotation_filters=request.param.get("annotation_filters"),
-    )
+        volume_name_policy=request.param.get("volume_name_policy"),
+        target_name=request.param.get("target_name"),
+    ) as vmc:
+        yield vmc
 
 
 @pytest.fixture()
 def target_vm_scope_function(unprivileged_client, cloning_job_scope_function):
-    yield from target_vm_from_cloning_job(client=unprivileged_client, cloning_job=cloning_job_scope_function)
+    with target_vm_from_cloning_job(client=unprivileged_client, cloning_job=cloning_job_scope_function) as target_vm:
+        yield target_vm

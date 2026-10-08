@@ -2,6 +2,7 @@
 
 """Pytest configuration for utilities tests - independent of main project"""
 
+import logging
 import os
 import sys
 from pathlib import Path
@@ -10,10 +11,9 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 from ocp_resources import resource
+from pytest_testconfig import config as py_config
 
-import utilities
-
-os.environ["OPENSHIFT_VIRTUALIZATION_TEST_IMAGES_ARCH"] = "x86_64"
+os.environ["OPENSHIFT_VIRTUALIZATION_TEST_IMAGES_ARCH"] = "amd64"
 
 # Add utilities to Python path for imports
 sys.path.insert(0, str(Path(__file__).parent.parent))
@@ -32,6 +32,7 @@ resource.get_client = _mock_get_client  # type: ignore[assignment]
 # Note: utilities.hco is mocked here but test_hco.py will clear it and import real module
 mock_hco = MagicMock()
 mock_infra = MagicMock()
+mock_virt = MagicMock()
 mock_data_collector = MagicMock()
 mock_data_collector.get_data_collector_base_directory = MagicMock(return_value="/tmp/data")
 mock_data_collector.get_data_collector_base = MagicMock(return_value="/tmp/data/")
@@ -42,12 +43,16 @@ mock_jira.JIRA = MagicMock()
 
 sys.modules["utilities.hco"] = mock_hco
 sys.modules["utilities.infra"] = mock_infra
+sys.modules["utilities.virt"] = mock_virt
 sys.modules["utilities.data_collector"] = mock_data_collector
 sys.modules["jira"] = mock_jira
+
+import utilities
 
 # Also set them as attributes of the utilities module for tests that need them
 utilities.hco = mock_hco  # type: ignore[attr-defined]
 utilities.infra = mock_infra  # type: ignore[attr-defined]
+utilities.virt = mock_virt  # type: ignore[attr-defined]
 utilities.data_collector = mock_data_collector  # type: ignore[attr-defined]
 
 
@@ -55,8 +60,6 @@ utilities.data_collector = mock_data_collector  # type: ignore[attr-defined]
 @pytest.fixture(autouse=True)
 def setup_py_config():
     """Setup py_config for tests that need data_collector configuration"""
-    from pytest_testconfig import config as py_config
-
     # Ensure data_collector config is set up
     if "data_collector" not in py_config:
         py_config["data_collector"] = {"data_collector_base_directory": "/tmp/data"}
@@ -76,7 +79,7 @@ def mock_node():
     """Mock Node resource"""
     node = MagicMock()
     node.name = "test-node"
-    node.labels = {"kubernetes.io/arch": "x86_64"}
+    node.labels = {"kubernetes.io/arch": "amd64"}
     node.status = {"conditions": []}
     return node
 
@@ -127,8 +130,6 @@ def mock_vm_no_namespace():
 @pytest.fixture(autouse=True)
 def mock_logger():
     """Auto-mock logger for all tests to prevent logging issues"""
-    import logging
-
     # Save original getLogger to avoid recursion
     original_get_logger = logging.getLogger
 
@@ -157,7 +158,6 @@ def mock_os_images():
     mock_rhel_class = MagicMock()
     mock_rhel_class.LATEST_RELEASE_STR = "rhel-9.6.qcow2"
     mock_rhel_class.DEFAULT_DV_SIZE = "20Gi"
-    mock_rhel_class.RHEL7_9_IMG = "rhel-7.9.qcow2"
     mock_rhel_class.RHEL8_10_IMG = "rhel-8.10.qcow2"
     mock_rhel_class.RHEL9_5_IMG = "rhel-9.5.qcow2"
     mock_rhel_class.RHEL9_6_IMG = "rhel-9.6.qcow2"
@@ -167,9 +167,7 @@ def mock_os_images():
     mock_windows_class = MagicMock()
     mock_windows_class.LATEST_RELEASE_STR = "win2k25.qcow2"
     mock_windows_class.DEFAULT_DV_SIZE = "60Gi"
-    mock_windows_class.WIN10_IMG = "win10.qcow2"
     mock_windows_class.WIN11_IMG = "win11.qcow2"
-    mock_windows_class.WIN2k16_IMG = "win2k16.qcow2"
     mock_windows_class.WIN2k19_IMG = "win2k19.qcow2"
     mock_windows_class.WIN2022_IMG = "win2022.qcow2"
     mock_windows_class.WIN2k25_IMG = "win2k25.qcow2"

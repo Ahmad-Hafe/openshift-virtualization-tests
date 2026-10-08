@@ -1,4 +1,7 @@
+from __future__ import annotations
+
 import shlex
+from typing import TYPE_CHECKING
 
 import pytest
 from ocp_resources.datavolume import DataVolume
@@ -15,10 +18,13 @@ from tests.virt.cluster.vm_cloning.utils import (
     assert_target_vm_has_new_pvc_disks,
     check_if_files_present_after_cloning,
 )
-from utilities.constants import RHEL_WITH_INSTANCETYPE_AND_PREFERENCE, Images
+from utilities.constants import Images
+from utilities.constants.instance_types import RHEL_WITH_INSTANCETYPE_AND_PREFERENCE
+from utilities.constants.timeouts import TIMEOUT_2MIN
 from utilities.storage import (
     add_dv_to_vm,
-    check_disk_count_in_vm,
+    assert_guest_disk_count,
+    construct_datavolume_source_dict,
 )
 from utilities.virt import (
     VirtualMachineForCloning,
@@ -27,6 +33,9 @@ from utilities.virt import (
     running_vm,
     target_vm_from_cloning_job,
 )
+
+if TYPE_CHECKING:
+    from kubernetes.dynamic import DynamicClient
 
 LABEL_TO_COPY_STR = "label-to-copy"
 LABEL_TO_EXCLUDE_STR = "label-to-exclude"
@@ -39,13 +48,15 @@ RHEL_VM_WITH_TWO_PVC = "rhel-vm-with-two-pvc"
 WINDOWS_VM_FOR_CLONING = "win-vm-for-cloning"
 FEDORA_VM_FOR_CLONING = "fedora-vm-with-labels-annotations-mac-smbios"
 
+TARGET_NAME_PREFIX = "unique-target-name"
+
 
 def dummy_dv_dict_for_vm_cloning(client, namespace):
     dv = DataVolume(
         name="dummy-dv-for-clone",
         client=client,
         namespace=namespace.name,
-        source="blank",
+        source_dict=construct_datavolume_source_dict(source="blank"),
         size="10Gi",
         storage_class=py_config["default_storage_class"],
         api_name="storage",
@@ -103,14 +114,15 @@ def files_created_on_pvc_disks(vm_with_dv_for_cloning):
         host=vm_with_dv_for_cloning.ssh_exec,
         commands=[
             # create file on root disk
-            shlex.split(f"echo 'TEST' > {ROOT_DISK_TEST_FILE_STR}"),
+            shlex.split(f"echo 'TEST' > {ROOT_DISK_TEST_FILE_STR} && sync"),
             # create partition and file on second disk
             shlex.split(f"sudo mkfs.ext4 {SECOND_DISK_PATH}"),
             shlex.split(f"sudo mount {SECOND_DISK_PATH} /mnt"),
-            shlex.split(f"echo 'TEST' | sudo tee {SECOND_DISK_TEST_FILE_STR}"),
+            shlex.split(f"echo 'TEST' | sudo tee {SECOND_DISK_TEST_FILE_STR} && sync"),
             # update selinux: allow snapshot for second disk
             shlex.split("sudo setsebool -P virt_qemu_ga_read_nonsecurity_files 1"),
         ],
+        wait_timeout=TIMEOUT_2MIN,
     )
 
 
@@ -125,6 +137,7 @@ def fedora_target_vm_instance(fedora_target_vm):
     yield fedora_target_vm.instance
 
 
+@pytest.mark.s390x
 @pytest.mark.parametrize(
     "golden_image_data_source_for_test_scope_function, vm_with_dv_for_cloning, cloning_job_scope_function",
     [
@@ -135,7 +148,11 @@ def fedora_target_vm_instance(fedora_target_vm):
                 "memory_guest": Images.Rhel.DEFAULT_MEMORY_SIZE,
                 "extra_dv": True,
             },
-            {"source_name": RHEL_VM_WITH_TWO_PVC},
+            {
+                "source_name": RHEL_VM_WITH_TWO_PVC,
+                "volume_name_policy": "PrefixTargetName",
+                "target_name": TARGET_NAME_PREFIX,
+            },
             marks=(pytest.mark.polarion("CNV-10295"), pytest.mark.gating()),
         )
     ],
@@ -147,11 +164,14 @@ def test_clone_vm_two_pvc_disks(
     cloning_job_scope_function,
     target_vm_scope_function,
 ):
-    assert_target_vm_has_new_pvc_disks(source_vm=vm_with_dv_for_cloning, target_vm=target_vm_scope_function)
-    check_disk_count_in_vm(vm=target_vm_scope_function)
+    assert_target_vm_has_new_pvc_disks(
+        source_vm=vm_with_dv_for_cloning, target_vm=target_vm_scope_function, prefix=TARGET_NAME_PREFIX
+    )
+    assert_guest_disk_count(vm=target_vm_scope_function)
     check_if_files_present_after_cloning(vm=target_vm_scope_function)
 
 
+@pytest.mark.s390x
 @pytest.mark.parametrize(
     "cloning_job_scope_function",
     [
@@ -167,7 +187,7 @@ def test_clone_vm_with_instance_type_and_preference(
     cloning_job_scope_function,
     target_vm_scope_function,
 ):
-    check_disk_count_in_vm(vm=target_vm_scope_function)
+    assert_guest_disk_count(vm=target_vm_scope_function)
 
 
 @pytest.mark.parametrize(
@@ -186,7 +206,11 @@ def test_clone_vm_with_instance_type_and_preference(
                 "memory_guest": Images.Windows.DEFAULT_MEMORY_SIZE,
                 "cpu_cores": Images.Windows.DEFAULT_CPU_CORES,
             },
-            {"source_name": WINDOWS_VM_FOR_CLONING},
+            {
+                "source_name": WINDOWS_VM_FOR_CLONING,
+                "volume_name_policy": "PrefixTargetName",
+                "target_name": TARGET_NAME_PREFIX,
+            },
             marks=pytest.mark.polarion("CNV-10296"),
         )
     ],
@@ -195,12 +219,15 @@ def test_clone_vm_with_instance_type_and_preference(
 @pytest.mark.ibm_bare_metal
 @pytest.mark.special_infra
 @pytest.mark.high_resource_vm
+@pytest.mark.windows
 def test_clone_windows_vm(
     vm_with_dv_for_cloning,
     cloning_job_scope_function,
     target_vm_scope_function,
 ):
-    assert_target_vm_has_new_pvc_disks(source_vm=vm_with_dv_for_cloning, target_vm=target_vm_scope_function)
+    assert_target_vm_has_new_pvc_disks(
+        source_vm=vm_with_dv_for_cloning, target_vm=target_vm_scope_function, prefix=TARGET_NAME_PREFIX
+    )
 
 
 @pytest.mark.parametrize(
@@ -227,6 +254,7 @@ def test_clone_windows_vm(
     indirect=True,
 )
 @pytest.mark.arm64
+@pytest.mark.s390x
 @pytest.mark.gating
 @pytest.mark.usefixtures(
     "fedora_vm_for_cloning",
@@ -238,7 +266,7 @@ class TestVMCloneAndMigrate:
         self,
         fedora_target_vm,
     ):
-        check_disk_count_in_vm(vm=fedora_target_vm)
+        assert_guest_disk_count(vm=fedora_target_vm)
 
     @pytest.mark.polarion("CNV-10352")
     def test_check_labels_on_clone(self, fedora_target_vm_instance):
@@ -278,8 +306,8 @@ class TestVMCloneAndMigrate:
         )
 
     @pytest.mark.polarion("CNV-10320")
-    def test_migrate_the_vm_clone(self, fedora_target_vm):
-        migrate_vm_and_verify(vm=fedora_target_vm)
+    def test_migrate_the_vm_clone(self, admin_client: DynamicClient, fedora_target_vm: VirtualMachineForCloning):
+        migrate_vm_and_verify(vm=fedora_target_vm, client=admin_client)
 
     @pytest.mark.parametrize(
         "cloning_job_scope_function",
@@ -296,4 +324,4 @@ class TestVMCloneAndMigrate:
     )
     @pytest.mark.polarion("CNV-10294")
     def test_clone_vm_with_clone_as_source(self, cloning_job_scope_function, target_vm_scope_function):
-        check_disk_count_in_vm(vm=target_vm_scope_function)
+        assert_guest_disk_count(vm=target_vm_scope_function)

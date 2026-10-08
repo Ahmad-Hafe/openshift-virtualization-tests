@@ -2,7 +2,8 @@ import pytest
 from ocp_resources.kubevirt import KubeVirt
 from ocp_resources.virtual_machine import VirtualMachine
 
-from utilities.constants import ARM_64, HCO_DEFAULT_CPU_MODEL_KEY
+from utilities.constants.architecture import ARM_64
+from utilities.constants.hco import HCO_DEFAULT_CPU_MODEL_KEY
 from utilities.hco import ResourceEditorValidateHCOReconcile
 from utilities.virt import VirtualMachineForTests, fedora_vm_body, running_vm
 
@@ -14,7 +15,7 @@ pytestmark = [pytest.mark.post_upgrade, pytest.mark.sno, pytest.mark.arm64, pyte
 
 
 def assert_updated_hco_default_cpu_model(hco_resource, expected_cpu_model):
-    hco_cpu_model = hco_resource.instance.spec.get(HCO_DEFAULT_CPU_MODEL_KEY)
+    hco_cpu_model = hco_resource.instance.spec.virtualization.virtualMachineOptions.get(HCO_DEFAULT_CPU_MODEL_KEY)
     assert hco_cpu_model == expected_cpu_model, (
         f"HCO CPU model: '{hco_cpu_model}' doesn't match with expected CPU model: '{expected_cpu_model}"
     )
@@ -28,7 +29,7 @@ def assert_vmi_cpu_model(vmi_resource, expected_cpu_model):
 
 
 def assert_kubevirt_cpu_model(kubevirt_resource, hco_resource):
-    hco_cpu_model = hco_resource.instance.spec.get(HCO_DEFAULT_CPU_MODEL_KEY)
+    hco_cpu_model = hco_resource.instance.spec.virtualization.virtualMachineOptions.get(HCO_DEFAULT_CPU_MODEL_KEY)
     kubevirt_cpu_model = kubevirt_resource.instance.spec.configuration.get(KUBEVIRT_CPU_MODEL_KEY)
     assert kubevirt_cpu_model == hco_cpu_model, (
         f"Kubevirt CPU model '{kubevirt_cpu_model}' doesn't match with the expected CPU model '{hco_cpu_model}'"
@@ -74,14 +75,20 @@ def fedora_vm_scope_function(unprivileged_client, namespace):
 
 @pytest.fixture()
 def hco_with_default_cpu_model_set(
+    admin_client,
     hyperconverged_resource_scope_function,
     cluster_common_node_cpu,
 ):
     with ResourceEditorValidateHCOReconcile(
+        admin_client=admin_client,
         patches={
             hyperconverged_resource_scope_function: {
                 "spec": {
-                    HCO_DEFAULT_CPU_MODEL_KEY: cluster_common_node_cpu,
+                    "virtualization": {
+                        "virtualMachineOptions": {
+                            HCO_DEFAULT_CPU_MODEL_KEY: cluster_common_node_cpu,
+                        },
+                    },
                 },
             }
         },
@@ -104,7 +111,8 @@ def test_default_value_for_cpu_model(
     and for VMI should be 'host-model' for AMD64 cluster and
     'host-passthrough' for ARM64 cluster
     """
-    assert HCO_DEFAULT_CPU_MODEL_KEY not in hco_spec_scope_module, (
+    hco_virtual_machine_options = hco_spec_scope_module.get("virtualization", {}).get("virtualMachineOptions", {})
+    assert HCO_DEFAULT_CPU_MODEL_KEY not in hco_virtual_machine_options, (
         f"HCO is not expected to contain default value for '{HCO_DEFAULT_CPU_MODEL_KEY}', "
         f"HCO spec values are: {hco_spec_scope_module}"
     )

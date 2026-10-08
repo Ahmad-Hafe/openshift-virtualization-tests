@@ -2,14 +2,13 @@ import pytest
 from ocp_resources.network_addons_config import NetworkAddonsConfig
 from ocp_resources.resource import ResourceEditor
 
-from utilities.constants import KMP_VM_ASSIGNMENT_LABEL, LINUX_BRIDGE
+from tests.network.kubemacpool import utils as kmp_utils
+from utilities.constants.networking import KMP_VM_ASSIGNMENT_LABEL, LINUX_BRIDGE
 from utilities.data_utils import name_prefix
 from utilities.hco import ResourceEditorValidateHCOReconcile
 from utilities.infra import create_ns, get_node_selector_dict
 from utilities.network import network_device, network_nad
 from utilities.virt import VirtualMachineForTests, fedora_vm_body
-
-from . import utils as kmp_utils
 
 
 @pytest.fixture(scope="module")
@@ -19,17 +18,18 @@ def kubemacpool_bridge_device_name(index_number):
 
 @pytest.fixture(scope="module")
 def kubemacpool_bridge_device_worker_1(
+    nmstate_dependent_placeholder,
     admin_client,
     worker_node1,
     kubemacpool_bridge_device_name,
-    nodes_available_nics,
+    hosts_common_available_ports,
 ):
     with network_device(
         interface_type=LINUX_BRIDGE,
         nncp_name=f"kubemacpool-{name_prefix(worker_node1.name)}",
         interface_name=kubemacpool_bridge_device_name,
         node_selector=get_node_selector_dict(node_selector=worker_node1.hostname),
-        ports=[nodes_available_nics[worker_node1.name][-1]],
+        ports=[hosts_common_available_ports[-1]],
         client=admin_client,
     ) as dev:
         yield dev
@@ -37,17 +37,18 @@ def kubemacpool_bridge_device_worker_1(
 
 @pytest.fixture(scope="module")
 def kubemacpool_bridge_device_worker_2(
+    nmstate_dependent_placeholder,
     admin_client,
     worker_node2,
     kubemacpool_bridge_device_name,
-    nodes_available_nics,
+    hosts_common_available_ports,
 ):
     with network_device(
         interface_type=LINUX_BRIDGE,
         nncp_name=f"kubemacpool-{name_prefix(worker_node2.name)}",
         interface_name=kubemacpool_bridge_device_name,
         node_selector=get_node_selector_dict(node_selector=worker_node2.hostname),
-        ports=[nodes_available_nics[worker_node2.name][-1]],
+        ports=[hosts_common_available_ports[-1]],
         client=admin_client,
     ) as dev:
         yield dev

@@ -13,10 +13,12 @@ from tests.os_params import (
     WINDOWS_LATEST,
     WINDOWS_LATEST_LABELS,
 )
-from utilities.constants import (
-    LINUX_STR,
+from utilities.constants.images import (
     OS_FLAVOR_RHEL,
     OS_FLAVOR_WINDOWS,
+)
+from utilities.constants.instance_types import LINUX_STR
+from utilities.constants.timeouts import (
     TIMEOUT_2MIN,
     TIMEOUT_5MIN,
     TIMEOUT_30MIN,
@@ -97,7 +99,11 @@ def restarted_persistence_vm(request, persistence_vm):
 
 
 def get_linux_timezone(ssh_exec):
-    return run_ssh_commands(host=ssh_exec, commands=shlex.split("timedatectl show | grep -i timezone"))[0]
+    return run_ssh_commands(
+        host=ssh_exec,
+        commands=shlex.split("timedatectl show | grep -i timezone"),
+        wait_timeout=TIMEOUT_2MIN,
+    )[0]
 
 
 def get_timezone(vm, os):
@@ -192,6 +198,7 @@ def verify_changes(vm, os):
     indirect=True,
 )
 class TestRestartPersistenceLinux:
+    @pytest.mark.s390x
     @pytest.mark.parametrize(
         "changed_os_preferences, restarted_persistence_vm",
         [
@@ -226,6 +233,7 @@ class TestRestartPersistenceLinux:
 )
 @pytest.mark.special_infra
 @pytest.mark.high_resource_vm
+@pytest.mark.windows
 class TestRestartPersistenceWindows:
     @pytest.mark.parametrize(
         "changed_os_preferences, restarted_persistence_vm",

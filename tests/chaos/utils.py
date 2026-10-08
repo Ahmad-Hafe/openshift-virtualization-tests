@@ -3,12 +3,13 @@ import json
 import logging
 import multiprocessing
 import random
+import threading
 import time
 from contextlib import contextmanager
-from datetime import datetime
-from multiprocessing.context import ForkContext
+from datetime import UTC, datetime
 
 from kubernetes.dynamic.exceptions import ResourceNotFoundError
+from ocp_resources.daemonset import DaemonSet
 from ocp_resources.deployment import Deployment
 from ocp_resources.node import Node
 from ocp_resources.pod import Pod
@@ -19,10 +20,9 @@ from ocp_resources.virtual_machine_cluster_instancetype import (
 from pytest_testconfig import py_config
 from timeout_sampler import TimeoutExpiredError, TimeoutSampler, TimeoutWatch
 
-from utilities.constants import (
-    DEFAULT_HCO_CONDITIONS,
-    MIGRATION_POLICY_VM_LABEL,
-    PORT_80,
+from utilities.constants.hco import DEFAULT_HCO_CONDITIONS
+from utilities.constants.networking import PORT_80
+from utilities.constants.timeouts import (
     TIMEOUT_1MIN,
     TIMEOUT_2MIN,
     TIMEOUT_5MIN,
@@ -30,7 +30,9 @@ from utilities.constants import (
     TIMEOUT_10MIN,
     TIMEOUT_10SEC,
     TIMEOUT_30MIN,
+    TIMEOUT_30SEC,
 )
+from utilities.constants.virt import MIGRATION_POLICY_VM_LABEL
 from utilities.data_collector import write_to_file
 from utilities.infra import (
     ExecCommandOnPod,
@@ -45,14 +47,11 @@ from utilities.infra import (
 )
 from utilities.virt import VirtualMachineForTests, fedora_vm_body, running_vm
 
-# Use fork context to avoid pickling issues with nested functions
-_FORK_CONTEXT: ForkContext = multiprocessing.get_context("fork")
-
 LOGGER = logging.getLogger(__name__)
 
 
 def create_pod_deleting_process(
-    dyn_client,
+    client,
     pod_prefix,
     namespace_name,
     ratio,
@@ -64,7 +63,7 @@ def create_pod_deleting_process(
     continuously deletes pods for a certain amount of time or until the process is stopped.
 
     Args:
-        dyn_client (DynamicClient)
+        client (DynamicClient)
         pod_prefix (str): Pod name prefix used to find the pods to be deleted.
         namespace_name (str): Name of the namespace were the pods to be deleted live.
         ratio (float): Percentage of pods to be deleted (expressed as a fraction between 0 and 1).
@@ -73,73 +72,28 @@ def create_pod_deleting_process(
 
     Returns:
         multiprocessing.Process: Process that continuously deletes pods.
-
-    Example:
-        pod_deleting_process = create_pod_deleting_process(
-            dyn_client=admin_client, pod_prefix="apiserver",
-            namespace_name="openshift-apiserver", ratio=0.5, interval=5, max_duration=180
-        )
-        pod_deleting_process.start()
-        ...
-        pod_deleting_process.terminate()
     """
 
-    def _choose_surviving_pods(dyn_client, pod_prefix, namespace_name, ratio):
-        initial_pods = get_pod_by_name_prefix(
-            dyn_client=dyn_client,
-            pod_prefix=pod_prefix,
-            namespace=namespace_name,
-            get_all=True,
-        )
-        number_of_deleted_pods = round(number=ratio * len(initial_pods))
-        LOGGER.info(f"Number of pods to delete: {number_of_deleted_pods} out of {len(initial_pods)}.")
-        surviving_pods = [
-            pod for pod in random.sample(population=initial_pods, k=len(initial_pods) - number_of_deleted_pods)
-        ]
-        LOGGER.info(f"Surviving pods: {[pod.name for pod in surviving_pods]}")
-
-        return surviving_pods
-
-    def _delete_pods(dyn_client, pod_prefix, namespace_name, surviving_pods):
-        deleted_pods = get_pod_by_name_prefix(
-            dyn_client=dyn_client,
-            pod_prefix=pod_prefix,
-            namespace=namespace_name,
-            get_all=True,
-        )
-        for pod in deleted_pods:
-            if pod.name not in [surviving_pod.name for surviving_pod in surviving_pods]:
-                # Set the log level to ERROR to avoid cluttering the console with the logs resulting from pod deletion
-                with resource_log_level_error(resource=pod) as _pod:
-                    _pod.delete()
-
-    def _delete_pods_continuously(dyn_client, pod_prefix, namespace_name, ratio, interval, max_duration):
-        surviving_pods = _choose_surviving_pods(
-            dyn_client=dyn_client,
-            pod_prefix=pod_prefix,
-            namespace_name=namespace_name,
-            ratio=ratio,
-        )
-
+    def _delete_pods_continuously(client, pod_prefix, namespace_name, ratio, interval, max_duration):
         try:
             for _ in TimeoutSampler(
                 wait_timeout=max_duration,
                 sleep=interval,
-                func=_delete_pods,
-                dyn_client=dyn_client,
+                func=delete_pods,
+                _client=client,
                 pod_prefix=pod_prefix,
                 namespace_name=namespace_name,
-                surviving_pods=surviving_pods,
+                ratio=ratio,
             ):
                 pass
         except TimeoutExpiredError:
             LOGGER.info("Pod deleting process finished.")
 
-    return _FORK_CONTEXT.Process(
+    return multiprocessing.Process(
         name="pod_delete",
         target=_delete_pods_continuously,
         args=(
-            dyn_client,
+            client,
             pod_prefix,
             namespace_name,
             ratio,
@@ -185,11 +139,11 @@ def create_nginx_monitoring_process(
         timeout_watch = TimeoutWatch(timeout=_sampling_duration)
         while timeout_watch.remaining_time() > 0:
             if not is_http_ok(utility_pods=_utility_pods, node=_control_plane_host_node, url=_url):
-                raise Exception("Wrong status code from server.")
+                raise RuntimeError(f"HTTP health check failed for URL {_url}: expected status 200 (OK).")
             time.sleep(_sampling_interval)
         LOGGER.info("HTTP querying finished successfully.")
 
-    return _FORK_CONTEXT.Process(
+    return multiprocessing.Process(
         name="nginx_monitoring",
         target=_monitor_nginx_server,
         args=(
@@ -206,7 +160,7 @@ def create_nginx_monitoring_process(
 def get_pods_status(admin_client, namespaces):
     pods_status = {"pod_status": {}}
     for namespace in namespaces:
-        pods = get_pods(dyn_client=admin_client, namespace=namespace)
+        pods = get_pods(client=admin_client, namespace=namespace)
         pods_status["pod_status"][namespace.name] = {}
         for pod in pods:
             # Set the log level to ERROR to avoid cluttering the console
@@ -250,9 +204,9 @@ def get_daemonset_replicas(admin_client, namespaces):
     return daemonsets_replicas
 
 
-def get_nodes_status():
+def get_nodes_status(client):
     nodes_status = {"nodes": {}}
-    for node in Node.get():
+    for node in Node.get(client=client):
         # Set loglevel to ERROR to avoid cluttering with the logs resulting from getting node status
         with resource_log_level_error(resource=node) as _node:
             nodes_status["nodes"][node.name] = "ready" if _node.kubelet_ready else "not ready"
@@ -279,12 +233,12 @@ def collect_cluster_health_info(client, hco_namespace, additional_namespaces):
     pods_status = get_pods_status(admin_client=client, namespaces=namespaces_to_monitor)
     deployments_replicas = get_deployment_replicas(admin_client=client, namespaces=namespaces_to_monitor)
     daemonset_replicas = get_daemonset_replicas(admin_client=client, namespaces=namespaces_to_monitor)
-    nodes_status = get_nodes_status()
+    nodes_status = get_nodes_status(client=client)
     hco_status_conditions = get_hyperconverged_status_conditions(client=client, hco_namespace=hco_namespace)
 
     log_content = json.dumps(
         {
-            f"{datetime.utcnow().strftime('%Y/%m/%d %H:%M:%S')}": [
+            f"{datetime.now(tz=UTC).strftime('%Y/%m/%d %H:%M:%S')}": [
                 pods_status,
                 deployments_replicas,
                 daemonset_replicas,
@@ -320,7 +274,7 @@ def create_cluster_monitoring_process(
             )
             time.sleep(interval)
 
-    return _FORK_CONTEXT.Process(
+    return multiprocessing.Process(
         name="cluster_monitoring",
         target=_monitor_cluster,
     )
@@ -392,30 +346,207 @@ def rebooting_node(node, utility_pods):
     wait_for_node_status(node=node, status=True, wait_timeout=TIMEOUT_10MIN)
 
 
-def pod_deleting_process_recover(resource, namespace, pod_prefix):
+def pod_deleting_process_recover(resources, namespace, pod_prefix):
     """
-    This function will make sure that the pods for the affected deployment recover after the test.
+    Wait for affected workloads to recover after pod deletion.
+
+    This helper ensures that pods belonging to the given Kubernetes workloads
+    (Deployment or DaemonSet) recover after a pod-deleting test. The function
+    polls the workloads until they report a healthy state.
+
+    Args:
+        resources (list[Union[Deployment, DaemonSet]]):
+            A list of Deployment/DaemonSet resource types to be checked.
+        namespace (str):
+            Namespace in which the workloads reside.
+        pod_prefix (str):
+            Name prefix used to locate affected workloads.
+
+    Raises:
+        ValueError:
+            If any resource is not a Deployment or DaemonSet.
+        ResourceNotFoundError:
+            If no matching workloads are found in the given namespace.
     """
-    resource_objs = get_resources_by_name_prefix(
-        prefix=pod_prefix,
-        namespace=namespace,
-        api_resource_name=resource,
-    )
-    if not resource_objs:
+    if not isinstance(resources, list):
+        raise TypeError("resources must be a list of Deployment or DaemonSet")
+
+    for resource in resources:
+        if resource.kind not in (Deployment.kind, DaemonSet.kind):
+            raise ValueError(
+                f"Unsupported resource type {resource.kind} for pod recovery. "
+                "Only Deployment or DaemonSet is supported."
+            )
+
+    found_any = False
+
+    for resource in resources:
+        resource_objs = get_resources_by_name_prefix(
+            prefix=pod_prefix,
+            namespace=namespace,
+            api_resource_name=resource,
+        )
+        if not resource_objs:
+            LOGGER.info(f"No {resource.kind} found with prefix {pod_prefix} in namespace {namespace}")
+            continue
+
+        found_any = True
+
+        for resource_obj in resource_objs:
+            if resource_obj.kind == Deployment.kind:
+                LOGGER.info(f"Waiting for Deployment {resource_obj.name} to recover replicas")
+                resource_obj.wait_for_replicas()
+
+            elif resource_obj.kind == DaemonSet.kind:
+                LOGGER.info(f"Waiting for DaemonSet {resource_obj.name} to recover")
+                resource_obj.wait_until_deployed()
+
+    if found_any:
+        LOGGER.info("Pod recovery process completed successfully.")
+    else:
         raise ResourceNotFoundError(f"No resources found with prefix {pod_prefix} in namespace {namespace}")
 
-    for resource_obj in resource_objs:
-        if resource_obj.kind == Deployment.kind:
-            resource_obj.wait_for_replicas()
 
-    LOGGER.info("Pod recovery process completed successfully.")
-
-
-def get_instance_type(name):
+def get_instance_type(name, client):
     """
     Function to check if the instance type exists
     """
-    instance_type = VirtualMachineClusterInstancetype(name=name)
+    instance_type = VirtualMachineClusterInstancetype(client=client, name=name)
     if not instance_type.exists:
         raise ResourceNotFoundError(f"Required instance type {name} does not exist")
     return instance_type
+
+
+def delete_pods(client, pod_prefix, namespace_name, ratio):
+    """Delete a ratio of pods matching the given prefix in a namespace.
+
+    This function lists all pods whose names start with ``pod_prefix`` in the
+    specified namespace, randomly selects a subset based on ``ratio``,
+    deletes them, and waits for deletion.
+
+    Args:
+        client: OpenShift/Kubernetes client used to query and delete pods.
+        pod_prefix (str): Prefix of pod names to match.
+        namespace_name (str): Namespace where pods are located.
+        ratio (float): Fraction of pods to delete (0 < ratio <= 1).
+
+    Raises:
+        ResourceNotFoundError: If no matching pods are found.
+    """
+    pods = get_pod_by_name_prefix(
+        client=client,
+        pod_prefix=pod_prefix,
+        namespace=namespace_name,
+        get_all=True,
+    )
+
+    if not pods:
+        LOGGER.error(f"No pods found with prefix {pod_prefix} in namespace {namespace_name}")
+        raise ResourceNotFoundError(f"No pods found with prefix {pod_prefix} in namespace {namespace_name}")
+
+    delete_count = max(1, round(ratio * len(pods)))
+    pods_to_delete = random.sample(population=pods, k=min(delete_count, len(pods)))
+
+    LOGGER.info(f"Deleting {len(pods_to_delete)} out of {len(pods)} pods: {[pod.name for pod in pods_to_delete]}")
+
+    for pod in pods_to_delete:
+        LOGGER.info(f"Deleting pod {pod.name}")
+        pod.clean_up()
+
+        try:
+            pod.wait_deleted(timeout=TIMEOUT_30SEC)
+        except TimeoutExpiredError:
+            LOGGER.warning(f"Pod {pod.name} was not deleted")
+
+
+def delete_pods_continuously(
+    stop_event,
+    client,
+    pod_prefix,
+    namespace_name,
+    ratio,
+    interval,
+    max_duration,
+):
+    """Continuously delete pods until stopped or max duration is reached.
+
+    This function repeatedly deletes pods matching ``pod_prefix`` every
+    ``interval`` seconds until either ``stop_event`` is set or
+    ``max_duration`` is exceeded.
+
+    Intended to be executed in a background thread.
+
+    Args:
+        stop_event (threading.Event): Event used to signal termination.
+        client: OpenShift/Kubernetes client.
+        pod_prefix (str): Prefix of pod names to match.
+        namespace_name (str): Namespace where pods are located.
+        ratio (float): Fraction of pods to delete each iteration.
+        interval (int): Seconds to wait between deletion rounds.
+        max_duration (int): Maximum total runtime in seconds.
+    """
+    start_time = time.time()
+
+    while not stop_event.is_set():
+        if time.time() - start_time > max_duration:
+            LOGGER.info("Pod deleting process finished (max_duration reached)")
+            break
+
+        try:
+            delete_pods(
+                client=client,
+                pod_prefix=pod_prefix,
+                namespace_name=namespace_name,
+                ratio=ratio,
+            )
+        except ResourceNotFoundError:
+            LOGGER.info(f"No pods found with prefix {pod_prefix} in this iteration")
+
+        stop_event.wait(timeout=interval)
+
+
+def create_pod_deleting_thread(
+    client,
+    pod_prefix,
+    namespace_name,
+    ratio,
+    interval=TIMEOUT_5SEC,
+    max_duration=TIMEOUT_1MIN,
+):
+    """Create a background thread for continuous pod deletion.
+
+    The returned thread is configured but NOT started. Call ``thread.start()``
+    to begin deleting pods. Pod deletion can be stopped by calling
+    ``stop_event.set()``.
+
+    Args:
+        client: OpenShift/Kubernetes client.
+        pod_prefix (str): Prefix of pod names to match.
+        namespace_name (str): Namespace where pods are located.
+        ratio (float): Fraction of pods to delete each iteration.
+        interval (int, optional): Seconds between deletion rounds.
+        max_duration (int, optional): Maximum total runtime in seconds.
+
+    Returns:
+        tuple:
+            threading.Thread: Daemon thread executing pod deletion.
+            threading.Event: Event used to signal the thread to stop.
+    """
+    stop_event = threading.Event()
+
+    thread = threading.Thread(
+        name="pod_delete",
+        target=delete_pods_continuously,
+        args=(
+            stop_event,
+            client,
+            pod_prefix,
+            namespace_name,
+            ratio,
+            interval,
+            max_duration,
+        ),
+        daemon=True,
+    )
+
+    return thread, stop_event

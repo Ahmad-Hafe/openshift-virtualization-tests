@@ -92,7 +92,7 @@ Apply pytest's `xfail` marker with `run=False`, for example:
 
 ```python
 import pytest
-from utilities.constants import QUARANTINED
+from utilities.constants.pytest import QUARANTINED
 
 
 @pytest.mark.xfail(
@@ -171,6 +171,22 @@ Understanding this distinction is critical:
 - `pytest.mark.xfail` - For quarantine marking
 - `pytest_jira` - For conditional skipping when bugs are open
 - `pytest-repeat` - For stability verification (de-quarantine)
+
+**Selecting quarantined tests:**
+
+Tests marked with `@pytest.mark.xfail(reason=f"{QUARANTINED}: ...", run=False)` automatically
+receive a `quarantined` pytest marker during collection. This enables:
+
+```bash
+# Run only quarantined tests (e.g., to verify fixes)
+pytest -m quarantined
+
+# Exclude quarantined tests
+pytest -m "not quarantined"
+
+# Combine with other markers
+pytest -m "quarantined and storage"
+```
 
 ### Pull Request Requirements
 

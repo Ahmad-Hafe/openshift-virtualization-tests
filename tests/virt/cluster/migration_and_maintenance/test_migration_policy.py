@@ -1,8 +1,12 @@
+from __future__ import annotations
+
+from typing import TYPE_CHECKING
+
 import pytest
 from ocp_resources.migration_policy import MigrationPolicy
 from ocp_resources.resource import ResourceEditor
 
-from utilities.constants import MIGRATION_POLICY_VM_LABEL
+from utilities.constants.virt import MIGRATION_POLICY_VM_LABEL
 from utilities.infra import label_project
 from utilities.virt import (
     VirtualMachineForTests,
@@ -10,6 +14,11 @@ from utilities.virt import (
     migrate_vm_and_verify,
     running_vm,
 )
+
+if TYPE_CHECKING:
+    from kubernetes.dynamic import DynamicClient
+
+pytestmark = pytest.mark.data_collector_scope(scope="module")
 
 NAMESPACE_LABEL = {"awesome-namespace-label": ""}
 
@@ -43,8 +52,9 @@ def assert_applied_migration_configuration(vmi, migration_policy):
     assert not wrong_values, f"Wrong values applied: \n{wrong_values}"
 
 
-def create_migration_policy(request):
+def create_migration_policy(request, admin_client):
     with MigrationPolicy(
+        client=admin_client,
         name=request.param.get("name", "migration-policy"),
         allow_auto_converge=request.param.get("allowAutoConverge"),
         bandwidth_per_migration=request.param.get("bandwidthPerMigration"),
@@ -68,18 +78,19 @@ def labeled_namespace(request, admin_client, namespace):
 
 
 @pytest.fixture()
-def migration_policy_a(request):
-    yield from create_migration_policy(request=request)
+def migration_policy_a(request, admin_client):
+    yield from create_migration_policy(request=request, admin_client=admin_client)
 
 
 @pytest.fixture()
-def migration_policy_b(request):
-    yield from create_migration_policy(request=request)
+def migration_policy_b(request, admin_client):
+    yield from create_migration_policy(request=request, admin_client=admin_client)
 
 
 @pytest.fixture()
 def vm_for_migration_policy_test(
     request,
+    unprivileged_client,
     namespace,
     cpu_for_migration,
 ):
@@ -87,6 +98,7 @@ def vm_for_migration_policy_test(
     with VirtualMachineForTests(
         name=name,
         namespace=namespace.name,
+        client=unprivileged_client,
         body=fedora_vm_body(name=name),
         additional_labels=request.param,
         cpu_model=cpu_for_migration,
@@ -96,18 +108,26 @@ def vm_for_migration_policy_test(
 
 
 @pytest.fixture()
-def vm_migrated_with_policy(vm_for_migration_policy_test):
-    migrate_vm_and_verify(vm=vm_for_migration_policy_test)
+def vm_migrated_with_policy(
+    admin_client: DynamicClient, vm_for_migration_policy_test: VirtualMachineForTests
+) -> VirtualMachineForTests:
+    migrate_vm_and_verify(vm=vm_for_migration_policy_test, client=admin_client)
+    return vm_for_migration_policy_test
 
 
 @pytest.fixture()
-def vm_re_migrated_after_updating_migration_policy(vm_for_migration_policy_test, migration_policy_a):
+def vm_re_migrated_after_updating_migration_policy(
+    admin_client: DynamicClient,
+    vm_for_migration_policy_test: VirtualMachineForTests,
+    migration_policy_a: MigrationPolicy,
+) -> VirtualMachineForTests:
     assert_applied_migration_configuration(
         vmi=vm_for_migration_policy_test.vmi,
         migration_policy=migration_policy_a,
     )
     remove_spec_param_from_migration_policy(migration_policy=migration_policy_a, param="allowAutoConverge")
-    migrate_vm_and_verify(vm=vm_for_migration_policy_test)
+    migrate_vm_and_verify(vm=vm_for_migration_policy_test, client=admin_client)
+    return vm_for_migration_policy_test
 
 
 @pytest.mark.rwx_default_storage

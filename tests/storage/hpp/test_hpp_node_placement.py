@@ -1,5 +1,3 @@
-# -*- coding: utf-8 -*-
-
 """
 HPP Node Placement test suite
 """
@@ -7,7 +5,6 @@ HPP Node Placement test suite
 import logging
 
 import pytest
-from ocp_resources.virtual_machine_instance import VirtualMachineInstance
 
 from tests.storage.hpp.utils import (
     DV_NAME,
@@ -17,12 +14,12 @@ from tests.storage.hpp.utils import (
     VM_NAME,
     edit_hpp_with_node_selector,
 )
-from utilities.constants import NODE_STR, QUARANTINED, TIMEOUT_1MIN, TIMEOUT_5MIN
-from utilities.storage import check_disk_count_in_vm
+from utilities.constants.cluster import NODE_STR
+from utilities.storage import assert_guest_disk_count
 
 LOGGER = logging.getLogger(__name__)
 
-pytestmark = pytest.mark.usefixtures("skip_test_if_no_hpp_sc")
+pytestmark = pytest.mark.hpp
 
 
 @pytest.mark.destructive
@@ -65,44 +62,6 @@ def test_create_dv_on_right_node_with_node_placement(
     assert cirros_vm_for_node_placement_tests.vmi.node.name == worker_node1.name
 
 
-@pytest.mark.xfail(
-    reason=f"{QUARANTINED}: flaky test, failure only reproduced in full tier2 run; CNV-54589",
-    run=False,
-)
-@pytest.mark.post_upgrade
-@pytest.mark.parametrize(
-    ("updated_hpp_with_node_placement", "cirros_vm_for_node_placement_tests"),
-    [
-        pytest.param(
-            {TYPE: NODE_SELECTOR},
-            {DV_NAME: "dv-5717", VM_NAME: "vm-5717", "wait_running": False},
-            marks=pytest.mark.polarion("CNV-5717"),
-        ),
-    ],
-    indirect=True,
-)
-@pytest.mark.s390x
-def test_create_vm_on_node_without_hpp_pod_and_after_update(
-    update_node_labels,
-    updated_hpp_with_node_placement,
-    cirros_vm_for_node_placement_tests,
-):
-    cirros_vm_for_node_placement_tests.vmi.wait_for_status(
-        status=VirtualMachineInstance.Status.SCHEDULING,
-        timeout=TIMEOUT_1MIN,
-        stop_status=VirtualMachineInstance.Status.RUNNING,
-    )
-    assert (
-        cirros_vm_for_node_placement_tests.printable_status
-        == cirros_vm_for_node_placement_tests.Status.WAITING_FOR_VOLUME_BINDING
-    )
-    updated_hpp_with_node_placement.restore()
-    cirros_vm_for_node_placement_tests.vmi.wait_for_status(
-        status=VirtualMachineInstance.Status.RUNNING,
-        timeout=TIMEOUT_5MIN,
-    )
-
-
 @pytest.mark.post_upgrade
 @pytest.mark.parametrize(
     "cirros_vm_for_node_placement_tests",
@@ -122,13 +81,13 @@ def test_vm_with_dv_on_functional_after_configuring_hpp_not_to_work_on_that_same
     schedulable_nodes,
     cirros_vm_for_node_placement_tests,
 ):
-    check_disk_count_in_vm(vm=cirros_vm_for_node_placement_tests)
+    assert_guest_disk_count(vm=cirros_vm_for_node_placement_tests)
     with edit_hpp_with_node_selector(
         hpp_resource=hostpath_provisioner_scope_module,
         hpp_daemonset=hpp_daemonset_scope_session,
         schedulable_nodes=schedulable_nodes,
     ):
-        check_disk_count_in_vm(vm=cirros_vm_for_node_placement_tests)
+        assert_guest_disk_count(vm=cirros_vm_for_node_placement_tests)
 
 
 @pytest.mark.parametrize(

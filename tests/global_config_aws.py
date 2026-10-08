@@ -3,7 +3,8 @@ from typing import Any
 import pytest_testconfig
 from ocp_resources.datavolume import DataVolume
 
-from utilities.constants import Images, StorageClassNames
+from utilities.constants import Images
+from utilities.constants.storage import StorageClassNames
 
 global config
 global_config = pytest_testconfig.load_python(py_file="tests/global_config.py", encoding="utf-8")
@@ -12,12 +13,23 @@ Images.Windows.DEFAULT_DV_SIZE = "75Gi"
 
 storage_class_matrix = [
     {
+        StorageClassNames.CEPH_RBD_VIRTUALIZATION: {
+            "volume_mode": DataVolume.VolumeMode.BLOCK,
+            "access_mode": DataVolume.AccessMode.RWX,
+            "snapshot": True,
+            "online_resize": True,
+            "wffc": False,
+            "data_import_cron_source_format": "snapshot",
+        }
+    },
+    {
         StorageClassNames.PORTWORX_CSI_DB_SHARED: {
             "volume_mode": DataVolume.VolumeMode.FILE,
             "access_mode": DataVolume.AccessMode.RWX,
             "snapshot": True,
             "online_resize": True,
             "wffc": False,
+            "data_import_cron_source_format": "pvc",
         }
     },
     {
@@ -27,7 +39,7 @@ storage_class_matrix = [
             "snapshot": True,
             "online_resize": True,
             "wffc": False,
-            "default": True,
+            "data_import_cron_source_format": "snapshot",
         }
     },
     {
@@ -37,6 +49,8 @@ storage_class_matrix = [
             "snapshot": True,
             "online_resize": True,
             "wffc": True,
+            "default": True,
+            "data_import_cron_source_format": "pvc",
         }
     },
 ]
@@ -45,7 +59,7 @@ storage_class_a = StorageClassNames.IO2_CSI
 storage_class_b = StorageClassNames.IO2_CSI
 
 for _dir in dir():
-    if not config:  # noqa: F821
+    if not config:
         config: dict[str, Any] = {}
     val = locals()[_dir]
     if type(val) not in [bool, list, dict, str]:
@@ -54,4 +68,4 @@ for _dir in dir():
     if _dir in ["encoding", "py_file"]:
         continue
 
-    config[_dir] = locals()[_dir]  # noqa: F821
+    config[_dir] = locals()[_dir]

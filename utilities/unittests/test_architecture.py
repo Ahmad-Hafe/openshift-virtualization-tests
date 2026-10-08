@@ -7,44 +7,46 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from utilities.architecture import get_cluster_architecture
+from utilities.architecture import get_cluster_architecture, get_multiarch_cpu_arch
+from utilities.exceptions import UnsupportedCPUArchitectureError
 
 
 class TestGetClusterArchitecture:
     """Test cases for get_cluster_architecture function"""
 
+    def setup_method(self):
+        """Clear cache before each test so env/node patches take effect"""
+        get_cluster_architecture.cache_clear()
+
     def test_get_cluster_architecture_from_env_arm64(self):
         """Test getting architecture from environment variable - arm64"""
-        with patch.dict(os.environ, {"OPENSHIFT_VIRTUALIZATION_TEST_IMAGES_ARCH": "arm64"}):
+        with patch.dict(in_dict=os.environ, values={"OPENSHIFT_VIRTUALIZATION_TEST_IMAGES_ARCH": "arm64"}):
             result = get_cluster_architecture()
-            assert result == "arm64"
-
-    def test_get_cluster_architecture_from_env_x86_64(self):
-        """Test getting architecture from environment variable - x86_64"""
-        with patch.dict(os.environ, {"OPENSHIFT_VIRTUALIZATION_TEST_IMAGES_ARCH": "x86_64"}):
-            result = get_cluster_architecture()
-            assert result == "x86_64"
+            assert result == {"arm64"}
 
     def test_get_cluster_architecture_from_env_s390x(self):
         """Test getting architecture from environment variable - s390x"""
-        with patch.dict(os.environ, {"OPENSHIFT_VIRTUALIZATION_TEST_IMAGES_ARCH": "s390x"}):
+        with patch.dict(in_dict=os.environ, values={"OPENSHIFT_VIRTUALIZATION_TEST_IMAGES_ARCH": "s390x"}):
             result = get_cluster_architecture()
-            assert result == "s390x"
+            assert result == {"s390x"}
 
-    def test_get_cluster_architecture_from_env_amd64_converts_to_x86_64(self):
-        """Test that amd64 from env is converted to x86_64"""
-        with patch.dict(os.environ, {"OPENSHIFT_VIRTUALIZATION_TEST_IMAGES_ARCH": "amd64"}):
+    def test_get_cluster_architecture_from_env_amd64(self):
+        """Test getting architecture from environment variable - amd64"""
+        with patch.dict(in_dict=os.environ, values={"OPENSHIFT_VIRTUALIZATION_TEST_IMAGES_ARCH": "amd64"}):
             result = get_cluster_architecture()
-            assert result == "x86_64"
+            assert result == {"amd64"}
+
+    def test_get_cluster_architecture_from_env_multiarch(self):
+        """Test getting architecture from environment variable - comma-separated multiarch"""
+        with patch.dict(in_dict=os.environ, values={"OPENSHIFT_VIRTUALIZATION_TEST_IMAGES_ARCH": "amd64,arm64"}):
+            result = get_cluster_architecture()
+            assert result == {"amd64", "arm64"}
 
     @patch("utilities.architecture.cache_admin_client")
     @patch("utilities.architecture.Node")
-    def test_get_cluster_architecture_from_nodes_x86_64(self, mock_node_class, mock_cache_client):
-        """Test getting architecture from nodes - x86_64"""
-        # Clear env var to force reading from nodes
-        with patch.dict(os.environ, {}, clear=True):
-            os.environ.pop("OPENSHIFT_VIRTUALIZATION_TEST_IMAGES_ARCH", None)
-
+    def test_get_cluster_architecture_from_nodes_amd64(self, mock_node_class, mock_cache_client):
+        """Test getting architecture from nodes - amd64"""
+        with patch.dict(in_dict=os.environ, values={}, clear=True):
             # Mock node with amd64 architecture
             mock_node = MagicMock()
             mock_node.labels = {"kubernetes.io/arch": "amd64"}
@@ -53,8 +55,7 @@ class TestGetClusterArchitecture:
 
             result = get_cluster_architecture()
 
-            # Should convert amd64 to x86_64
-            assert result == "x86_64"
+            assert result == {"amd64"}
             mock_node_class.get.assert_called_once()
             mock_cache_client.assert_called_once()
 
@@ -62,9 +63,7 @@ class TestGetClusterArchitecture:
     @patch("utilities.architecture.Node")
     def test_get_cluster_architecture_from_nodes_arm64(self, mock_node_class, mock_cache_client):
         """Test getting architecture from nodes - arm64"""
-        with patch.dict(os.environ, {}, clear=True):
-            os.environ.pop("OPENSHIFT_VIRTUALIZATION_TEST_IMAGES_ARCH", None)
-
+        with patch.dict(in_dict=os.environ, values={}, clear=True):
             # Mock node with arm64 architecture
             mock_node = MagicMock()
             mock_node.labels = {"kubernetes.io/arch": "arm64"}
@@ -73,15 +72,13 @@ class TestGetClusterArchitecture:
 
             result = get_cluster_architecture()
 
-            assert result == "arm64"
+            assert result == {"arm64"}
 
     @patch("utilities.architecture.cache_admin_client")
     @patch("utilities.architecture.Node")
     def test_get_cluster_architecture_from_nodes_s390x(self, mock_node_class, mock_cache_client):
         """Test getting architecture from nodes - s390x"""
-        with patch.dict(os.environ, {}, clear=True):
-            os.environ.pop("OPENSHIFT_VIRTUALIZATION_TEST_IMAGES_ARCH", None)
-
+        with patch.dict(in_dict=os.environ, values={}, clear=True):
             # Mock node with s390x architecture
             mock_node = MagicMock()
             mock_node.labels = {"kubernetes.io/arch": "s390x"}
@@ -90,26 +87,13 @@ class TestGetClusterArchitecture:
 
             result = get_cluster_architecture()
 
-            assert result == "s390x"
-
-    def test_get_cluster_architecture_unsupported(self):
-        """Test unsupported architecture raises ValueError"""
-        with (
-            patch.dict(os.environ, {"OPENSHIFT_VIRTUALIZATION_TEST_IMAGES_ARCH": "unsupported"}),
-            pytest.raises(
-                ValueError,
-                match="unsupported architecture in not supported",
-            ),
-        ):
-            get_cluster_architecture()
+            assert result == {"s390x"}
 
     @patch("utilities.architecture.cache_admin_client")
     @patch("utilities.architecture.Node")
-    def test_get_cluster_architecture_multiple_nodes(self, mock_node_class, mock_cache_client):
-        """Test getting architecture with multiple nodes of same arch"""
-        with patch.dict(os.environ, {}, clear=True):
-            os.environ.pop("OPENSHIFT_VIRTUALIZATION_TEST_IMAGES_ARCH", None)
-
+    def test_get_cluster_architecture_multiple_nodes_same_arch(self, mock_node_class, mock_cache_client):
+        """Test getting architecture with multiple nodes of same arch returns set"""
+        with patch.dict(in_dict=os.environ, values={}, clear=True):
             # Mock multiple nodes with same architecture
             mock_node1 = MagicMock()
             mock_node1.labels = {"kubernetes.io/arch": "amd64"}
@@ -120,15 +104,29 @@ class TestGetClusterArchitecture:
 
             result = get_cluster_architecture()
 
-            assert result == "x86_64"
+            assert result == {"amd64"}
+
+    @patch("utilities.architecture.cache_admin_client")
+    @patch("utilities.architecture.Node")
+    def test_get_cluster_architecture_multiple_archs_returns_set(self, mock_node_class, mock_cache_client):
+        """Test getting architecture with mixed nodes returns set of all archs"""
+        with patch.dict(in_dict=os.environ, values={}, clear=True):
+            mock_node1 = MagicMock()
+            mock_node1.labels = {"kubernetes.io/arch": "amd64"}
+            mock_node2 = MagicMock()
+            mock_node2.labels = {"kubernetes.io/arch": "arm64"}
+            mock_node_class.get.return_value = [mock_node1, mock_node2]
+            mock_cache_client.return_value = MagicMock()
+
+            result = get_cluster_architecture()
+
+            assert result == {"amd64", "arm64"}
 
     @patch("utilities.architecture.cache_admin_client")
     @patch("utilities.architecture.Node")
     def test_get_cluster_architecture_uses_cache_admin_client(self, mock_node_class, mock_cache_client):
         """Test that cache_admin_client is used when getting nodes"""
-        with patch.dict(os.environ, {}, clear=True):
-            os.environ.pop("OPENSHIFT_VIRTUALIZATION_TEST_IMAGES_ARCH", None)
-
+        with patch.dict(in_dict=os.environ, values={}, clear=True):
             mock_client = MagicMock()
             mock_cache_client.return_value = mock_client
 
@@ -140,4 +138,48 @@ class TestGetClusterArchitecture:
 
             # Verify cache_admin_client was called and passed to Node.get
             mock_cache_client.assert_called_once()
-            mock_node_class.get.assert_called_once_with(dyn_client=mock_client)
+            mock_node_class.get.assert_called_once_with(client=mock_client)
+
+    @patch("utilities.architecture.cache_admin_client")
+    @patch("utilities.architecture.Node")
+    def test_get_cluster_architecture_raises_error_when_no_nodes(self, mock_node_class, mock_cache_client):
+        """Test that UnsupportedCPUArchitectureError is raised when no nodes are found"""
+        with patch.dict(in_dict=os.environ, values={}, clear=True):
+            mock_cache_client.return_value = MagicMock()
+            mock_node_class.get.return_value = []
+
+            with pytest.raises(
+                UnsupportedCPUArchitectureError,
+                match="Cluster architecture could not be determined",
+            ):
+                get_cluster_architecture()
+
+    @pytest.mark.parametrize("exit_flag", ["--help", "-h", "--version"])
+    @patch("utilities.architecture.cache_admin_client")
+    @patch("utilities.architecture.Node")
+    def test_get_cluster_architecture_skips_cluster_on_exit_flag(self, mock_node_class, mock_cache_client, exit_flag):
+        """Test that pytest exit flags skip cluster connection and return default architecture"""
+        with patch.dict(in_dict=os.environ, values={}, clear=True), patch("utilities.architecture.sys") as mock_sys:
+            mock_sys.argv = ["pytest", exit_flag]
+            result = get_cluster_architecture()
+            assert result == {"amd64"}
+            mock_cache_client.assert_not_called()
+            mock_node_class.get.assert_not_called()
+
+
+class TestGetMultiarchCpuArch:
+    @patch.dict("utilities.architecture.py_config", {"cpu_arch": "arm64", "cluster_type": "multiarch"})
+    def test_returns_arch_on_multiarch_cluster_with_single_arch(self):
+        assert get_multiarch_cpu_arch() == "arm64"
+
+    @patch.dict("utilities.architecture.py_config", {"cpu_arch": "arm64", "cluster_type": "standard"})
+    def test_returns_none_on_non_multiarch_cluster(self):
+        assert get_multiarch_cpu_arch() is None
+
+    @patch.dict("utilities.architecture.py_config", {"cluster_type": "multiarch"})
+    def test_returns_none_when_cpu_arch_not_set(self):
+        assert get_multiarch_cpu_arch() is None
+
+    @patch.dict("utilities.architecture.py_config", {})
+    def test_returns_none_when_no_config(self):
+        assert get_multiarch_cpu_arch() is None

@@ -1,7 +1,10 @@
 import pytest
 
 from tests.infrastructure.instance_types.supported_os.constants import TEST_CREATE_VM_TEST_NAME, TEST_START_VM_TEST_NAME
-from utilities.constants import PREFERENCE_STR, U1_MEDIUM_STR
+from utilities.constants.instance_types import (
+    PREFERENCE_STR,
+    U1_MEDIUM_STR,
+)
 from utilities.virt import (
     check_qemu_guest_agent_installed,
     running_vm,
@@ -15,6 +18,7 @@ TESTS_MODULE_IDENTIFIER = "TestCommonInstancetypeCentos"
 
 @pytest.mark.arm64
 @pytest.mark.sno
+@pytest.mark.s390x
 class TestVMCreationAndValidation:
     @pytest.mark.dependency(name=f"{TESTS_MODULE_IDENTIFIER}::{TEST_CREATE_VM_TEST_NAME}")
     @pytest.mark.polarion("CNV-12068")
@@ -47,6 +51,7 @@ class TestVMCreationAndValidation:
 
 @pytest.mark.arm64
 @pytest.mark.sno
+@pytest.mark.s390x
 @pytest.mark.order(-1)
 class TestVMDeletion:
     @pytest.mark.dependency(depends=[f"{TESTS_MODULE_IDENTIFIER}::{TEST_CREATE_VM_TEST_NAME}"])

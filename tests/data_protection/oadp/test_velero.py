@@ -1,8 +1,13 @@
 import pytest
 from ocp_resources.datavolume import DataVolume
 
-from tests.data_protection.oadp.utils import check_file_in_vm, wait_for_restored_dv
-from utilities.constants import TIMEOUT_10SEC, Images
+from tests.data_protection.oadp.utils import FILE_PATH_FOR_WINDOWS_BACKUP, wait_for_restored_dv
+from utilities.constants import Images
+from utilities.constants.oadp import FILE_NAME_FOR_BACKUP, TEXT_TO_TEST
+from utilities.constants.timeouts import TIMEOUT_10SEC, TIMEOUT_15MIN
+from utilities.oadp import check_file_in_running_vm
+from utilities.storage import verify_file_in_windows_vm
+from utilities.virt import wait_for_running_vm
 
 pytestmark = pytest.mark.usefixtures("skip_if_no_storage_class_for_snapshot")
 
@@ -53,7 +58,9 @@ def test_restore_multiple_namespaces(
         timeout=TIMEOUT_10SEC,
         stop_status=DataVolume.Status.IMPORT_IN_PROGRESS,
     )
-    check_file_in_vm(vm=rhel_vm_with_data_volume_template)
+    check_file_in_running_vm(
+        vm=rhel_vm_with_data_volume_template, file_name=FILE_NAME_FOR_BACKUP, file_content=TEXT_TO_TEST
+    )
 
 
 @pytest.mark.s390x
@@ -81,16 +88,51 @@ def test_restore_multiple_namespaces(
     ],
     indirect=True,
 )
-def test_backup_vm_data_volume_template_with_datamover(
-    rhel_vm_with_data_volume_template, velero_restore_first_namespace_with_datamover
-):
-    check_file_in_vm(vm=rhel_vm_with_data_volume_template)
+@pytest.mark.usefixtures("velero_restore_first_namespace_with_datamover")
+def test_backup_vm_data_volume_template_with_datamover(rhel_vm_with_data_volume_template):
+    check_file_in_running_vm(
+        vm=rhel_vm_with_data_volume_template, file_name=FILE_NAME_FOR_BACKUP, file_content=TEXT_TO_TEST
+    )
+
+
+@pytest.mark.tier3
+@pytest.mark.windows
+@pytest.mark.polarion("CNV-8696")
+@pytest.mark.usefixtures("velero_restore_first_namespace_without_datamover")
+def test_backup_and_restore_windows_vm(windows_vm_with_data_volume_template):
+    """
+    Test Windows VM backup and restore without Data Mover using Velero snapshot.
+
+    Preconditions:
+        - Windows VM with a marker file containing test data
+        - Velero backup created without Data Mover
+        - Velero restore completed
+
+    Steps:
+        1. Wait for Windows VM to reach Running state
+        2. Verify marker file exists at expected path
+        3. Verify file content matches pre-backup text
+
+    Expected:
+        - Windows VM is Running
+        - Marker file content equals TEXT_TO_TEST
+    """
+    wait_for_running_vm(
+        vm=windows_vm_with_data_volume_template,
+        wait_until_running_timeout=TIMEOUT_15MIN,
+    )
+    verify_file_in_windows_vm(
+        windows_vm=windows_vm_with_data_volume_template,
+        file_name_with_path=FILE_PATH_FOR_WINDOWS_BACKUP,
+        file_content=TEXT_TO_TEST,
+    )
 
 
 @pytest.mark.s390x
 @pytest.mark.polarion("CNV-10589")
-def test_restore_vm_with_existing_dv(rhel_vm_from_existing_dv, velero_restore_second_namespace_with_datamover):
-    check_file_in_vm(vm=rhel_vm_from_existing_dv)
+@pytest.mark.usefixtures("velero_restore_second_namespace_with_datamover")
+def test_restore_vm_with_existing_dv(rhel_vm_from_existing_dv):
+    check_file_in_running_vm(vm=rhel_vm_from_existing_dv, file_name=FILE_NAME_FOR_BACKUP, file_content=TEXT_TO_TEST)
 
 
 @pytest.mark.s390x

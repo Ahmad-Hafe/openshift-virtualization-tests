@@ -35,7 +35,7 @@ class IpamStatic(Ipam):
     """
 
     type: str = field(default="static", init=False)
-    addresses: list["IpamStatic.Address"]
+    addresses: list[IpamStatic.Address]
     routes: list[IpamRoute] | None = None
 
     @dataclass
@@ -78,9 +78,24 @@ class CNIPluginOvnK8sConfig(CNIPluginConfig):
     topology: str
     netAttachDefName: str  # noqa: N815
     vlanID: int | None = None  # noqa: N815
+    subnets: str | None = None
 
     class Topology(Enum):
         LOCALNET = "localnet"
+
+
+@dataclass
+class CNIPluginBandwidthConfig(CNIPluginConfig):
+    """
+    CNI Bandwidth Plugin
+    Ref: https://www.cni.dev/plugins/current/meta/bandwidth/
+    """
+
+    type: str = field(default="bandwidth", init=False)
+    ingressRate: int  # noqa: N815
+    ingressBurst: int  # noqa: N815
+    egressRate: int  # noqa: N815
+    egressBurst: int  # noqa: N815
 
 
 @dataclass

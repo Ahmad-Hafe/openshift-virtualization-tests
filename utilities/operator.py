@@ -1,38 +1,30 @@
 # TODO: Remove ### unused_code: ignore ### from function docstring once it's used.
 
 import logging
-import os
-import shlex
 from contextlib import contextmanager
 from datetime import datetime
 from pprint import pformat
 
-import yaml
+from kubernetes.dynamic import DynamicClient
 from kubernetes.dynamic.exceptions import ResourceNotFoundError
 from ocp_resources.catalog_source import CatalogSource
 from ocp_resources.cluster_operator import ClusterOperator
 from ocp_resources.cluster_service_version import ClusterServiceVersion
 from ocp_resources.image_content_source_policy import ImageContentSourcePolicy
-from ocp_resources.image_digest_mirror_set import ImageDigestMirrorSet
 from ocp_resources.machine_config_pool import MachineConfigPool
 from ocp_resources.namespace import Namespace
-from ocp_resources.node import Node
 from ocp_resources.operator_group import OperatorGroup
 from ocp_resources.operator_hub import OperatorHub
 from ocp_resources.pod import Pod
 from ocp_resources.resource import Resource, ResourceEditor
 from ocp_resources.subscription import Subscription
-from pyhelper_utils.shell import run_command
 from pytest_testconfig import config as py_config
 from timeout_sampler import TimeoutExpiredError, TimeoutSampler
 
 import utilities.infra
-from utilities.constants import (
-    BASE_EXCEPTIONS_DICT,
-    BREW_REGISTERY_SOURCE,
-    DEFAULT_RESOURCE_CONDITIONS,
-    ICSP_FILE,
-    IDMS_FILE,
+from utilities.constants.cluster import BASE_EXCEPTIONS_DICT
+from utilities.constants.hco import DEFAULT_RESOURCE_CONDITIONS
+from utilities.constants.timeouts import (
     TIMEOUT_5MIN,
     TIMEOUT_5SEC,
     TIMEOUT_10MIN,
@@ -44,80 +36,6 @@ from utilities.constants import (
 from utilities.data_collector import collect_ocp_must_gather
 
 LOGGER = logging.getLogger(__name__)
-
-
-def create_icsp_idms_command(image, source_url, folder_name, pull_secret=None, filter_options=""):
-    """
-        Create ImageContentSourcePolicy command.
-
-    Args:
-        image (str): name of image to be mirrored.
-        source_url (str): source url of image registry to which contents mirror.
-        folder_name (str): local path to store manifests.
-        pull_secret (str): Path to your registry credentials, default set to None(until passed)
-        filter_options (str): when filter passed it will choose image from multiple variants.
-
-    Returns:
-        str: base command to create icsp in the cluster.
-    """
-    base_command = (
-        f"oc adm catalog mirror {image} {source_url} --manifests-only --to-manifests {folder_name} {filter_options}"
-    )
-    if pull_secret:
-        base_command = f"{base_command} --registry-config={pull_secret}"
-
-    return base_command
-
-
-def generate_icsp_idms_file(folder_name, command, is_idms_file, cnv_version=None):
-    rc, _, _ = run_command(
-        command=shlex.split(command),
-        verify_stderr=False,
-        check=False,
-    )
-    assert rc
-    file_name = IDMS_FILE if is_idms_file else ICSP_FILE
-
-    absolute_file_name = os.path.join(folder_name, file_name)
-    assert os.path.isfile(absolute_file_name), f"file does not exist in path {absolute_file_name}"
-    if cnv_version:
-        absolute_file_name = generate_unique_icsp_idms_file(
-            file_name=absolute_file_name,
-            version_string=cnv_version.lstrip("v").replace(".", ""),
-        )
-    return absolute_file_name
-
-
-def generate_unique_icsp_idms_file(file_name, version_string):
-    # update the metadata.name value to generate unique ICSP/IDMS
-    with open(file_name) as fd:
-        file_yaml = yaml.safe_load(fd.read())
-    file_yaml["metadata"]["name"] = f"iib-{version_string}"
-    with open(file_name, "w") as current_mirror_file:
-        yaml.dump(file_yaml, current_mirror_file)
-    new_file_name = file_name.replace(file_name, f"{file_name.replace('.yaml', '')}{version_string}.yaml")
-    os.rename(file_name, new_file_name)
-    return new_file_name
-
-
-def create_icsp_idms_from_file(file_path):
-    LOGGER.info(f"Creating icsp/idms using file: {file_path}")
-    rc, _, _ = run_command(
-        command=shlex.split(f"oc create -f {file_path}"),
-        verify_stderr=False,
-        check=False,
-    )
-    assert rc
-
-
-def delete_existing_icsp_idms(name, is_idms_file):
-    resource_class = ImageDigestMirrorSet if is_idms_file else ImageContentSourcePolicy
-    LOGGER.info(f"Deleting {resource_class}.")
-    for resource_obj in resource_class.get():
-        object_name = resource_obj.name
-        if object_name.startswith(name):
-            LOGGER.info(f"Deleting {resource_class} {object_name}.")
-            resource_obj.delete(wait=True)
 
 
 def get_mcps_with_different_transition_times(condition_type, machine_config_pools_list, initial_transition_times):
@@ -234,8 +152,8 @@ def consecutive_checks_for_mcp_condition(mcp_sampler, machine_config_pools_list)
         raise
 
 
-def wait_for_mcp_update_end(machine_config_pools_list):
-    wait_for_mcp_updated_condition_true(machine_config_pools_list=machine_config_pools_list)
+def wait_for_mcp_update_end(machine_config_pools_list, timeout=TIMEOUT_75MIN):
+    wait_for_mcp_updated_condition_true(machine_config_pools_list=machine_config_pools_list, timeout=timeout)
     wait_for_mcp_ready_machine_count(machine_config_pools_list=machine_config_pools_list)
 
 
@@ -286,13 +204,13 @@ def collect_mcp_data_on_update_timeout(machine_config_pools_list, not_matching_m
     LOGGER.error(
         f"Out of MCPs {mcps_to_check}, following MCPs {not_matching_mcps} were not at desired "
         f"condition {condition_type} before timeout.\n"
-        f"Current MCP status={str({mcp.name: mcp.instance.status.conditions for mcp in machine_config_pools_list})}"
+        f"Current MCP status={ {mcp.name: mcp.instance.status.conditions for mcp in machine_config_pools_list}!s}"
     )
     collect_ocp_must_gather(since_time=since_time)
 
 
-def get_machine_config_pool_by_name(mcp_name):
-    mcp = MachineConfigPool(name=mcp_name)
+def get_machine_config_pool_by_name(mcp_name: str, admin_client: DynamicClient) -> MachineConfigPool:
+    mcp = MachineConfigPool(name=mcp_name, client=admin_client)
     if mcp.exists:
         return mcp
     raise ResourceNotFoundError(f"OperatorHub {mcp_name} not found")
@@ -302,9 +220,9 @@ def get_machine_config_pools_conditions(machine_config_pools):
     return {mcp.name: mcp.instance.status.conditions for mcp in machine_config_pools}
 
 
-def get_operator_hub():
+def get_operator_hub(client: DynamicClient) -> OperatorHub:
     operator_hub_name = "cluster"
-    operator_hub = OperatorHub(name=operator_hub_name)
+    operator_hub = OperatorHub(client=client, name=operator_hub_name)
     if operator_hub.exists:
         return operator_hub
     raise ResourceNotFoundError(f"OperatorHub {operator_hub_name} not found")
@@ -312,30 +230,32 @@ def get_operator_hub():
 
 @contextmanager
 def disable_default_sources_in_operatorhub(admin_client):
-    operator_hub = get_operator_hub()
+    operator_hub = get_operator_hub(client=admin_client)
     LOGGER.info("Disable default sources in operatorhub.")
     with ResourceEditor(patches={operator_hub: {"spec": {"disableAllDefaultSources": True}}}) as edited_source:
         # wait for all the catalogsources to disappear:
         sources = operator_hub.instance.status.sources
         for catalog_source_name in [catalog_source["name"] for catalog_source in sources]:
-            wait_for_catalog_source_disabled(catalog_name=catalog_source_name)
+            wait_for_catalog_source_disabled(client=admin_client, catalog_name=catalog_source_name)
         yield edited_source
 
 
-def get_catalog_source(catalog_name):
+def get_catalog_source(client: DynamicClient, catalog_name: str) -> CatalogSource | None:
     market_place_namespace = py_config["marketplace_namespace"]
-    catalog_source = CatalogSource(namespace=market_place_namespace, name=catalog_name)
+    catalog_source = CatalogSource(client=client, namespace=market_place_namespace, name=catalog_name)
     if catalog_source.exists:
         return catalog_source
     LOGGER.warning(f"CatalogSource {catalog_name} not found in namespace: {market_place_namespace}")
+    return None
 
 
-def wait_for_catalog_source_disabled(catalog_name):
+def wait_for_catalog_source_disabled(client: DynamicClient, catalog_name: str) -> None:
     LOGGER.info(f"Wait for catalogsource {catalog_name} to be disabled.")
     samples = TimeoutSampler(
         wait_timeout=TIMEOUT_5MIN,
         sleep=10,
         func=get_catalog_source,
+        client=client,
         catalog_name=catalog_name,
     )
     try:
@@ -350,6 +270,7 @@ def wait_for_catalog_source_disabled(catalog_name):
 def create_catalog_source(
     catalog_name,
     image,
+    admin_client,
     display_name="OpenShift Virtualization Index Image",
 ):
     LOGGER.info(f"Create catalog source {catalog_name}")
@@ -361,6 +282,7 @@ def create_catalog_source(
         image=image,
         publisher="Red Hat",
         teardown=False,
+        client=admin_client,
     ) as catalog_source:
         return catalog_source
 
@@ -375,8 +297,8 @@ def wait_for_catalogsource_ready(admin_client, catalog_name):
         not_running = [
             _pod.name
             for _pod in utilities.infra.get_pods(
-                dyn_client=admin_client,
-                namespace=Namespace(name=py_config["marketplace_namespace"]),
+                client=admin_client,
+                namespace=Namespace(client=admin_client, name=py_config["marketplace_namespace"]),
                 label=f"olm.catalogSource={catalog_name}",
             )
             if _pod.instance.status.phase != Pod.Status.RUNNING
@@ -399,13 +321,14 @@ def wait_for_catalogsource_ready(admin_client, catalog_name):
         raise
 
 
-def create_operator_group(operator_group_name, namespace_name, target_namespaces=None):
+def create_operator_group(operator_group_name, namespace_name, admin_client, target_namespaces=None):
     """
         Create specified Operator group.
 
     Args:
         operator_group_name (str): name of the operator group
         namespace_name (str): Namespace name in which operator group be created.
+        client: OpenShift client.
         target_namespaces (list): List of namespace names for which operator group can be a member. Default None.
 
     Returns:
@@ -417,6 +340,7 @@ def create_operator_group(operator_group_name, namespace_name, target_namespaces
         namespace=namespace_name,
         target_namespaces=target_namespaces,
         teardown=False,
+        client=admin_client,
     ) as operator_group:
         return operator_group
 
@@ -426,6 +350,7 @@ def create_subscription(
     package_name,
     namespace_name,
     catalogsource_name,
+    admin_client,
     channel_name="stable",
     install_plan_approval="Automatic",
 ):
@@ -442,6 +367,7 @@ def create_subscription(
         source=catalogsource_name,
         source_namespace=py_config["marketplace_namespace"],
         teardown=False,
+        client=admin_client,
     ) as subscription:
         return subscription
 
@@ -471,7 +397,7 @@ def get_install_plan_from_subscription(subscription):
 
 
 def wait_for_csv_successful_state(admin_client, namespace_name, subscription_name):
-    subscription = Subscription(name=subscription_name, namespace=namespace_name)
+    subscription = Subscription(client=admin_client, name=subscription_name, namespace=namespace_name)
     if subscription.exists:
         csv = utilities.infra.get_csv_by_name(
             csv_name=subscription.instance.status.installedCSV,
@@ -483,7 +409,7 @@ def wait_for_csv_successful_state(admin_client, namespace_name, subscription_nam
     raise ResourceNotFoundError(f"Subscription {subscription_name} not found in namespace: {namespace_name}")
 
 
-def wait_for_mcp_update_completion(machine_config_pools_list, initial_mcp_conditions, nodes):
+def wait_for_mcp_update_completion(machine_config_pools_list, initial_mcp_conditions, nodes, timeout=TIMEOUT_75MIN):
     initial_updating_transition_times = get_mcp_updating_transition_times(mcp_conditions=initial_mcp_conditions)
 
     wait_for_mcp_update_start(
@@ -492,6 +418,7 @@ def wait_for_mcp_update_completion(machine_config_pools_list, initial_mcp_condit
     )
     wait_for_mcp_update_end(
         machine_config_pools_list=machine_config_pools_list,
+        timeout=timeout,
     )
     wait_for_nodes_to_have_same_kubelet_version(nodes=nodes)
     wait_for_all_nodes_ready(nodes=nodes)
@@ -559,14 +486,14 @@ def get_mcp_updating_transition_times(mcp_conditions):
     return updating_transition_times
 
 
-def create_operator(operator_class, operator_name, namespace_name=None):
+def create_operator(operator_class, operator_name, admin_client, namespace_name=None):
     """
     ### unused_code: ignore ###
     """
     if namespace_name:
-        operator = operator_class(name=operator_name, namespace=namespace_name)
+        operator = operator_class(name=operator_name, namespace=namespace_name, client=admin_client)
     else:
-        operator = operator_class(name=operator_name)
+        operator = operator_class(name=operator_name, client=admin_client)
     if operator.exists:
         LOGGER.warning(f"Operator: {operator_name} already exists in namespace: {namespace_name}")
         return
@@ -575,13 +502,13 @@ def create_operator(operator_class, operator_name, namespace_name=None):
     return operator
 
 
-def wait_for_package_manifest_to_exist(dyn_client, cr_name, catalog_name):
+def wait_for_package_manifest_to_exist(client, cr_name, catalog_name):
     LOGGER.info(f"Wait for package manifest creation for {cr_name} associated with catalog source: {catalog_name}")
     samples = TimeoutSampler(
         wait_timeout=TIMEOUT_10MIN,
         sleep=10,
         func=utilities.infra.get_raw_package_manifest,
-        admin_client=dyn_client,
+        admin_client=client,
         name=cr_name,
         catalog_source=catalog_name,
     )
@@ -594,8 +521,8 @@ def wait_for_package_manifest_to_exist(dyn_client, cr_name, catalog_name):
         raise
 
 
-def update_image_in_catalog_source(dyn_client, image, catalog_source_name, cr_name):
-    catalog = get_catalog_source(catalog_name=catalog_source_name)
+def update_image_in_catalog_source(client, image, catalog_source_name, cr_name):
+    catalog = get_catalog_source(client=client, catalog_name=catalog_source_name)
     if catalog:
         LOGGER.info(f"Updating {catalog_source_name} image to {image}")
         ResourceEditor(patches={catalog: {"spec": {"image": image}}}).update()
@@ -604,9 +531,10 @@ def update_image_in_catalog_source(dyn_client, image, catalog_source_name, cr_na
         create_catalog_source(
             catalog_name=catalog_source_name,
             image=image,
+            admin_client=client,
         )
         LOGGER.info(f"Waiting for {cr_name} packagemanifest associated with {catalog_source_name} to appear")
-        wait_for_package_manifest_to_exist(dyn_client=dyn_client, catalog_name=catalog_source_name, cr_name=cr_name)
+        wait_for_package_manifest_to_exist(client=client, catalog_name=catalog_source_name, cr_name=cr_name)
 
 
 def update_subscription_source(
@@ -628,15 +556,15 @@ def update_subscription_source(
     }).update()
 
 
-def cluster_with_icsp():
-    icsp_list = list(ImageContentSourcePolicy.get())
+def cluster_with_icsp(client: DynamicClient) -> bool:
+    icsp_list = list(ImageContentSourcePolicy.get(dyn_client=client))
     return len(icsp_list) > 0
 
 
 def get_cluster_operator_status_conditions(admin_client, operator_conditions=None):
     operator_conditions = operator_conditions or DEFAULT_RESOURCE_CONDITIONS
     cluster_operator_status = {}
-    for cluster_operator in list(ClusterOperator.get(dyn_client=admin_client)):
+    for cluster_operator in list(ClusterOperator.get(client=admin_client)):
         operator_name = cluster_operator.name
         cluster_operator_status[operator_name] = {}
         for condition in cluster_operator.instance.get("status", {}).get("conditions", []):
@@ -696,59 +624,3 @@ def wait_for_cluster_operator_stabilize(admin_client, wait_timeout=TIMEOUT_20MIN
 
 def get_hco_csv_name_by_version(cnv_target_version: str) -> str:
     return f"kubevirt-hyperconverged-operator.v{cnv_target_version}"
-
-
-def get_generated_icsp_idms(
-    image_url: str,
-    registry_source: str,
-    generated_pulled_secret: str,
-    pull_secret_directory: str,
-    is_idms_cluster: bool,
-    cnv_version: str | None = None,
-    filter_options: str = "",
-) -> str:
-    pull_secret = None
-    if image_url.startswith(tuple([BREW_REGISTERY_SOURCE, "quay.io"])):
-        registry_source = BREW_REGISTERY_SOURCE
-        pull_secret = generated_pulled_secret
-    cnv_mirror_cmd = create_icsp_idms_command(
-        image=image_url,
-        source_url=registry_source,
-        folder_name=pull_secret_directory,
-        pull_secret=pull_secret,
-        filter_options=filter_options,
-    )
-    icsp_file_path = generate_icsp_idms_file(
-        folder_name=pull_secret_directory,
-        command=cnv_mirror_cmd,
-        is_idms_file=is_idms_cluster,
-        cnv_version=cnv_version,
-    )
-
-    return icsp_file_path
-
-
-def apply_icsp_idms(
-    file_paths: list[str],
-    machine_config_pools: list[MachineConfigPool],
-    mcp_conditions: dict[str, list[dict[str, str]]],
-    nodes: list[Node],
-    is_idms_file: bool,
-    delete_file: bool = False,
-) -> None:
-    LOGGER.info("pausing MCP updates while modifying ICSP/IDMS")
-    with ResourceEditor(patches={mcp: {"spec": {"paused": True}} for mcp in machine_config_pools}):
-        if delete_file:
-            # Due to the amount of annotations in ICSP/IDMS yaml, `oc apply` may fail. Existing ICSP/IDMS is deleted.
-            LOGGER.info("Deleting existing ICSP/IDMS.")
-            delete_existing_icsp_idms(name="iib", is_idms_file=is_idms_file)
-        LOGGER.info("Creating new ICSP/IDMS")
-        for file_path in file_paths:
-            create_icsp_idms_from_file(file_path=file_path)
-
-    LOGGER.info("Wait for MCP update after ICSP/IDMS modification.")
-    wait_for_mcp_update_completion(
-        machine_config_pools_list=machine_config_pools,
-        initial_mcp_conditions=mcp_conditions,
-        nodes=nodes,
-    )

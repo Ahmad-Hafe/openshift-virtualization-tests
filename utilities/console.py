@@ -1,22 +1,26 @@
 import logging
 import os
+import pty
+import shlex
+import subprocess
 
 import pexpect
+import pexpect.fdpexpect
 from ocp_resources.virtual_machine import VirtualMachine
-from timeout_sampler import TimeoutSampler, retry
+from timeout_sampler import TimeoutExpiredError, TimeoutSampler, retry
 
-from utilities.constants import (
+from utilities.constants.timeouts import (
     TIMEOUT_5MIN,
     TIMEOUT_10SEC,
     TIMEOUT_30SEC,
-    VIRTCTL,
 )
+from utilities.constants.virt import VIRTCTL
 from utilities.data_collector import get_data_collector_base_directory
 
 LOGGER = logging.getLogger(__name__)
 
 
-class Console(object):
+class Console:
     def __init__(
         self,
         vm: VirtualMachine,
@@ -24,6 +28,7 @@ class Console(object):
         password: str | None = None,
         timeout: int = TIMEOUT_30SEC,
         prompt: str | list[str] | None = None,
+        kubeconfig: str | None = None,
     ) -> None:
         """
         Connect to VM console
@@ -34,38 +39,48 @@ class Console(object):
             password: VM password
             timeout: Connection timeout in seconds
             prompt: Shell prompt pattern(s) to expect
+            kubeconfig: Path to kubeconfig file for remote cluster access
 
         Examples:
             from utilities import console
+            # Local cluster
             with console.Console(vm=vm) as vmc:
+                vmc.sendline('some command')
+                vmc.expect('some output')
+
+            # Remote cluster with kubeconfig
+            with console.Console(vm=vm, kubeconfig="/path/to/kubeconfig") as vmc:
                 vmc.sendline('some command')
                 vmc.expect('some output')
         """
         self.vm = vm
         # TODO: `BaseVirtualMachine` does not set cloud-init so the VM is using predefined credentials
         self.username = (
-            username or getattr(self.vm, "login_params", {}).get("username") or self.vm.username  # type: ignore[attr-defined]  # noqa: E501
+            username or getattr(self.vm, "login_params", {}).get("username") or self.vm.username  # type: ignore[attr-defined]
         )
         self.password = (
-            password or getattr(self.vm, "login_params", {}).get("password") or self.vm.password  # type: ignore[attr-defined]  # noqa: E501
+            password or getattr(self.vm, "login_params", {}).get("password") or self.vm.password  # type: ignore[attr-defined]
         )
         self.timeout = timeout
-        self.child = None
+        self.child: pexpect.fdpexpect.fdspawn | None = None
+        self._proc: subprocess.Popen[bytes] | None = None
         self.login_prompt = "login:"
         self.prompt = prompt if prompt else [r"#", r"\$"]
+        self.kubeconfig = kubeconfig
         self.cmd = self._generate_cmd()
         self.base_dir = get_data_collector_base_directory()
 
     @retry(wait_timeout=TIMEOUT_5MIN, sleep=TIMEOUT_10SEC)
     def connect(self):
         LOGGER.info(f"Connect to {self.vm.name} console")
-        self.console_eof_sampler(func=pexpect.spawn, command=self.cmd, timeout=self.timeout)
-
         try:
+            self.console_eof_sampler()
             self._connect()
-        except Exception:
+        except TimeoutExpiredError, pexpect.exceptions.ExceptionPexpect:
             LOGGER.exception(f"Failed to connect to {self.vm.name} console.")
-            self.child.close()
+            if self.child is not None:
+                self.child.close()
+            self._terminate_proc()
             raise
 
         return self.child
@@ -73,21 +88,31 @@ class Console(object):
     def _connect(self):
         self.child.send("\n\n")
         if self.username:
-            self.child.expect(self.login_prompt)
-            LOGGER.info(f"{self.vm.name}: Using username {self.username}")
-            self.child.sendline(self.username)
-            if self.password:
-                self.child.expect("Password:")
-                LOGGER.info(f"{self.vm.name}: Using password {self.password}")
-                self.child.sendline(self.password)
+            # Wait for either "login:" or a shell prompt (e.g., "$" or "#")
+            patterns = [self.login_prompt] + (self.prompt if isinstance(self.prompt, list) else [self.prompt])
+            matched_index = self.child.expect(patterns)
+
+            # Index 0 = login prompt, other indices = shell prompt
+            if matched_index == 0:
+                # Need to login
+                LOGGER.info(f"{self.vm.name}: Using username {self.username}")
+                self.child.sendline(self.username)
+                if self.password:
+                    self.child.expect("Password:")
+                    LOGGER.info(f"{self.vm.name}: Using password {self.password}")
+                    self.child.sendline(self.password)
+            else:
+                # Already logged in, skip login sequence
+                LOGGER.info(f"{self.vm.name}: Already at shell prompt, skipping login")
+                return
 
         LOGGER.info(f"{self.vm.name}: waiting for terminal prompt '{self.prompt}'")
         self.child.expect(self.prompt)
         LOGGER.info(f"{self.vm.name}: Got prompt {self.prompt}")
 
     def disconnect(self):
-        if self.child.terminated:
-            self.console_eof_sampler(func=pexpect.spawn, command=self.cmd, timeout=self.timeout)
+        if self._proc is not None and self._proc.poll() is not None:
+            self.console_eof_sampler()
 
         try:
             self.child.send("\n\n")
@@ -98,16 +123,63 @@ class Console(object):
                 self.child.expect("login:")
         finally:
             self.child.close()
+            self._terminate_proc()
 
-    def console_eof_sampler(self, func, command, timeout):
+    def _spawn_console(self) -> pexpect.fdpexpect.fdspawn:
+        """
+        Creates a pty pair and spawns virtctl via subprocess, returning an fdspawn
+        wrapping the master end.
+
+        Uses pty.openpty() + subprocess.Popen instead of pexpect.spawn to avoid
+        os.forkpty(), which is deprecated in multi-threaded processes (Python 3.12+).
+        """
+        self._terminate_proc()
+        master_fd, slave_fd = pty.openpty()
+        proc: subprocess.Popen[bytes] | None = None
+        try:
+            proc = subprocess.Popen(
+                shlex.split(self.cmd),
+                stdin=slave_fd,
+                stdout=slave_fd,
+                stderr=slave_fd,
+                start_new_session=True,
+            )
+            child = pexpect.fdpexpect.fdspawn(fd=master_fd, encoding="utf-8", timeout=self.timeout)
+        except OSError, ValueError, pexpect.exceptions.ExceptionPexpect:
+            if proc is not None:
+                proc.terminate()
+                try:
+                    proc.wait(timeout=TIMEOUT_10SEC)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+                    proc.wait(timeout=TIMEOUT_10SEC)
+            os.close(master_fd)
+            raise
+        finally:
+            os.close(slave_fd)
+
+        self._proc = proc
+        return child
+
+    def _terminate_proc(self) -> None:
+        if self._proc is not None:
+            try:
+                if self._proc.poll() is None:
+                    self._proc.terminate()
+                self._proc.wait(timeout=TIMEOUT_10SEC)
+            except subprocess.TimeoutExpired:
+                LOGGER.warning(f"Force killing unresponsive console process for {self.vm.name}")
+                self._proc.kill()
+                self._proc.wait(timeout=TIMEOUT_10SEC)
+            finally:
+                self._proc = None
+
+    def console_eof_sampler(self) -> None:
         sampler = TimeoutSampler(
             wait_timeout=TIMEOUT_5MIN,
             sleep=5,
-            func=func,
+            func=self._spawn_console,
             exceptions_dict={pexpect.exceptions.EOF: []},
-            command=command,
-            timeout=timeout,
-            encoding="utf-8",
         )
         for sample in sampler:
             if sample:
@@ -120,6 +192,8 @@ class Console(object):
         cmd = f"{virtctl_str} console {self.vm.name}"
         if self.vm.namespace:
             cmd += f" -n {self.vm.namespace}"
+        if self.kubeconfig:
+            cmd += f" --kubeconfig {self.kubeconfig}"
         return cmd
 
     def __enter__(self):

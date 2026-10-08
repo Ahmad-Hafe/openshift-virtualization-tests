@@ -10,24 +10,24 @@ from tests.chaos.migration.utils import (
     assert_migration_result_and_cleanup,
 )
 from tests.chaos.utils import verify_vm_service_reachable
-from utilities.constants import (
-    PORT_80,
-    QUARANTINED,
+from utilities.constants.namespaces import NamespacesNames
+from utilities.constants.networking import PORT_80
+from utilities.constants.pytest import QUARANTINED
+from utilities.constants.storage import StorageClassNames
+from utilities.constants.timeouts import (
     TIMEOUT_2MIN,
     TIMEOUT_3MIN,
     TIMEOUT_5MIN,
     TIMEOUT_5SEC,
     TIMEOUT_15MIN,
     TIMEOUT_30SEC,
-    NamespacesNames,
-    StorageClassNames,
 )
 from utilities.infra import wait_for_pods_running
 from utilities.virt import wait_for_vmi_relocation_and_running
 
 pytestmark = [
     pytest.mark.chaos,
-    pytest.mark.usefixtures("chaos_namespace", "cluster_monitoring_process"),
+    pytest.mark.usefixtures("multiprocessing_start_method_fork", "chaos_namespace", "cluster_monitoring_process"),
 ]
 
 
@@ -79,7 +79,7 @@ def test_pod_delete_migration(
     wait_for_vmi_relocation_and_running(vm=chaos_vm_rhel9, initial_node=tainted_node_for_vm_chaos_rhel9_migration)
     wait_for_pods_running(
         admin_client=admin_client,
-        namespace=Namespace(name=pod_deleting_process["namespace_name"]),
+        namespace=Namespace(client=admin_client, name=pod_deleting_process["namespace_name"]),
         number_of_consecutive_checks=10,
         filter_pods_by_name=pod_deleting_process["pod_prefix"],
     )

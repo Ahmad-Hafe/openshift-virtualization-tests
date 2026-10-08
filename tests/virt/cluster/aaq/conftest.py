@@ -1,4 +1,7 @@
+from __future__ import annotations
+
 import logging
+from typing import TYPE_CHECKING
 
 import pytest
 from ocp_resources.application_aware_cluster_resource_quota import ApplicationAwareClusterResourceQuota
@@ -20,15 +23,19 @@ from tests.virt.cluster.aaq.utils import (
 )
 from tests.virt.constants import ACRQ_NAMESPACE_LABEL, ACRQ_TEST
 from tests.virt.utils import update_hco_memory_overcommit, wait_for_virt_launcher_pod, wait_when_pod_in_gated_state
-from utilities.constants import (
+from utilities.constants import Images
+from utilities.constants.aaq import (
     AAQ_NAMESPACE_LABEL,
-    POD_CONTAINER_SPEC,
-    POD_SECURITY_CONTEXT_SPEC,
-    TIMEOUT_1MIN,
-    TIMEOUT_5SEC,
     VM_CPU_CORES,
     VM_MEMORY_GUEST,
-    Images,
+)
+from utilities.constants.networking import (
+    POD_CONTAINER_SPEC,
+    POD_SECURITY_CONTEXT_SPEC,
+)
+from utilities.constants.timeouts import (
+    TIMEOUT_1MIN,
+    TIMEOUT_5SEC,
 )
 from utilities.hco import ResourceEditorValidateHCOReconcile, enabled_aaq_in_hco
 from utilities.infra import create_ns, get_pod_by_name_prefix, label_project
@@ -40,6 +47,9 @@ from utilities.virt import (
     restart_vm_wait_for_running_vm,
     running_vm,
 )
+
+if TYPE_CHECKING:
+    from kubernetes.dynamic import DynamicClient
 
 LOGGER = logging.getLogger(__name__)
 
@@ -58,12 +68,17 @@ def enabled_aaq_in_hco_scope_package(admin_client, hco_namespace, hyperconverged
 
 
 @pytest.fixture(scope="class")
-def updated_aaq_allocation_method(hyperconverged_resource_scope_class, aaq_allocation_methods_matrix__class__):
+def updated_aaq_allocation_method(
+    admin_client, hyperconverged_resource_scope_class, aaq_allocation_methods_matrix__class__
+):
     with ResourceEditorValidateHCOReconcile(
+        admin_client=admin_client,
         patches={
             hyperconverged_resource_scope_class: {
                 "spec": {
-                    "applicationAwareConfig": {"vmiCalcConfigName": aaq_allocation_methods_matrix__class__},
+                    "deployment": {
+                        "applicationAwareConfig": {"vmiCalcConfigName": aaq_allocation_methods_matrix__class__},
+                    }
                 }
             }
         },
@@ -74,8 +89,10 @@ def updated_aaq_allocation_method(hyperconverged_resource_scope_class, aaq_alloc
 
 
 @pytest.fixture()
-def updated_hco_memory_overcommit(hyperconverged_resource_scope_class):
-    yield from update_hco_memory_overcommit(hco=hyperconverged_resource_scope_class, percentage=50)
+def updated_hco_memory_overcommit(admin_client, hyperconverged_resource_scope_class):
+    yield from update_hco_memory_overcommit(
+        admin_client=admin_client, hco=hyperconverged_resource_scope_class, percentage=50
+    )
 
 
 @pytest.fixture(scope="class")
@@ -121,7 +138,7 @@ def vm_for_aaq_test(namespace, unprivileged_client, cpu_for_migration):
 
 
 @pytest.fixture(scope="class")
-def vm_for_aaq_test_in_gated_state(namespace, unprivileged_client):
+def vm_for_aaq_test_in_gated_state(admin_client, namespace, unprivileged_client):
     vm_name = "second-vm-for-aaq-test"
     with VirtualMachineForTests(
         name=vm_name,
@@ -133,8 +150,8 @@ def vm_for_aaq_test_in_gated_state(namespace, unprivileged_client):
         run_strategy=VirtualMachine.RunStrategy.ALWAYS,
     ) as vm:
         vm.wait_for_specific_status(status=VirtualMachine.Status.STARTING)
-        wait_for_virt_launcher_pod(vmi=vm.vmi)
-        wait_when_pod_in_gated_state(pod=vm.vmi.virt_launcher_pod)
+        wait_for_virt_launcher_pod(vmi=vm.vmi, privileged_client=admin_client)
+        wait_when_pod_in_gated_state(pod=vm.vmi.get_virt_launcher_pod(privileged_client=admin_client))
         yield vm
 
 
@@ -153,18 +170,22 @@ def updated_arq_quota(request, namespace, application_aware_resource_quota):
 
 
 @pytest.fixture()
-def migrated_arq_vm(vm_for_aaq_test):
-    migrate_vm_and_verify(vm=vm_for_aaq_test)
+def migrated_arq_vm(admin_client: DynamicClient, vm_for_aaq_test: VirtualMachineForTests) -> VirtualMachineForTests:
+    migrate_vm_and_verify(vm=vm_for_aaq_test, client=admin_client)
+    return vm_for_aaq_test
 
 
 # ACRQ - ApplicationAwareClusterResourceQuota, cluster level object containing quotas for multiple resources
 @pytest.fixture(scope="module")
 def enabled_acrq_support(admin_client, hco_namespace, hyperconverged_resource_scope_module):
     with ResourceEditorValidateHCOReconcile(
+        admin_client=admin_client,
         patches={
             hyperconverged_resource_scope_module: {
                 "spec": {
-                    "applicationAwareConfig": {"allowApplicationAwareClusterResourceQuota": True},
+                    "deployment": {
+                        "applicationAwareConfig": {"allowApplicationAwareClusterResourceQuota": True},
+                    }
                 }
             }
         },
@@ -175,8 +196,9 @@ def enabled_acrq_support(admin_client, hco_namespace, hyperconverged_resource_sc
 
 
 @pytest.fixture(scope="class")
-def application_aware_cluster_resource_quota():
+def application_aware_cluster_resource_quota(admin_client):
     with ApplicationAwareClusterResourceQuota(
+        client=admin_client,
         name="application-aware-cluster-resource-quota-for-aaq-test",
         quota={"hard": ACRQ_QUOTA_HARD_SPEC},
         selector={"labels": {"matchLabels": ACRQ_NAMESPACE_LABEL}},
@@ -187,7 +209,9 @@ def application_aware_cluster_resource_quota():
 @pytest.fixture(scope="class")
 def acrq_label_on_first_namespace(admin_client, namespace, application_aware_cluster_resource_quota):
     label_project(name=namespace.name, label=ACRQ_NAMESPACE_LABEL, admin_client=admin_client)
-    wait_for_aacrq_object_created(namespace=namespace, acrq_name=application_aware_cluster_resource_quota.name)
+    wait_for_aacrq_object_created(
+        admin_client=admin_client, namespace=namespace, acrq_name=application_aware_cluster_resource_quota.name
+    )
 
 
 @pytest.fixture(scope="class")
@@ -206,11 +230,12 @@ def removed_acrq_label_from_second_namespace(second_namespace_for_acrq_test):
 
 
 @pytest.fixture(scope="class")
-def vm_in_second_namespace_for_acrq_test(second_namespace_for_acrq_test):
+def vm_in_second_namespace_for_acrq_test(admin_client, second_namespace_for_acrq_test):
     vm_name = "vm-another-namespace-for-acrq-test"
     with VirtualMachineForTests(
         name=vm_name,
         namespace=second_namespace_for_acrq_test.name,
+        client=admin_client,
         cpu_cores=VM_CPU_CORES,
         memory_guest=VM_MEMORY_GUEST,
         body=fedora_vm_body(name=vm_name),
@@ -266,7 +291,7 @@ def hotplugged_target_pod(namespace, unprivileged_client, hotplug_vm_for_aaq_tes
         pod_prefix=f"virt-launcher-{hotplug_vm_for_aaq_test.name}",
         namespace=namespace.name,
         get_all=True,
-        dyn_client=unprivileged_client,
+        client=unprivileged_client,
     )
     sample = []
     try:
@@ -284,11 +309,14 @@ def hotplugged_target_pod(namespace, unprivileged_client, hotplug_vm_for_aaq_tes
 
 
 @pytest.fixture(scope="class")
-def vm_for_aaq_allocation_methods_test(namespace, cpu_for_migration, aaq_allocation_methods_matrix__class__):
+def vm_for_aaq_allocation_methods_test(
+    unprivileged_client, namespace, cpu_for_migration, aaq_allocation_methods_matrix__class__
+):
     vm_name = f"vm-aaq-test-{aaq_allocation_methods_matrix__class__.lower()}-allocation"
     with VirtualMachineForTests(
         name=vm_name,
         namespace=namespace.name,
+        client=unprivileged_client,
         cpu_limits=1,
         memory_limits="1Gi",
         memory_requests="1Gi",

@@ -1,9 +1,17 @@
+from __future__ import annotations
+
 import logging
+from typing import TYPE_CHECKING
 
 import pytest
 
 from tests.virt.cluster.aaq.utils import check_arq_status_values_different_allocations
 from utilities.virt import migrate_vm_and_verify
+
+if TYPE_CHECKING:
+    from kubernetes.dynamic import DynamicClient
+
+    from utilities.virt import VirtualMachineForTests
 
 LOGGER = logging.getLogger(__name__)
 TESTS_CLASS_NAME = "TestAAQDifferentAllocationMethods"
@@ -14,6 +22,7 @@ pytestmark = [
         "updated_namespace_with_aaq_label",
     ),
     pytest.mark.arm64,
+    pytest.mark.data_collector_scope(scope="module"),
 ]
 
 
@@ -25,6 +34,7 @@ class TestAAQDifferentAllocationMethods:
     @pytest.mark.polarion("CNV-11242")
     def test_aaq_with_virtual_resources_allocation_methods(
         self,
+        admin_client,
         aaq_allocation_methods_matrix__class__,
         application_aware_resource_quota,
         vm_for_aaq_allocation_methods_test,
@@ -33,17 +43,21 @@ class TestAAQDifferentAllocationMethods:
             arq=application_aware_resource_quota,
             vm=vm_for_aaq_allocation_methods_test,
             allocation_method=aaq_allocation_methods_matrix__class__,
+            admin_client=admin_client,
         )
 
     @pytest.mark.dependency(depends=[f"{TESTS_CLASS_NAME}::test_aaq_allocation_methods"])
     @pytest.mark.polarion("CNV-11387")
-    def test_aaq_vm_migration_with_different_allocation(self, vm_for_aaq_allocation_methods_test):
-        migrate_vm_and_verify(vm=vm_for_aaq_allocation_methods_test)
+    def test_aaq_vm_migration_with_different_allocation(
+        self, admin_client: DynamicClient, vm_for_aaq_allocation_methods_test: VirtualMachineForTests
+    ):
+        migrate_vm_and_verify(vm=vm_for_aaq_allocation_methods_test, client=admin_client)
 
     @pytest.mark.dependency(depends=[f"{TESTS_CLASS_NAME}::test_aaq_allocation_methods"])
     @pytest.mark.polarion("CNV-11248")
     def test_aaq_different_allocation_memory_overcommit(
         self,
+        admin_client,
         aaq_allocation_methods_matrix__class__,
         application_aware_resource_quota,
         updated_hco_memory_overcommit,
@@ -53,4 +67,5 @@ class TestAAQDifferentAllocationMethods:
             arq=application_aware_resource_quota,
             vm=restarted_vm_for_aaq_allocation_methods_test,
             allocation_method=aaq_allocation_methods_matrix__class__,
+            admin_client=admin_client,
         )

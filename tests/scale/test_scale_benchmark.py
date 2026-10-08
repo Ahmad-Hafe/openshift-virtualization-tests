@@ -31,20 +31,22 @@ from utilities.artifactory import (
     get_artifactory_config_map,
     get_artifactory_secret,
 )
-from utilities.constants import (
-    NODE_STR,
+from utilities.constants.cluster import NODE_STR
+from utilities.constants.images import (
     OS_FLAVOR_FEDORA,
     OS_FLAVOR_RHEL,
     OS_FLAVOR_WINDOWS,
+)
+from utilities.constants.storage import StorageClassNames
+from utilities.constants.timeouts import (
     TIMEOUT_1MIN,
     TIMEOUT_30MIN,
-    StorageClassNames,
 )
 from utilities.infra import (
     create_ns,
 )
 from utilities.must_gather import run_must_gather
-from utilities.storage import generate_data_source_dict, get_test_artifact_server_url
+from utilities.storage import construct_datavolume_source_dict, generate_data_source_dict, get_test_artifact_server_url
 from utilities.virt import (
     VirtualMachineForTestsFromTemplate,
     verify_vm_migrated,
@@ -61,7 +63,7 @@ SCALE_STORAGE_TYPES = {
     OCS: StorageClassNames.CEPH_RBD_VIRTUALIZATION,
     NFS: StorageClassNames.NFS,
 }
-pytestmark = pytest.mark.scale
+pytestmark = [pytest.mark.scale, pytest.mark.windows]
 
 
 def log_nodes_load_data(vms=None):
@@ -110,7 +112,7 @@ def delete_resources(resources):
 def save_must_gather_logs(must_gather_image_url):
     logs_path = os.path.join(
         os.path.expanduser("~"),
-        f"must_gather_{datetime.datetime.utcnow().strftime('%Y_%m_%d_%H_%M_%S')}",
+        f"must_gather_{datetime.datetime.now(tz=datetime.UTC).strftime('%Y_%m_%d_%H_%M_%S')}",
     )
     os.makedirs(logs_path)
     return run_must_gather(
@@ -239,9 +241,9 @@ def vms_info(scale_test_param):
         OS_FLAVOR_FEDORA: {"latest_labels": FEDORA_LATEST_LABELS},
         OS_FLAVOR_WINDOWS: {"latest_labels": WINDOWS_LATEST_LABELS},
     }
-    for os_name in vms_info_dict:
+    for os_name, os_info in vms_info_dict.items():
         for storage_type_key in SCALE_STORAGE_TYPES:
-            vms_info_dict[os_name][storage_type_key] = {
+            os_info[storage_type_key] = {
                 "vms_per_batch": scale_test_param["vms"][os_name][storage_type_key]["vms_per_batch"],
                 "number_of_batches": scale_test_param["vms"][os_name][storage_type_key]["number_of_batches"],
             }
@@ -272,12 +274,14 @@ def golden_images_scale_dvs(request, keep_resources, admin_client, golden_images
                 namespace=golden_images_namespace.name,
                 storage_class=SCALE_STORAGE_TYPES[storage_type],
                 api_name="storage",
-                url=f"{get_test_artifact_server_url()}{dv_info['url']}",
+                source_dict=construct_datavolume_source_dict(
+                    source="http",
+                    url=f"{get_test_artifact_server_url()}{dv_info['url']}",
+                    secret_name=artifactory_secret.name,
+                    cert_configmap_name=artifactory_config_map.name,
+                ),
                 size=dv_info["size"],
                 client=admin_client,
-                source="http",
-                secret=artifactory_secret,
-                cert_configmap=artifactory_config_map.name,
             )
             golden_images_scale_dv.deploy()
             dvs_list.append(golden_images_scale_dv)
@@ -365,7 +369,7 @@ def vm_migration_info(scale_vms, admin_client):
         for vm in batch:
             vm_migration_info[vm.name] = {
                 NODE_STR: vm.vmi.node,
-                VMI_SOURCE_POD_STR: vm.vmi.virt_launcher_pod,
+                VMI_SOURCE_POD_STR: vm.vmi.get_virt_launcher_pod(privileged_client=admin_client),
                 MIGRATION_INSTANCE_STR: start_live_migration(vm=vm, client=admin_client),
             }
     return vm_migration_info
@@ -455,7 +459,6 @@ class TestScale:
         for batch in scale_vms:
             for vm in batch:
                 wait_for_migration_finished(
-                    namespace=vm.namespace,
                     migration=vm_migration_info[vm.name][MIGRATION_INSTANCE_STR],
                 )
                 verify_vm_migrated(

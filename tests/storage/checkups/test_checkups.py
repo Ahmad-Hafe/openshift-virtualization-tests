@@ -5,7 +5,7 @@ from ocp_resources.datavolume import DataVolume
 from ocp_resources.job import Job
 
 from tests.storage.checkups.utils import assert_results_in_configmap
-from utilities.constants import QUARANTINED
+from utilities.constants.pytest import QUARANTINED
 
 MSG_MIGRATION_FAIL = "cannot migrate VMI"
 MSG_MIGRATION_SUCCESS = "migration completed"
@@ -66,10 +66,10 @@ class TestCheckupPositive:
             result_entry="storageProfileMissingVolumeSnapshotClass",
         )
 
+    @pytest.mark.ocs
     @pytest.mark.polarion("CNV-10709")
     def test_ocs_rbd_non_virt_vm_exist(
         self,
-        skip_if_no_ocs_rbd_non_virt_sc,
         ocs_rbd_non_virt_vm_for_checkups_test,
         checkup_configmap,
         checkup_job,

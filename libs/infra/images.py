@@ -23,6 +23,8 @@ class Cirros:
 @dataclass
 class Alpine:
     QCOW2_IMG: str | None = None
+    QCOW2_IMG_VERSIONED: str | None = None
+    RAW_IMG_XZ: str | None = None
     DIR: str = f"{BASE_IMAGES_DIR}/alpine-images"
     DEFAULT_DV_SIZE: str = "1Gi"
     DEFAULT_MEMORY_SIZE: str = "128M"
@@ -30,7 +32,6 @@ class Alpine:
 
 @dataclass
 class Rhel:
-    RHEL7_9_IMG: str | None = None
     RHEL8_0_IMG: str | None = None
     RHEL8_9_IMG: str | None = None
     RHEL8_10_IMG: str | None = None
@@ -49,10 +50,7 @@ class Rhel:
 
 @dataclass
 class Windows:
-    WIN10_IMG: str | None = None
-    WIN10_WSL2_IMG: str | None = None
     WIN10_ISO_IMG: str | None = None
-    WIN2k16_IMG: str | None = None
     WIN2k19_IMG: str | None = None
     WIN2k25_IMG: str | None = None
     WIN2k19_HA_IMG: str | None = None
@@ -64,7 +62,7 @@ class Windows:
     WIN2022_ISO_IMG: str | None = None
     WIN2025_ISO_IMG: str | None = None
     DIR: str = f"{BASE_IMAGES_DIR}/windows-images"
-    DOCKER_IMAGE_DIR = "docker/kubevirt-common-instancetypes"
+    DOCKER_IMAGE_DIR: str = "docker-local/kubevirt-common-instancetypes"
     UEFI_WIN_DIR: str = f"{DIR}/uefi"
     HA_DIR: str = f"{DIR}/HA-images"
     ISO_BASE_DIR = f"{DIR}/install_iso"

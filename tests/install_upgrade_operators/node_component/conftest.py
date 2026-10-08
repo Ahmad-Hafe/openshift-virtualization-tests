@@ -2,6 +2,9 @@ import logging
 
 import pytest
 from ocp_resources.node import Node
+from ocp_utilities.exceptions import NodesNotHealthyConditionError
+from ocp_utilities.infra import assert_nodes_in_healthy_condition
+from timeout_sampler import TimeoutExpiredError, TimeoutSampler
 
 from tests.install_upgrade_operators.node_component.utils import (
     SELECTORS,
@@ -10,22 +13,24 @@ from tests.install_upgrade_operators.node_component.utils import (
     wait_for_pod_node_selector_clean_up,
 )
 from tests.install_upgrade_operators.utils import get_network_addon_config
-from utilities.constants import (
+from utilities.constants.components import (
     BRIDGE_MARKER,
     CDI_APISERVER,
     CDI_DEPLOYMENT,
     CDI_UPLOADPROXY,
-    HCO_SUBSCRIPTION,
     HYPERCONVERGED_CLUSTER_CLI_DOWNLOAD,
-    IMAGE_CRON_STR,
     KUBE_CNI_LINUX_BRIDGE_PLUGIN,
     KUBEMACPOOL_MAC_CONTROLLER_MANAGER,
-    TIMEOUT_5MIN,
     VIRT_API,
     VIRT_CONTROLLER,
     VIRT_HANDLER,
     VIRT_TEMPLATE_VALIDATOR,
 )
+from utilities.constants.hco import (
+    HCO_SUBSCRIPTION,
+    IMAGE_CRON_STR,
+)
+from utilities.constants.timeouts import TIMEOUT_2MIN, TIMEOUT_5MIN, TIMEOUT_10SEC
 from utilities.hco import add_labels_to_nodes, apply_np_changes, wait_for_hco_conditions
 from utilities.infra import (
     get_daemonset_by_name,
@@ -87,7 +92,7 @@ def node_placement_labels(
         hco_namespace=hco_namespace,
         consecutive_checks_count=6,
     )
-    wait_for_pod_node_selector_clean_up(namespace_name=hco_namespace.name)
+    wait_for_pod_node_selector_clean_up(namespace_name=hco_namespace.name, admin_client=admin_client)
 
 
 def create_dict_by_label(values):
@@ -104,7 +109,7 @@ def expected_node_by_label(node_placement_labels):
 
 @pytest.fixture(scope="class")
 def np_nodes_labels_dict(admin_client):
-    return {node.name: node.instance.metadata.labels for node in Node.get(dyn_client=admin_client)}
+    return {node.name: node.instance.metadata.labels for node in Node.get(client=admin_client)}
 
 
 @pytest.fixture(scope="class")
@@ -115,7 +120,7 @@ def nodes_labeled(np_nodes_labels_dict):
 @pytest.fixture()
 def virt_template_validator_spec_nodeselector(admin_client, hco_namespace):
     virt_template_validator_spec = get_deployment_by_name(
-        namespace_name=hco_namespace.name, deployment_name=VIRT_TEMPLATE_VALIDATOR
+        namespace_name=hco_namespace.name, deployment_name=VIRT_TEMPLATE_VALIDATOR, admin_client=admin_client
     ).instance.to_dict()["spec"]["template"]["spec"]
     return virt_template_validator_spec.get("nodeSelector")
 
@@ -131,6 +136,7 @@ def network_deployment_placement(admin_client, hco_namespace):
     nw_deployment = get_deployment_by_name(
         namespace_name=hco_namespace.name,
         deployment_name=KUBEMACPOOL_MAC_CONTROLLER_MANAGER,
+        admin_client=admin_client,
     ).instance.to_dict()["spec"]["template"]["spec"]
     node_selector_deployments[KUBEMACPOOL_MAC_CONTROLLER_MANAGER] = nw_deployment.get("nodeSelector").get("infra-comp")
     return node_selector_deployments
@@ -168,7 +174,7 @@ def virt_deployment_nodeselector_comp_list(admin_client, hco_namespace):
     virt_deployments = [VIRT_API, VIRT_CONTROLLER]
     for deployment in virt_deployments:
         virt_deployment = get_deployment_by_name(
-            namespace_name=hco_namespace.name, deployment_name=deployment
+            namespace_name=hco_namespace.name, deployment_name=deployment, admin_client=admin_client
         ).instance.to_dict()["spec"]["template"]["spec"]
         nodeselector_lists.append(virt_deployment.get("nodeSelector").get("infra-comp"))
     return nodeselector_lists
@@ -180,7 +186,7 @@ def cdi_deployment_nodeselector_list(admin_client, hco_namespace):
     cdi_deployments = [CDI_APISERVER, CDI_DEPLOYMENT, CDI_UPLOADPROXY]
     for deployment in cdi_deployments:
         cdi_deployment = get_deployment_by_name(
-            namespace_name=hco_namespace.name, deployment_name=deployment
+            namespace_name=hco_namespace.name, deployment_name=deployment, admin_client=admin_client
         ).instance.to_dict()["spec"]["template"]["spec"]
         nodeselector_lists.append(cdi_deployment.get("nodeSelector"))
     return nodeselector_lists
@@ -210,8 +216,11 @@ def hyperconverged_resource_before_np(admin_client, hco_namespace, hyperconverge
     Update HCO CR with infrastructure and workloads spec.
     """
     LOGGER.info("Fetching HCO to save its initial node placement configuration ")
-    initial_infra = hyperconverged_resource_scope_class.instance.to_dict()["spec"].get("infra", {})
-    initial_workloads = hyperconverged_resource_scope_class.instance.to_dict()["spec"].get("workloads", {})
+    node_placements = (
+        hyperconverged_resource_scope_class.instance.to_dict()["spec"].get("deployment", {}).get("nodePlacements", {})
+    )
+    initial_infra = node_placements.get("infra", {})
+    initial_workloads = node_placements.get("workload", {})
     yield hyperconverged_resource_scope_class
     LOGGER.info("Revert to initial HCO node placement configuration ")
     apply_np_changes(
@@ -225,11 +234,35 @@ def hyperconverged_resource_before_np(admin_client, hco_namespace, hyperconverge
 
 
 @pytest.fixture()
+def healthy_nodes(nodes):
+    """Wait for all nodes to be healthy before node-placement changes.
+
+    Raises:
+        TimeoutExpiredError: If nodes remain unhealthy after two minutes.
+    """
+    try:
+        for sample in TimeoutSampler(
+            wait_timeout=TIMEOUT_2MIN,
+            sleep=TIMEOUT_10SEC,
+            func=assert_nodes_in_healthy_condition,
+            exceptions_dict={NodesNotHealthyConditionError: []},
+            nodes=nodes,
+            healthy_node_condition_type=None,
+        ):
+            if sample is None:
+                break
+    except TimeoutExpiredError:
+        LOGGER.error("Nodes are not healthy after 2 minutes; node-placement changes were not applied")
+        raise
+
+
+@pytest.fixture()
 def alter_np_configuration(
     request,
     admin_client,
     hco_namespace,
     hyperconverged_resource_scope_function,
+    healthy_nodes,
 ):
     """
     Update HCO CR with infrastructure and workloads spec.

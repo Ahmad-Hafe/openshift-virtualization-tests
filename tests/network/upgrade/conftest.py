@@ -1,18 +1,57 @@
+from ipaddress import IPv4Interface, IPv6Interface
+from typing import TYPE_CHECKING, Final
+
 import pytest
+from ocp_resources.user_defined_network import Layer2UserDefinedNetwork
 from ocp_resources.virtual_machine import VirtualMachine
 
-from tests.network.libs.ip import random_ipv4_address
-from utilities.constants import (
-    ES_NONE,
-    KMP_DISABLED_LABEL,
-    KMP_VM_ASSIGNMENT_LABEL,
-    LINUX_BRIDGE,
+if TYPE_CHECKING:
+    from collections.abc import Generator
+
+    from kubernetes.dynamic import DynamicClient
+    from ocp_resources.namespace import Namespace
+
+    from libs.vm.vm import BaseVirtualMachine
+    from tests.network.libs.cluster_user_defined_network import ClusterUserDefinedNetwork
+
+from libs.net import nodenetworkconfigurationpolicy as libnncp
+from libs.net.cluster import cluster_vlans, ipv4_supported_cluster, ipv6_supported_cluster
+from libs.net.ip import (
+    filter_link_local_addresses,
+    random_ipv4_address,
+    random_ipv6_address,
 )
+from libs.net.udn import UDN_BINDING_DEFAULT_PLUGIN_NAME, create_udn_namespace
+from libs.net.vmspec import lookup_iface_status
+from libs.vm.oper import run_vms
+from libs.vm.spec import Interface, Multus, Network
+from tests.network.libs import cloudinit
+from tests.network.libs.localnet import (
+    GUEST_1ST_IFACE_NAME,
+    GUEST_2ND_IFACE_NAME,
+    LOCALNET_BR_EX_INTERFACE,
+    LOCALNET_BR_EX_NETWORK,
+    LOCALNET_OVS_BRIDGE_INTERFACE,
+    LOCALNET_OVS_BRIDGE_NETWORK,
+    LOCALNET_TEST_LABEL,
+    LOCALNET_VM_ANTI_AFFINITY,
+    create_nncp_localnet_on_secondary_node_nic,
+    ip_addresses_from_pool,
+    localnet_cloudinit,
+    localnet_cudn,
+    localnet_vm,
+)
+from tests.network.libs.vm_factory import udn_vm
+from tests.network.upgrade.libupgrade import KMP_DISABLED_LABEL
+from utilities.constants.cluster import WORKER_NODE_LABEL_KEY
+from utilities.constants.networking import KMP_VM_ASSIGNMENT_LABEL, LINUX_BRIDGE
+from utilities.constants.virt import ES_NONE
 from utilities.infra import create_ns, get_node_selector_dict
 from utilities.network import cloud_init, network_nad
 from utilities.virt import VirtualMachineForTests, fedora_vm_body
 
 NAD_MAC_SPOOF_NAME = "brspoofupgrade"
+UDN_UPGRADE_VM_ANTI_AFFINITY_LABEL: Final[dict[str, str]] = {"upgrade-udn-vm": "true"}
 
 
 @pytest.fixture(scope="session")
@@ -46,7 +85,7 @@ def vma_upgrade_mac_spoof(worker_node1, unprivileged_client, upgrade_linux_macsp
         networks=vm_nad_networks_data,
         interfaces=sorted(vm_nad_networks_data.keys()),
         client=unprivileged_client,
-        cloud_init_data=cloud_init(ip_address=random_ipv4_address(net_seed=0, host_address=1)),
+        cloud_init_data=cloud_init(ip_address=random_ipv4_address(net_seed=0, host_address=1).ip),
         body=fedora_vm_body(name=name),
         node_selector=get_node_selector_dict(node_selector=worker_node1.hostname),
         run_strategy=VirtualMachine.RunStrategy.ALWAYS,
@@ -64,7 +103,7 @@ def vmb_upgrade_mac_spoof(worker_node1, unprivileged_client, upgrade_linux_macsp
         networks=vm_nad_networks_data,
         interfaces=sorted(vm_nad_networks_data.keys()),
         client=unprivileged_client,
-        cloud_init_data=cloud_init(ip_address=random_ipv4_address(net_seed=0, host_address=2)),
+        cloud_init_data=cloud_init(ip_address=random_ipv4_address(net_seed=0, host_address=2).ip),
         body=fedora_vm_body(name=name),
         node_selector=get_node_selector_dict(node_selector=worker_node1.hostname),
         run_strategy=VirtualMachine.RunStrategy.ALWAYS,
@@ -115,3 +154,306 @@ def running_vm_with_bridge(
         vm.start(wait=True)
         vm.wait_for_agent_connected()
         yield vm
+
+
+@pytest.fixture(scope="session")
+def nncp_localnet_upgrade(
+    nmstate_dependent_placeholder: None,
+    admin_client: DynamicClient,
+) -> Generator[libnncp.NodeNetworkConfigurationPolicy]:
+    desired_state = libnncp.DesiredState(
+        ovn=libnncp.OVN([
+            libnncp.BridgeMappings(
+                localnet=LOCALNET_BR_EX_NETWORK,
+                bridge=libnncp.DEFAULT_OVN_EXTERNAL_BRIDGE,
+                state=libnncp.BridgeMappings.State.PRESENT.value,
+            )
+        ])
+    )
+    with libnncp.NodeNetworkConfigurationPolicy(
+        client=admin_client,
+        name="upgrade-localnet-nncp",
+        desired_state=desired_state,
+        node_selector={WORKER_NODE_LABEL_KEY: ""},
+    ) as nncp:
+        nncp.wait_for_status_success()
+        yield nncp
+
+
+@pytest.fixture(scope="session")
+def namespace_localnet_upgrade(
+    admin_client: DynamicClient,
+    unprivileged_client: DynamicClient,
+) -> Generator[Namespace]:
+    yield from create_ns(
+        admin_client=admin_client,
+        unprivileged_client=unprivileged_client,
+        name="upgrade-localnet-ns",
+        labels=LOCALNET_TEST_LABEL,
+    )
+
+
+@pytest.fixture(scope="session")
+def cudn_localnet_upgrade(
+    admin_client: DynamicClient,
+    nncp_localnet_upgrade: libnncp.NodeNetworkConfigurationPolicy,
+    namespace_localnet_upgrade: Namespace,
+) -> Generator[ClusterUserDefinedNetwork]:
+    with localnet_cudn(
+        name=LOCALNET_BR_EX_NETWORK,
+        match_labels=LOCALNET_TEST_LABEL,
+        vlan_id=cluster_vlans()[0],
+        physical_network_name=LOCALNET_BR_EX_NETWORK,
+        client=admin_client,
+    ) as cudn:
+        cudn.wait_for_status_success()
+        yield cudn
+
+
+@pytest.fixture(scope="session")
+def ipv4_localnet_address_pool_upgrade() -> Generator[IPv4Interface]:
+    return (random_ipv4_address(net_seed=0, host_address=host) for host in range(1, 254))
+
+
+@pytest.fixture(scope="session")
+def ipv6_localnet_address_pool_upgrade() -> Generator[IPv6Interface]:
+    return (random_ipv6_address(net_seed=0, host_address=host) for host in range(1, 254))
+
+
+@pytest.fixture(scope="session")
+def vm_localnet_upgrade_a(
+    unprivileged_client: DynamicClient,
+    namespace_localnet_upgrade: Namespace,
+    cudn_localnet_upgrade: ClusterUserDefinedNetwork,
+    cudn_dedicated_nic_bridge_localnet_upgrade: ClusterUserDefinedNetwork,
+    ipv4_localnet_address_pool_upgrade: Generator[IPv4Interface],
+    ipv6_localnet_address_pool_upgrade: Generator[IPv6Interface],
+    ipv4_dedicated_nic_bridge_localnet_address_pool_upgrade: Generator[IPv4Interface],
+    ipv6_dedicated_nic_bridge_localnet_address_pool_upgrade: Generator[IPv6Interface],
+) -> Generator[BaseVirtualMachine]:
+    with localnet_vm(
+        namespace=namespace_localnet_upgrade.name,
+        name="upgrade-localnet-vm-a",
+        client=unprivileged_client,
+        networks=[
+            Network(name=LOCALNET_BR_EX_INTERFACE, multus=Multus(networkName=cudn_localnet_upgrade.name)),
+            Network(
+                name=LOCALNET_OVS_BRIDGE_INTERFACE,
+                multus=Multus(networkName=cudn_dedicated_nic_bridge_localnet_upgrade.name),
+            ),
+        ],
+        interfaces=[
+            Interface(name=LOCALNET_BR_EX_INTERFACE, bridge={}),
+            Interface(name=LOCALNET_OVS_BRIDGE_INTERFACE, bridge={}),
+        ],
+        cloud_init=localnet_cloudinit(
+            network_data=cloudinit.NetworkData(
+                ethernets={
+                    GUEST_1ST_IFACE_NAME: cloudinit.EthernetDevice(
+                        addresses=[
+                            str(addr)
+                            for addr in ip_addresses_from_pool(
+                                ipv4_pool=ipv4_localnet_address_pool_upgrade,
+                                ipv6_pool=ipv6_localnet_address_pool_upgrade,
+                            )
+                        ],
+                    ),
+                    GUEST_2ND_IFACE_NAME: cloudinit.EthernetDevice(
+                        addresses=[
+                            str(addr)
+                            for addr in ip_addresses_from_pool(
+                                ipv4_pool=ipv4_dedicated_nic_bridge_localnet_address_pool_upgrade,
+                                ipv6_pool=ipv6_dedicated_nic_bridge_localnet_address_pool_upgrade,
+                            )
+                        ],
+                    ),
+                }
+            )
+        ),
+        affinity=LOCALNET_VM_ANTI_AFFINITY,
+    ) as vm:
+        yield vm
+
+
+@pytest.fixture(scope="session")
+def vm_localnet_upgrade_b(
+    unprivileged_client: DynamicClient,
+    namespace_localnet_upgrade: Namespace,
+    cudn_localnet_upgrade: ClusterUserDefinedNetwork,
+    cudn_dedicated_nic_bridge_localnet_upgrade: ClusterUserDefinedNetwork,
+    ipv4_localnet_address_pool_upgrade: Generator[IPv4Interface],
+    ipv6_localnet_address_pool_upgrade: Generator[IPv6Interface],
+    ipv4_dedicated_nic_bridge_localnet_address_pool_upgrade: Generator[IPv4Interface],
+    ipv6_dedicated_nic_bridge_localnet_address_pool_upgrade: Generator[IPv6Interface],
+) -> Generator[BaseVirtualMachine]:
+    with localnet_vm(
+        namespace=namespace_localnet_upgrade.name,
+        name="upgrade-localnet-vm-b",
+        client=unprivileged_client,
+        networks=[
+            Network(name=LOCALNET_BR_EX_INTERFACE, multus=Multus(networkName=cudn_localnet_upgrade.name)),
+            Network(
+                name=LOCALNET_OVS_BRIDGE_INTERFACE,
+                multus=Multus(networkName=cudn_dedicated_nic_bridge_localnet_upgrade.name),
+            ),
+        ],
+        interfaces=[
+            Interface(name=LOCALNET_BR_EX_INTERFACE, bridge={}),
+            Interface(name=LOCALNET_OVS_BRIDGE_INTERFACE, bridge={}),
+        ],
+        cloud_init=localnet_cloudinit(
+            network_data=cloudinit.NetworkData(
+                ethernets={
+                    GUEST_1ST_IFACE_NAME: cloudinit.EthernetDevice(
+                        addresses=[
+                            str(addr)
+                            for addr in ip_addresses_from_pool(
+                                ipv4_pool=ipv4_localnet_address_pool_upgrade,
+                                ipv6_pool=ipv6_localnet_address_pool_upgrade,
+                            )
+                        ],
+                    ),
+                    GUEST_2ND_IFACE_NAME: cloudinit.EthernetDevice(
+                        addresses=[
+                            str(addr)
+                            for addr in ip_addresses_from_pool(
+                                ipv4_pool=ipv4_dedicated_nic_bridge_localnet_address_pool_upgrade,
+                                ipv6_pool=ipv6_dedicated_nic_bridge_localnet_address_pool_upgrade,
+                            )
+                        ],
+                    ),
+                }
+            )
+        ),
+        affinity=LOCALNET_VM_ANTI_AFFINITY,
+    ) as vm:
+        yield vm
+
+
+@pytest.fixture(scope="session")
+def localnet_running_vms_upgrade(
+    vm_localnet_upgrade_a: BaseVirtualMachine,
+    vm_localnet_upgrade_b: BaseVirtualMachine,
+) -> tuple[BaseVirtualMachine, BaseVirtualMachine]:
+    vm_a, vm_b = run_vms(vms=(vm_localnet_upgrade_a, vm_localnet_upgrade_b))
+    ip_families = [
+        ip_family for ip_family, enabled in ((4, ipv4_supported_cluster()), (6, ipv6_supported_cluster())) if enabled
+    ]
+    for vm in (vm_a, vm_b):
+        for iface_name in (LOCALNET_BR_EX_INTERFACE, LOCALNET_OVS_BRIDGE_INTERFACE):
+            lookup_iface_status(
+                vm=vm,
+                iface_name=iface_name,
+                predicate=lambda interface: (
+                    len(filter_link_local_addresses(ip_addresses=interface.get("ipAddresses", []))) == len(ip_families)
+                ),
+            )
+    return vm_a, vm_b
+
+
+@pytest.fixture(scope="session")
+def nncp_dedicated_nic_bridge_localnet_upgrade(
+    nmstate_dependent_placeholder: None,
+    admin_client: DynamicClient,
+    hosts_common_available_ports: list[str],
+) -> Generator[libnncp.NodeNetworkConfigurationPolicy]:
+    with create_nncp_localnet_on_secondary_node_nic(
+        node_nic_name=hosts_common_available_ports[-1],
+        client=admin_client,
+    ) as nncp:
+        yield nncp
+
+
+@pytest.fixture(scope="session")
+def cudn_dedicated_nic_bridge_localnet_upgrade(
+    admin_client: DynamicClient,
+    nncp_dedicated_nic_bridge_localnet_upgrade: libnncp.NodeNetworkConfigurationPolicy,
+    namespace_localnet_upgrade: Namespace,
+) -> Generator[ClusterUserDefinedNetwork]:
+    with localnet_cudn(
+        name=LOCALNET_OVS_BRIDGE_NETWORK,
+        match_labels=LOCALNET_TEST_LABEL,
+        vlan_id=cluster_vlans()[0],
+        physical_network_name=LOCALNET_OVS_BRIDGE_NETWORK,
+        client=admin_client,
+    ) as cudn:
+        cudn.wait_for_status_success()
+        yield cudn
+
+
+@pytest.fixture(scope="session")
+def ipv4_dedicated_nic_bridge_localnet_address_pool_upgrade() -> Generator[IPv4Interface]:
+    return (random_ipv4_address(net_seed=1, host_address=host) for host in range(1, 254))
+
+
+@pytest.fixture(scope="session")
+def ipv6_dedicated_nic_bridge_localnet_address_pool_upgrade() -> Generator[IPv6Interface]:
+    return (random_ipv6_address(net_seed=1, host_address=host) for host in range(1, 254))
+
+
+@pytest.fixture(scope="session")
+def namespace_udn_upgrade(admin_client: DynamicClient) -> Generator[Namespace]:
+    yield from create_udn_namespace(name="upgrade-udn-ns", client=admin_client)
+
+
+@pytest.fixture(scope="session")
+def primary_udn_upgrade(
+    admin_client: DynamicClient,
+    namespace_udn_upgrade: Namespace,
+) -> Generator[Layer2UserDefinedNetwork]:
+    with Layer2UserDefinedNetwork(
+        name="upgrade-udn",
+        namespace=namespace_udn_upgrade.name,
+        role="Primary",
+        subnets=[str(random_ipv4_address(net_seed=2, host_address=0))],
+        ipam={"lifecycle": "Persistent"},
+        client=admin_client,
+    ) as udn:
+        udn.wait_for_condition(
+            condition="NetworkAllocationSucceeded",
+            status=udn.Condition.Status.TRUE,
+        )
+        yield udn
+
+
+@pytest.fixture(scope="session")
+def vm_udn_upgrade_a(
+    admin_client: DynamicClient,
+    namespace_udn_upgrade: Namespace,
+    primary_udn_upgrade: Layer2UserDefinedNetwork,
+) -> Generator[BaseVirtualMachine]:
+    with udn_vm(
+        namespace_name=namespace_udn_upgrade.name,
+        name="upgrade-udn-vm-a",
+        client=admin_client,
+        binding=UDN_BINDING_DEFAULT_PLUGIN_NAME,
+        template_labels=UDN_UPGRADE_VM_ANTI_AFFINITY_LABEL,
+        anti_affinity_namespaces=[namespace_udn_upgrade.name],
+    ) as vm:
+        yield vm
+
+
+@pytest.fixture(scope="session")
+def vm_udn_upgrade_b(
+    admin_client: DynamicClient,
+    namespace_udn_upgrade: Namespace,
+    primary_udn_upgrade: Layer2UserDefinedNetwork,
+) -> Generator[BaseVirtualMachine]:
+    with udn_vm(
+        namespace_name=namespace_udn_upgrade.name,
+        name="upgrade-udn-vm-b",
+        client=admin_client,
+        binding=UDN_BINDING_DEFAULT_PLUGIN_NAME,
+        template_labels=UDN_UPGRADE_VM_ANTI_AFFINITY_LABEL,
+        anti_affinity_namespaces=[namespace_udn_upgrade.name],
+    ) as vm:
+        yield vm
+
+
+@pytest.fixture(scope="session")
+def running_udn_vms_upgrade(
+    vm_udn_upgrade_a: BaseVirtualMachine,
+    vm_udn_upgrade_b: BaseVirtualMachine,
+) -> tuple[BaseVirtualMachine, BaseVirtualMachine]:
+    vm_a, vm_b = run_vms(vms=(vm_udn_upgrade_a, vm_udn_upgrade_b))
+    return vm_a, vm_b

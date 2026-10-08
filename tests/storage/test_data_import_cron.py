@@ -15,15 +15,9 @@ from ocp_resources.storage_profile import StorageProfile
 from ocp_resources.volume_snapshot import VolumeSnapshot
 from timeout_sampler import TimeoutExpiredError, TimeoutSampler
 
-from utilities.constants import (
-    BIND_IMMEDIATE_ANNOTATION,
-    OUTDATED,
-    TIMEOUT_1MIN,
-    TIMEOUT_3MIN,
-    TIMEOUT_5SEC,
-    WILDCARD_CRON_EXPRESSION,
-    Images,
-)
+from utilities.constants import Images
+from utilities.constants.storage import BIND_IMMEDIATE_ANNOTATION, OUTDATED, WILDCARD_CRON_EXPRESSION
+from utilities.constants.timeouts import TIMEOUT_1MIN, TIMEOUT_3MIN, TIMEOUT_5SEC
 from utilities.storage import (
     wait_for_succeeded_dv,
     wait_for_volume_snapshot_ready_to_use,
@@ -39,20 +33,20 @@ RHEL8_DIGEST = "947541648d7f12fd56d2224d55ce708d369f76ffeb4938c8846b287197f30970
 LOGGER = logging.getLogger(__name__)
 
 
-def wait_for_succeeded_imported_object(namespace, name, storage_with_import_cron_source_snapshot):
+def wait_for_succeeded_imported_object(namespace, name, storage_with_import_cron_source_snapshot, client):
     if storage_with_import_cron_source_snapshot:
-        wait_for_volume_snapshot_ready_to_use(namespace=namespace, name=name)
+        wait_for_volume_snapshot_ready_to_use(namespace=namespace, name=name, client=client)
     else:
-        wait_for_succeeded_dv(namespace=namespace, dv_name=name)
+        wait_for_succeeded_dv(namespace=namespace, dv_name=name, client=client)
 
 
-def assert_first_imported_object_was_deleted(namespace, name):
+def assert_first_imported_object_was_deleted(namespace, name, client):
     samples = TimeoutSampler(
         wait_timeout=TIMEOUT_3MIN,
         sleep=TIMEOUT_5SEC,
         func=lambda: (
-            PersistentVolumeClaim(namespace=namespace, name=name).exists
-            or VolumeSnapshot(namespace=namespace, name=name).exists
+            PersistentVolumeClaim(namespace=namespace, name=name, client=client).exists
+            or VolumeSnapshot(namespace=namespace, name=name, client=client).exists
         ),
     )
     try:
@@ -66,9 +60,10 @@ def assert_first_imported_object_was_deleted(namespace, name):
 
 @pytest.fixture()
 def storage_with_import_cron_source_snapshot(
+    admin_client,
     storage_class_name_scope_function,
 ):
-    sc_storage_profile = StorageProfile(name=storage_class_name_scope_function)
+    sc_storage_profile = StorageProfile(name=storage_class_name_scope_function, client=admin_client)
     yield sc_storage_profile.instance.status.get("dataImportCronSourceFormat") == "snapshot"
 
 
@@ -89,6 +84,7 @@ def rhel8_image_stream(admin_client, namespace):
         name=RHEL8_IMAGE_STREAM,
         namespace=namespace.name,
         tags=tags,
+        client=admin_client,
     ) as image_stream:
         yield image_stream
 
@@ -145,11 +141,12 @@ def first_object_name(rhel8_latest_image_truncated_sha_from_image_stream):
 
 
 @pytest.fixture()
-def first_imported_object(namespace, first_object_name, storage_with_import_cron_source_snapshot):
+def first_imported_object(admin_client, namespace, first_object_name, storage_with_import_cron_source_snapshot):
     wait_for_succeeded_imported_object(
         namespace=namespace.name,
         name=first_object_name,
         storage_with_import_cron_source_snapshot=storage_with_import_cron_source_snapshot,
+        client=admin_client,
     )
 
 
@@ -160,6 +157,7 @@ def second_object_name():
 
 @pytest.fixture()
 def second_imported_object(
+    admin_client,
     namespace,
     second_object_name,
     storage_with_import_cron_source_snapshot,
@@ -168,6 +166,7 @@ def second_imported_object(
         namespace=namespace.name,
         name=second_object_name,
         storage_with_import_cron_source_snapshot=storage_with_import_cron_source_snapshot,
+        client=admin_client,
     )
 
 
@@ -195,6 +194,7 @@ def rhel8_image_stream_digest_update(rhel8_image_stream):
 
 @pytest.fixture()
 def second_object_cleanup(
+    admin_client,
     namespace,
     second_object_name,
     storage_with_import_cron_source_snapshot,
@@ -205,13 +205,13 @@ def second_object_cleanup(
         f"(DV/PVC or VolumeSnapshot) that was created by the DataImportCron"
     )
     resource_class = VolumeSnapshot if storage_with_import_cron_source_snapshot else DataVolume
-    resource_class(namespace=namespace.name, name=second_object_name).clean_up()
+    resource_class(namespace=namespace.name, name=second_object_name, client=admin_client).clean_up()
 
 
-@pytest.mark.gating
 @pytest.mark.polarion("CNV-7602")
 @pytest.mark.s390x
 def test_data_import_cron_garbage_collection(
+    admin_client,
     namespace,
     second_object_cleanup,
     rhel8_image_stream,
@@ -223,8 +223,8 @@ def test_data_import_cron_garbage_collection(
     second_object_name,
     storage_with_import_cron_source_snapshot,
 ):
-    assert_first_imported_object_was_deleted(namespace=namespace.name, name=first_object_name)
+    assert_first_imported_object_was_deleted(namespace=namespace.name, name=first_object_name, client=admin_client)
     resource_class = VolumeSnapshot if storage_with_import_cron_source_snapshot else PersistentVolumeClaim
-    assert resource_class(namespace=namespace.name, name=second_object_name).exists, (
+    assert resource_class(namespace=namespace.name, name=second_object_name, client=admin_client).exists, (
         f"Second {resource_class.kind} '{second_object_name}' does not exist"
     )
