@@ -3,10 +3,9 @@ Upload tests
 """
 
 import logging
-import multiprocessing
 import time
+from contextlib import ExitStack
 from random import shuffle
-from time import sleep
 
 import pytest
 from ocp_resources.datavolume import DataVolume
@@ -253,36 +252,9 @@ def test_successful_upload_token_expiry(unprivileged_client, namespace, data_vol
         wait_for_upload_response_code(token=token, data="test", response_code=HTTP_UNAUTHORIZED)
 
 
-def _upload_image(dv_name, namespace, storage_class, local_name, client):
-    """
-    Upload image function for the use of other tests
-    """
-    with utilities.storage.create_dv(
-        client=client,
-        source="upload",
-        dv_name=dv_name,
-        namespace=namespace.name,
-        size="3Gi",
-        storage_class=storage_class,
-    ) as dv:
-        LOGGER.info("Wait for DV to be UploadReady")
-        dv.wait_for_status(status=DataVolume.Status.UPLOAD_READY, timeout=TIMEOUT_5MIN)
-        with UploadTokenRequest(
-            client=client,
-            name=dv_name,
-            namespace=namespace.name,
-            pvc_name=dv.pvc.name,
-        ) as utr:
-            token = utr.create().status.token
-            sleep(5)
-            LOGGER.info("Ensure upload was successful")
-            wait_for_upload_response_code(token=token, data=local_name, response_code=HTTP_OK)
-
-
 @pytest.mark.sno
 @pytest.mark.s390x
 @pytest.mark.polarion("CNV-2015")
-@pytest.mark.usefixtures("multiprocessing_start_method_fork")
 @pytest.mark.parametrize(
     "upload_file_path",
     [
@@ -302,21 +274,37 @@ def test_successful_concurrent_uploads(
     namespace,
     storage_class_matrix__module__,
 ):
-    dvs_processes = []
     storage_class = [*storage_class_matrix__module__][0]
     available_pv = PersistentVolume(name=namespace, client=admin_client).max_available_pvs
-    for dv in range(available_pv):
-        dv_process = multiprocessing.Process(
-            target=_upload_image,
-            args=(f"dv-{dv}", namespace, storage_class, upload_file_path, unprivileged_client),
-        )
-        dv_process.start()
-        dvs_processes.append(dv_process)
 
-    for dvs in dvs_processes:
-        dvs.join()
-        if dvs.exitcode != 0:
-            raise pytest.fail("Creating DV exited with non-zero return code")
+    with ExitStack() as stack:
+        dvs = []
+        for index in range(available_pv):
+            dv = stack.enter_context(
+                cm=utilities.storage.create_dv(
+                    client=unprivileged_client,
+                    source="upload",
+                    dv_name=f"concurrent-upload-{index}",
+                    namespace=namespace.name,
+                    size="3Gi",
+                    storage_class=storage_class,
+                )
+            )
+            dvs.append(dv)
+
+        for dv in dvs:
+            dv.wait_for_status(status=DataVolume.Status.UPLOAD_READY, timeout=TIMEOUT_5MIN)
+
+        for dv in dvs:
+            with UploadTokenRequest(
+                client=unprivileged_client,
+                name=dv.name,
+                namespace=namespace.name,
+                pvc_name=dv.pvc.name,
+            ) as utr:
+                token = utr.create().status.token
+                LOGGER.info("Ensure upload was successful")
+                wait_for_upload_response_code(token=token, data=upload_file_path, response_code=HTTP_OK)
 
 
 @pytest.mark.sno
