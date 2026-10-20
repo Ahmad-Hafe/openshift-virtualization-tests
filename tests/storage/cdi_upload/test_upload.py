@@ -4,6 +4,7 @@ Upload tests
 
 import logging
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import ExitStack
 from random import shuffle
 
@@ -274,11 +275,25 @@ def test_successful_concurrent_uploads(
     namespace,
     storage_class_matrix__module__,
 ):
+    """Create DVs sequentially, upload them concurrently using ThreadPoolExecutor."""
     storage_class = [*storage_class_matrix__module__][0]
     available_pv = PersistentVolume(name=namespace, client=admin_client).max_available_pvs
 
+    def upload_dv(dv):
+        """Upload a single DV concurrently."""
+        with UploadTokenRequest(
+            client=unprivileged_client,
+            name=dv.name,
+            namespace=namespace.name,
+            pvc_name=dv.pvc.name,
+        ) as utr:
+            token = utr.create().status.token
+            LOGGER.info(f"Uploading {dv.name}")
+            wait_for_upload_response_code(token=token, data=upload_file_path, response_code=HTTP_OK)
+
     with ExitStack() as stack:
         dvs = []
+        # Create DVs sequentially
         for index in range(available_pv):
             dv = stack.enter_context(
                 cm=utilities.storage.create_dv(
@@ -292,19 +307,19 @@ def test_successful_concurrent_uploads(
             )
             dvs.append(dv)
 
+        # Wait for all DVs to be UPLOAD_READY
         for dv in dvs:
             dv.wait_for_status(status=DataVolume.Status.UPLOAD_READY, timeout=TIMEOUT_5MIN)
 
-        for dv in dvs:
-            with UploadTokenRequest(
-                client=unprivileged_client,
-                name=dv.name,
-                namespace=namespace.name,
-                pvc_name=dv.pvc.name,
-            ) as utr:
-                token = utr.create().status.token
-                LOGGER.info("Ensure upload was successful")
-                wait_for_upload_response_code(token=token, data=upload_file_path, response_code=HTTP_OK)
+        # Upload DVs concurrently using ThreadPoolExecutor
+        with ThreadPoolExecutor(max_workers=available_pv) as executor:
+            futures = {executor.submit(upload_dv, dv): dv for dv in dvs}
+            for future in as_completed(futures):
+                dv = futures[future]
+                try:
+                    future.result()
+                except Exception as exc:
+                    raise pytest.fail(f"Upload of {dv.name} failed: {exc}")
 
 
 @pytest.mark.sno
