@@ -4,7 +4,6 @@ Upload tests
 
 import logging
 import time
-from contextlib import ExitStack
 from random import shuffle
 
 import pytest
@@ -16,12 +15,12 @@ from pytest_testconfig import config as py_config
 from timeout_sampler import TimeoutSampler
 
 import tests.storage.utils as storage_utils
-import utilities.storage
 from tests.os_params import RHEL_LATEST
+from tests.storage.cdi_upload.utils import upload_images_to_multiple_dvs
 from tests.storage.stop_status_utils import dv_stop_status_restart_threshold
 from utilities.constants import Images
 from utilities.constants.components import CDI_UPLOADPROXY
-from utilities.constants.timeouts import TIMEOUT_1MIN, TIMEOUT_3MIN, TIMEOUT_5MIN
+from utilities.constants.timeouts import TIMEOUT_1MIN, TIMEOUT_3MIN
 from utilities.storage import create_vm_from_dv, get_downloaded_artifact
 
 LOGGER = logging.getLogger(__name__)
@@ -30,23 +29,6 @@ HTTP_OK = 200
 
 
 def wait_for_upload_response_code(token, data, response_code, asynchronous=False):
-    """
-    Wait for upload to return expected HTTP response code.
-
-    Logs all received HTTP statuses. Fails fast on fatal errors (4xx/5xx except 401).
-
-    Args:
-        token: Upload token
-        data: File path to upload
-        response_code: Expected HTTP response code (200 OK or 401 Unauthorized)
-        asynchronous: Whether to run upload asynchronously
-
-    Raises:
-        AssertionError: If server error (5xx) or client error (4xx, except 401) received
-        TimeoutExpiredError: If expected response not received within timeout
-    """
-    fatal_error_codes = {400, 403, 404, 500, 502, 503}
-
     kwargs = {
         "wait_timeout": TIMEOUT_1MIN,
         "sleep": 5,
@@ -56,93 +38,10 @@ def wait_for_upload_response_code(token, data, response_code, asynchronous=False
     }
     if asynchronous:
         kwargs["asynchronous"] = asynchronous
-
     sampler = TimeoutSampler(**kwargs)
-    for attempt, sample in enumerate(sampler, start=1):
-        LOGGER.debug(f"Upload attempt {attempt}: received HTTP {sample}, expecting {response_code}")
-
+    for sample in sampler:
         if sample == response_code:
-            LOGGER.info(f"Upload succeeded with HTTP {sample} after {attempt} attempts")
             return True
-
-        # Fail fast on fatal errors instead of retrying
-        if sample in fatal_error_codes:
-            raise AssertionError(
-                f"Upload failed with HTTP {sample}. Expected {response_code}. "
-                f"Check CDI upload proxy logs and cluster events."
-            )
-
-
-def create_and_upload_dvs(
-    client,
-    namespace_name,
-    storage_class,
-    num_dvs,
-    upload_file_path,
-    expected_response_code=HTTP_OK,
-):
-    """
-    Create multiple DataVolumes, wait for UPLOAD_READY, and upload images.
-
-    Handles DV lifecycle with proper resource cleanup and detailed logging of upload status.
-
-    Args:
-        client: Kubernetes dynamic client
-        namespace_name: Namespace where DVs will be created
-        storage_class: Storage class for DVs
-        num_dvs: Number of DataVolumes to create
-        upload_file_path: Path to file to upload
-        expected_response_code: Expected HTTP response code (default 200 OK)
-
-    Returns:
-        List of DataVolume objects that were successfully created and uploaded
-    """
-    with ExitStack() as stack:
-        dvs = []
-        LOGGER.info(f"Creating {num_dvs} DataVolumes in {namespace_name} with {storage_class}")
-        for index in range(num_dvs):
-            dv = stack.enter_context(
-                cm=utilities.storage.create_dv(
-                    client=client,
-                    source="upload",
-                    dv_name=f"concurrent-upload-{index}",
-                    namespace=namespace_name,
-                    size="3Gi",
-                    storage_class=storage_class,
-                )
-            )
-            dvs.append(dv)
-            LOGGER.info(f"Created DV {dv.name} ({index + 1}/{num_dvs})")
-
-        # Wait for all DVs to be UPLOAD_READY
-        LOGGER.info(f"Waiting for {len(dvs)} DataVolumes to reach UPLOAD_READY status")
-        for dv in dvs:
-            dv.wait_for_status(status=DataVolume.Status.UPLOAD_READY, timeout=TIMEOUT_5MIN)
-            LOGGER.debug(f"DV {dv.name} reached UPLOAD_READY status")
-
-        # Upload to all DVs
-        LOGGER.info(f"Starting upload to {len(dvs)} DataVolumes")
-        for dv_index, dv in enumerate(dvs, start=1):
-            with UploadTokenRequest(
-                client=client,
-                name=dv.name,
-                namespace=namespace_name,
-                pvc_name=dv.pvc.name,
-            ) as utr:
-                token = utr.create().status.token
-                LOGGER.info(f"Uploading to {dv.name} ({dv_index}/{len(dvs)})")
-                try:
-                    wait_for_upload_response_code(
-                        token=token,
-                        data=upload_file_path,
-                        response_code=expected_response_code,
-                    )
-                except AssertionError as err:
-                    LOGGER.error(f"Upload to {dv.name} failed: {err}")
-                    raise
-
-        LOGGER.info(f"Successfully created and uploaded {len(dvs)} DataVolumes")
-        return dvs
 
 
 @pytest.mark.polarion("CNV-2318")
@@ -391,12 +290,13 @@ def test_successful_concurrent_uploads(
     available_pv = PersistentVolume(name=namespace, client=admin_client).max_available_pvs
     assert available_pv > 0, "No PVs available for concurrent upload test"
 
-    create_and_upload_dvs(
+    upload_images_to_multiple_dvs(
         client=unprivileged_client,
         namespace_name=namespace.name,
         storage_class=storage_class,
         num_dvs=available_pv,
         upload_file_path=upload_file_path,
+        wait_for_upload_fn=wait_for_upload_response_code,
     )
 
 
